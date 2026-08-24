@@ -163,6 +163,11 @@ sign-in. The phone and PC displays may turn off after the initial upload, but th
 powered on and connected to the internet. Windows prevents system sleep only while a workflow is
 actively optimizing or transcribing.
 
+`Recent recording recommendation` lets a phone user select several recordings from the system
+picker without uploading them. The page ranks up to six candidates using a recording timestamp in
+the filename (for example, `Voice_260824_133000.m4a`) and falls back to the file's modified time.
+Only the candidate the user chooses enters the passcode-gated upload and transcription flow.
+
 After transcription, choose `Original filename`, `Auto recommendation`, or enter a custom basename.
 The selected name is applied to the TXT, JSON, optimized ZIP, and a downloadable copy of the
 original phone recording. Browser security does not allow the page to rename the source file

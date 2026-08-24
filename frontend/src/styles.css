@@ -241,6 +241,119 @@ h1 {
   font-size: 12px;
 }
 
+.file-choice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.recommended-picker {
+  border-color: #111111;
+  background: #111111;
+  color: #ffffff;
+}
+
+.recent-recordings-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #111111;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.recent-recordings-heading {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+}
+
+.recent-recordings-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.recent-recordings-heading strong {
+  font-size: 13px;
+}
+
+.recent-recordings-heading span {
+  color: #707070;
+  font-size: 10px;
+}
+
+.recent-recordings-heading .text-link {
+  min-height: 24px;
+  padding: 0;
+}
+
+.recent-recordings-list {
+  display: grid;
+  gap: 7px;
+}
+
+.recent-recordings-list > button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 10px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111111;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.recent-recordings-list > button:first-child {
+  border-color: #111111;
+  box-shadow: inset 3px 0 0 #111111;
+}
+
+.recent-rank {
+  min-width: 42px;
+  padding: 5px 6px;
+  border-radius: 999px;
+  background: #eeeeee;
+  color: #555555;
+  font-size: 9px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.recent-rank.recommended {
+  background: #111111;
+  color: #ffffff;
+}
+
+.recent-file-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.recent-file-copy strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-file-copy small {
+  color: #707070;
+  font-size: 9px;
+}
+
+.recent-pick-label {
+  font-size: 10px;
+  font-weight: 800;
+}
+
 .selected-file {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) 42px;
@@ -932,6 +1045,24 @@ h1 {
   .drop-zone {
     min-height: 190px;
     padding: 20px 14px;
+  }
+
+  .file-choice-actions {
+    display: grid;
+    width: 100%;
+  }
+
+  .recent-recordings-panel {
+    padding: 13px;
+  }
+
+  .recent-recordings-list > button {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .recent-pick-label {
+    grid-column: 2;
+    justify-self: start;
   }
 
   .analysis-band {

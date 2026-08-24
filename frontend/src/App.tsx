@@ -2,6 +2,7 @@ import {
   AlertCircle,
   Check,
   CheckCircle2,
+  Clock3,
   Clipboard,
   Download,
   ExternalLink,
@@ -72,6 +73,7 @@ export function App() {
   const [file, setFile] = useState<File | null>(null);
   const [sourceName, setSourceName] = useState("");
   const [sourceBytes, setSourceBytes] = useState(0);
+  const [recentRecordingCandidates, setRecentRecordingCandidates] = useState<File[]>([]);
   const [runtime, setRuntime] = useState<RuntimeProfile | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
   const [scan, setScan] = useState<QuickScanResult | null>(null);
@@ -101,6 +103,7 @@ export function App() {
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const recentInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const restoreAttemptedRef = useRef(false);
@@ -625,6 +628,11 @@ export function App() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
+  function resetRecentCandidates() {
+    setRecentRecordingCandidates([]);
+    if (recentInputRef.current) recentInputRef.current.value = "";
+  }
+
   async function copyTranscript() {
     if (!transcript) return;
     await navigator.clipboard.writeText(transcript.text);
@@ -657,13 +665,31 @@ export function App() {
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const selected = event.target.files?.[0];
-    if (selected) void selectFile(selected);
+    if (selected) {
+      resetRecentCandidates();
+      void selectFile(selected);
+    }
+  }
+
+  function handleRecentFilesChange(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.target.files || []);
+    if (!selected.length) return;
+    setRecentRecordingCandidates(rankRecentRecordings(selected).slice(0, 6));
+    setError(null);
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
-    const selected = event.dataTransfer.files?.[0];
-    if (selected) void selectFile(selected);
+    const selected = Array.from(event.dataTransfer.files || []);
+    if (selected.length > 1) {
+      setRecentRecordingCandidates(rankRecentRecordings(selected).slice(0, 6));
+      setError(null);
+      return;
+    }
+    if (selected[0]) {
+      resetRecentCandidates();
+      void selectFile(selected[0]);
+    }
   }
 
   return (
@@ -691,7 +717,7 @@ export function App() {
 
         <section className="flow-section">
           <SectionTitle index="01" title="녹음 파일" note="M4A · MP3 · WAV · AAC" />
-          {!hasSource ? (
+          {!hasSource && recentRecordingCandidates.length === 0 ? (
             <div
               className="drop-zone"
               onDragOver={(event) => event.preventDefault()}
@@ -700,14 +726,68 @@ export function App() {
               <Upload size={25} />
               <strong>휴대폰 녹음 파일을 선택하세요</strong>
               <span>파일은 먼저 이 컴퓨터에서 분석됩니다.</span>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <FileAudio size={17} />
-                녹음 파일 선택
-              </button>
+              <div className="file-choice-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <FileAudio size={17} />
+                  파일 1개 선택
+                </button>
+                <button
+                  className="secondary-button recommended-picker"
+                  type="button"
+                  onClick={() => {
+                    if (recentInputRef.current) recentInputRef.current.value = "";
+                    recentInputRef.current?.click();
+                  }}
+                >
+                  <Clock3 size={17} />
+                  최근 녹음 추천
+                </button>
+              </div>
+            </div>
+          ) : !hasSource ? (
+            <div className="recent-recordings-panel">
+              <div className="recent-recordings-heading">
+                <Clock3 size={20} />
+                <div>
+                  <strong>최근 녹음 추천</strong>
+                  <span>
+                    선택한 파일 중 녹음 날짜가 가장 최근인 순서입니다.
+                  </span>
+                </div>
+                <button
+                  className="text-link"
+                  type="button"
+                  onClick={resetRecentCandidates}
+                >
+                  닫기
+                </button>
+              </div>
+              <div className="recent-recordings-list">
+                {recentRecordingCandidates.map((candidate, index) => (
+                  <button
+                    key={`${candidate.name}-${candidate.size}-${candidate.lastModified}`}
+                    type="button"
+                    onClick={() => void selectFile(candidate)}
+                  >
+                    <span className={index === 0 ? "recent-rank recommended" : "recent-rank"}>
+                      {index === 0 ? "1순위" : `${index + 1}순위`}
+                    </span>
+                    <span className="recent-file-copy">
+                      <strong>{candidate.name}</strong>
+                      <small>
+                        {formatRecordingDate(candidate)} · {formatBytes(candidate.size)}
+                      </small>
+                    </span>
+                    <span className="recent-pick-label">
+                      {index === 0 ? "추천 전사" : "선택"}
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
           ) : (
             <div className="selected-file">
@@ -742,6 +822,16 @@ export function App() {
             type="file"
             accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,audio/*"
             onChange={handleFileChange}
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+          <input
+            ref={recentInputRef}
+            className="visually-hidden"
+            type="file"
+            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,audio/*"
+            multiple
+            onChange={handleRecentFilesChange}
             aria-hidden="true"
             tabIndex={-1}
           />
@@ -1416,6 +1506,59 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
+}
+
+function rankRecentRecordings(files: File[]): File[] {
+  return [...files].sort((left, right) => {
+    const recency = recordingTimestamp(right) - recordingTimestamp(left);
+    return recency || right.size - left.size || left.name.localeCompare(right.name, "ko");
+  });
+}
+
+function formatRecordingDate(file: File): string {
+  const timestamp = recordingTimestamp(file);
+  if (!timestamp) return "날짜 정보 없음";
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(timestamp));
+}
+
+function recordingTimestamp(file: File): number {
+  return filenameRecordingTimestamp(file.name) || file.lastModified || 0;
+}
+
+function filenameRecordingTimestamp(filename: string): number {
+  const withTime = filename.match(
+    /(?:^|\D)(20\d{2}|\d{2})(\d{2})(\d{2})[_\s-]?(\d{2})(\d{2})(\d{2})(?:\D|$)/
+  );
+  const dateOnly = withTime
+    ? null
+    : filename.match(/(?:^|\D)(20\d{2}|\d{2})(\d{2})(\d{2})(?:\D|$)/);
+  const match = withTime || dateOnly;
+  if (!match) return 0;
+
+  const year = match[1].length === 2 ? 2000 + Number(match[1]) : Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4] || 0);
+  const minute = Number(match[5] || 0);
+  const second = Number(match[6] || 0);
+  const date = new Date(year, month - 1, day, hour, minute, second);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute ||
+    date.getSeconds() !== second
+  ) {
+    return 0;
+  }
+  return date.getTime();
 }
 
 function formatRemainingTime(seconds: number): string {
