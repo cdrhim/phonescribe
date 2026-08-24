@@ -1,0 +1,51 @@
+# Local runtime data
+data/
+models/
+outputs/
+frontend/dist/
+frontend/node_modules/
+
+# Secrets and tokens
+.env
+.env.*
+!.env.example
+*.token
+hf_token*
+
+# Audio/video inputs and generated transcripts
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mov
+*.flac
+*.ogg
+*.webm
+*.srt
+*.vtt
+*.docx
+transcript*.json
+meeting_minutes*.md
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.agents/
+.codex/

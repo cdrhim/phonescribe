@@ -1,0 +1,13 @@
+services:
+  local-meetscribe:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      LOCAL_MEETSCRIBE_DATA_DIR: /app/data
+      LOCAL_MEETSCRIBE_MODELS_DIR: /app/models
+      LOCAL_MEETSCRIBE_ALLOW_MOCKS: "true"
+      LOCAL_MEETSCRIBE_ALLOW_MODEL_AUTODOWNLOAD: "false"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
