@@ -29,6 +29,8 @@ import {
   downloadApiFile,
   getTranscriptionWorkflow,
   getRuntime,
+  hasApiAccessToken,
+  isApiAuthenticationError,
   startTranscriptionWorkflow,
   verifyGeminiSharePasscode
 } from "./api";
@@ -86,9 +88,10 @@ export function App() {
   const [geminiApiKey, setGeminiApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [sharePasscode, setSharePasscode] = useState("");
-  const [shareAccessReady, setShareAccessReady] = useState(false);
+  const [shareAccessReady, setShareAccessReady] = useState(hasApiAccessToken);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [verifyingShareAccess, setVerifyingShareAccess] = useState(false);
+  const [accessNeedsReconnect, setAccessNeedsReconnect] = useState(false);
   const [showKeySetup, setShowKeySetup] = useState(false);
   const [savingShareKey, setSavingShareKey] = useState(false);
   const [cloudConsent, setCloudConsent] = useState(true);
@@ -241,9 +244,14 @@ export function App() {
         if (cancelled) return;
         markWorkflowAutoDownloaded(activeWorkflowId);
         setAutoDownloadStatus(`${statusPrefix}이 기기에도 TXT를 자동 다운로드했습니다.`);
-      } catch {
+      } catch (downloadError) {
         if (!cancelled) {
-          setAutoDownloadStatus("자동 다운로드를 다시 준비하고 있습니다.");
+          if (isApiAuthenticationError(downloadError)) {
+            requireAccessReconnect();
+            setAutoDownloadStatus("비밀번호를 다시 확인하면 TXT를 자동 다운로드합니다.");
+          } else {
+            setAutoDownloadStatus("자동 다운로드를 다시 준비하고 있습니다.");
+          }
         }
       } finally {
         downloadStarting = false;
@@ -333,6 +341,7 @@ export function App() {
     try {
       const workflow = await getTranscriptionWorkflow(currentWorkflowId);
       setError(null);
+      setAccessNeedsReconnect(false);
       applyWorkflowStatus(workflow);
     } catch (workflowError) {
       const message =
@@ -343,6 +352,10 @@ export function App() {
         setStage("failed");
         setError(message);
         stopProgressPolling();
+        return;
+      }
+      if (isApiAuthenticationError(workflowError)) {
+        requireAccessReconnect();
         return;
       }
       setError("연결을 다시 확인하고 있습니다. PC의 전사 작업은 계속 진행됩니다.");
@@ -458,6 +471,13 @@ export function App() {
       }
 
       setShareAccessReady(true);
+      setAccessNeedsReconnect(false);
+      if (activeWorkflowId) {
+        setShareStatus("연결 복구 완료 · 작업 결과를 불러오고 있습니다.");
+        setError(null);
+        beginWorkflowPolling(activeWorkflowId);
+        return;
+      }
       if (!file && recentRecordingCandidates[0]) {
         setShareStatus(
           "확인 완료 · 최신 1순위 녹음을 전사하고 PC에 TXT로 자동 저장합니다."
@@ -537,6 +557,11 @@ export function App() {
         saveBaseName: baseNameFromFile(selected.name)
       });
     } catch (analysisError) {
+      if (isApiAuthenticationError(analysisError)) {
+        setStage("idle");
+        requireAccessReconnect();
+        return;
+      }
       setStage("failed");
       setError(
         analysisError instanceof Error
@@ -585,6 +610,11 @@ export function App() {
       beginWorkflowPolling(workflow.workflow_id);
     } catch (transcriptionError) {
       stopProgressPolling();
+      if (isApiAuthenticationError(transcriptionError)) {
+        setStage("ready");
+        requireAccessReconnect();
+        return;
+      }
       setStage("failed");
       setError(
         transcriptionError instanceof Error
@@ -671,12 +701,29 @@ export function App() {
     try {
       await downloadApiFile(url, downloadName);
     } catch (downloadError) {
+      if (isApiAuthenticationError(downloadError)) {
+        requireAccessReconnect();
+        return;
+      }
       setError(
         downloadError instanceof Error
           ? downloadError.message
           : "파일을 다운로드하지 못했습니다."
       );
     }
+  }
+
+  function requireAccessReconnect() {
+    clearApiAccessToken();
+    setShareAccessReady(false);
+    setAccessNeedsReconnect(true);
+    setShareStatus("보안을 위해 공유 비밀번호를 다시 확인해 주세요.");
+    setError(
+      activeWorkflowId
+        ? "PC 작업은 보존되어 있습니다. 비밀번호를 다시 확인하면 결과를 바로 가져옵니다."
+        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 자동으로 이어집니다."
+    );
+    stopProgressPolling();
   }
 
   function chooseNamingMode(mode: NamingMode) {
@@ -747,6 +794,54 @@ export function App() {
             <AlertCircle size={18} />
             <span>{error}</span>
           </div>
+        )}
+
+        {accessNeedsReconnect && shareMode && (
+          <form
+            className="workflow-reconnect"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void confirmShareAccess();
+            }}
+          >
+            <div>
+              <strong>{activeWorkflowId ? "전사 결과 연결 복구" : "Gemini 연결 복구"}</strong>
+              <span>
+                {activeWorkflowId
+                  ? "PC의 작업은 그대로 있습니다. 비밀번호만 다시 확인하세요."
+                  : "선택한 파일을 유지한 채 자동으로 다시 시작합니다."}
+              </span>
+            </div>
+            <label className="secret-input single">
+              <input
+                type="password"
+                value={sharePasscode}
+                onChange={(event) => setSharePasscode(event.target.value)}
+                placeholder="공유 비밀번호"
+                inputMode="numeric"
+                maxLength={12}
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="공유 비밀번호 다시 입력"
+              />
+            </label>
+            <button
+              className="secondary-button reconnect-button"
+              type="submit"
+              disabled={
+                verifyingShareAccess ||
+                sharePasscode.trim().length < 4 ||
+                !runtime?.gemini_share_ready
+              }
+            >
+              {verifyingShareAccess ? (
+                <Loader2 className="spin" size={17} />
+              ) : (
+                <ShieldCheck size={17} />
+              )}
+              {activeWorkflowId ? "확인하고 결과 받기" : "확인하고 자동 재개"}
+            </button>
+          </form>
         )}
 
         <section className="flow-section">

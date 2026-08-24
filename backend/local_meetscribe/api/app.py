@@ -613,7 +613,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         resolved_api_key = (gemini_api_key or "").strip()
         if share_store.passcode_configured:
-            require_share_passcode(request, share_passcode)
+            if not remote_session_is_valid(request.headers.get("authorization")):
+                require_share_passcode(request, share_passcode)
             resolved_api_key = (
                 active_settings.gemini_api_key or share_store.load_api_key() or ""
             ).strip()

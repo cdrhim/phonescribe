@@ -180,6 +180,49 @@ h1 {
   font-size: 13px;
 }
 
+.workflow-reconnect {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.7fr) auto;
+  align-items: end;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid #111111;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.workflow-reconnect > div {
+  display: grid;
+  align-self: center;
+  gap: 4px;
+}
+
+.workflow-reconnect strong {
+  font-size: 13px;
+}
+
+.workflow-reconnect span {
+  color: #686868;
+  font-size: 10px;
+}
+
+.reconnect-button {
+  min-height: 44px;
+  border-color: #111111;
+  background: #111111;
+  color: #ffffff;
+}
+
+@media (max-width: 640px) {
+  .workflow-reconnect {
+    grid-template-columns: 1fr;
+  }
+
+  .reconnect-button {
+    width: 100%;
+  }
+}
+
 .flow-section {
   display: grid;
   gap: 18px;

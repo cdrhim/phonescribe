@@ -158,8 +158,11 @@ Set `VITE_API_BASE_URL` in the Vercel project to the Funnel `https://...ts.net` 
 server with `scripts/start-network.ps1`; it enables remote session protection and allows only the
 `https://phonescribe.vercel.app` browser origin. Health, runtime discovery, and passcode verification
 remain public. Every upload, workflow-status request, and download requires the short-lived bearer
-session returned after a correct passcode. The token is held only in memory and is cleared when the
-passcode changes or the server restarts.
+session returned after a correct passcode. The token is stored only in the current tab's
+`sessionStorage`, expires with the server TTL, and is cleared when the passcode changes. This lets a
+mobile browser restore the tab after the screen turns off without losing workflow polling. If the
+server restarts or the token expires, the page keeps the workflow ID and shows an inline passcode
+form; successful re-verification resumes polling and TXT download without another upload.
 
 Tailscale runs as a Windows service and the LocalMeetScribe scheduled task starts the backend at
 sign-in. The phone and PC displays may turn off after the initial upload, but the PC itself must stay

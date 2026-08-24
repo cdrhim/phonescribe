@@ -54,10 +54,34 @@ export interface OptimizerOptions {
 }
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
-let apiAccessToken: string | null = null;
+const API_ACCESS_TOKEN_STORAGE_KEY = "local-meetscribe.remote-session.v1";
+let apiAccessToken: string | null = restoreApiAccessToken();
+
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+export function hasApiAccessToken(): boolean {
+  return Boolean(apiAccessToken);
+}
+
+export function isApiAuthenticationError(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 401;
+}
 
 export function clearApiAccessToken(): void {
   apiAccessToken = null;
+  try {
+    window.sessionStorage.removeItem(API_ACCESS_TOKEN_STORAGE_KEY);
+  } catch {
+    // Some privacy modes disable session storage; in-memory access still works.
+  }
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -78,7 +102,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail ?? response.statusText);
+    throw new ApiRequestError(String(body.detail ?? response.statusText), response.status);
   }
   return (await response.json()) as T;
 }
@@ -209,7 +233,7 @@ export function verifyGeminiSharePasscode(
     method: "POST",
     headers: { "X-LocalMeetScribe-Passcode": sharePasscode }
   }).then((result) => {
-    apiAccessToken = result.access_token;
+    saveApiAccessToken(result.access_token, result.expires_in);
     return result;
   });
 }
@@ -303,7 +327,7 @@ export async function downloadApiFile(url: string, downloadName: string): Promis
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail ?? response.statusText);
+    throw new ApiRequestError(String(body.detail ?? response.statusText), response.status);
   }
   const objectUrl = URL.createObjectURL(await response.blob());
   const anchor = document.createElement("a");
@@ -325,4 +349,38 @@ function apiUrl(url: string): string {
 function withDownloadName(url: string, downloadName: string): string {
   const separator = url.includes("?") ? "&" : "?";
   return `${url}${separator}download_name=${encodeURIComponent(downloadName)}`;
+}
+
+function saveApiAccessToken(token: string, expiresIn: number): void {
+  apiAccessToken = token;
+  try {
+    window.sessionStorage.setItem(
+      API_ACCESS_TOKEN_STORAGE_KEY,
+      JSON.stringify({
+        token,
+        expiresAt: Date.now() + Math.max(0, expiresIn) * 1000
+      })
+    );
+  } catch {
+    // Some privacy modes disable session storage; in-memory access still works.
+  }
+}
+
+function restoreApiAccessToken(): string | null {
+  try {
+    const stored = window.sessionStorage.getItem(API_ACCESS_TOKEN_STORAGE_KEY);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as { token?: unknown; expiresAt?: unknown };
+    if (
+      typeof parsed.token !== "string" ||
+      typeof parsed.expiresAt !== "number" ||
+      parsed.expiresAt <= Date.now()
+    ) {
+      window.sessionStorage.removeItem(API_ACCESS_TOKEN_STORAGE_KEY);
+      return null;
+    }
+    return parsed.token;
+  } catch {
+    return null;
+  }
 }

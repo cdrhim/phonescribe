@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -47,6 +48,20 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
     assert token and token != "3543"
     authorized = {"Authorization": f"Bearer {token}"}
     assert client.get("/api/jobs", headers=authorized).status_code == 200
+
+    package_id = "a" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    package_dir.mkdir(parents=True)
+    (package_dir / "manifest.json").write_text(
+        json.dumps({"source": {}, "recommendation": {}, "chunks": []}),
+        encoding="utf-8",
+    )
+    resumed_session_workflow = client.post(
+        "/api/workflows",
+        data={"destination": "gemini", "package_id": package_id},
+        headers=authorized,
+    )
+    assert resumed_session_workflow.status_code == 202
 
     remote_admin = client.post(
         "/api/admin/gemini-share-key",
