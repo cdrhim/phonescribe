@@ -119,12 +119,15 @@ audio and completed chunks remain on disk, so a retry does not require another u
 successful chunks.
 
 With the shared passcode flow, choose a recording and enter the passcode. The file is uploaded only
-after the passcode is verified, then optimization and transcription start automatically without a
-second button press. Shared mode skips the optional local language scan so the phone only needs to
-stay awake for the initial file transfer. As soon as the progress moves to optimization, the PC owns
+after the explicit `Confirm and auto-transcribe` action, then optimization and transcription start
+automatically without another button press. If the recent-recording list is open, confirmation picks
+the top-ranked recording automatically. Shared mode skips the optional local language scan so the
+phone only needs to stay awake for the initial file transfer. As soon as the progress moves to optimization, the PC owns
 the workflow. The phone screen may turn off or the browser may close; reopening the same workflow
 URL restores progress and results.
 When the page is visible after completion, the TXT transcript downloads automatically once. The
+network startup script also saves a collision-safe TXT copy to the server PC's
+`Downloads\PhoneScribe` folder, independently of the phone screen state. The
 page requests a Screen Wake Lock while busy when the browser exposes that API. Standard Wake Lock
 requires HTTPS, so it works with a Tailscale Serve URL but may be unavailable on a plain Wi-Fi
 `http://` address.
@@ -166,7 +169,8 @@ actively optimizing or transcribing.
 `Recent recording recommendation` lets a phone user select several recordings from the system
 picker without uploading them. The page ranks up to six candidates using a recording timestamp in
 the filename (for example, `Voice_260824_133000.m4a`) and falls back to the file's modified time.
-Only the candidate the user chooses enters the passcode-gated upload and transcription flow.
+Before passcode confirmation, the user may choose a candidate manually. After confirmation, the
+top-ranked candidate enters the upload and transcription flow automatically.
 
 After transcription, choose `Original filename`, `Auto recommendation`, or enter a custom basename.
 The selected name is applied to the TXT, JSON, optimized ZIP, and a downloadable copy of the

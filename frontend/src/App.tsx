@@ -88,6 +88,7 @@ export function App() {
   const [sharePasscode, setSharePasscode] = useState("");
   const [shareAccessReady, setShareAccessReady] = useState(false);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
+  const [verifyingShareAccess, setVerifyingShareAccess] = useState(false);
   const [showKeySetup, setShowKeySetup] = useState(false);
   const [savingShareKey, setSavingShareKey] = useState(false);
   const [cloudConsent, setCloudConsent] = useState(true);
@@ -102,6 +103,7 @@ export function App() {
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
+  const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const recentInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
@@ -160,44 +162,6 @@ export function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!runtime?.gemini_share_enabled || !runtime.gemini_share_ready) return;
-    const passcode = sharePasscode.trim();
-    if (passcode.length < 4) {
-      clearApiAccessToken();
-      setShareAccessReady(false);
-      setShareStatus(null);
-      return;
-    }
-    let active = true;
-    setShareStatus("비밀번호 확인 중");
-    const timer = window.setTimeout(() => {
-      void verifyGeminiSharePasscode(passcode)
-        .then((result) => {
-          if (!active) return;
-          setShareAccessReady(result.valid && result.key_ready);
-          setShareStatus(
-            result.valid && result.key_ready
-              ? "Gemini 기본 키에 연결되었습니다."
-              : "서버 PC에서 기본 키 등록이 필요합니다."
-          );
-        })
-        .catch((verificationError) => {
-          if (!active) return;
-          setShareAccessReady(false);
-          setShareStatus(
-            verificationError instanceof Error
-              ? verificationError.message
-              : "공유 비밀번호를 확인하지 못했습니다."
-          );
-        });
-    }, 250);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [runtime?.gemini_share_enabled, runtime?.gemini_share_ready, sharePasscode]);
-
   const shareMode = Boolean(runtime?.gemini_share_enabled);
   const serverKeyReady = Boolean(
     !shareMode &&
@@ -253,8 +217,9 @@ export function App() {
 
   useEffect(() => {
     if (stage !== "complete" || !transcript || !activeWorkflowId) return;
+    const statusPrefix = serverExportStatus ? `${serverExportStatus} · ` : "";
     if (wasWorkflowAutoDownloaded(activeWorkflowId)) {
-      setAutoDownloadStatus("TXT 전사문 다운로드가 준비되었습니다.");
+      setAutoDownloadStatus(`${statusPrefix}이 기기의 TXT 다운로드도 준비되었습니다.`);
       return;
     }
 
@@ -264,7 +229,9 @@ export function App() {
     const downloadWhenVisible = async () => {
       if (cancelled) return;
       if (document.visibilityState !== "visible") {
-        setAutoDownloadStatus("화면을 다시 켜면 TXT 전사문이 자동 다운로드됩니다.");
+        setAutoDownloadStatus(
+          `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+        );
         return;
       }
       if (downloadStarting) return;
@@ -273,7 +240,7 @@ export function App() {
         await downloadApiFile(transcript.txt_url, `${safeSaveBaseName}.txt`);
         if (cancelled) return;
         markWorkflowAutoDownloaded(activeWorkflowId);
-        setAutoDownloadStatus("TXT 전사문을 자동 다운로드했습니다.");
+        setAutoDownloadStatus(`${statusPrefix}이 기기에도 TXT를 자동 다운로드했습니다.`);
       } catch {
         if (!cancelled) {
           setAutoDownloadStatus("자동 다운로드를 다시 준비하고 있습니다.");
@@ -290,14 +257,16 @@ export function App() {
     if (document.visibilityState === "visible") {
       timer = window.setTimeout(() => void downloadWhenVisible(), 350);
     } else {
-      setAutoDownloadStatus("화면을 다시 켜면 TXT 전사문이 자동 다운로드됩니다.");
+      setAutoDownloadStatus(
+        `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+      );
     }
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [activeWorkflowId, safeSaveBaseName, stage, transcript]);
+  }, [activeWorkflowId, safeSaveBaseName, serverExportStatus, stage, transcript]);
 
   useEffect(() => {
     const wakeLockApi = "wakeLock" in navigator ? navigator.wakeLock : null;
@@ -425,6 +394,11 @@ export function App() {
       return;
     }
     if (workflow.status === "complete" && workflow.transcript) {
+      setServerExportStatus(
+        workflow.auto_exported
+          ? "서버 PC Downloads\\PhoneScribe 저장 완료"
+          : workflow.auto_export_error || null
+      );
       setTranscript(workflow.transcript);
       if (namingMode === "recommended") {
         setSaveBaseName(workflow.transcript.suggested_filename);
@@ -446,7 +420,10 @@ export function App() {
       setGeminiApiKey("");
       setShowKeySetup(false);
       setShareAccessReady(true);
-      setShareStatus("기본 키가 이 PC에 암호화되어 저장되었습니다.");
+      setShareStatus("기본 키 저장 완료 · 파일을 받으면 TXT 저장까지 자동 진행합니다.");
+      if (!file && recentRecordingCandidates[0]) {
+        await selectFile(recentRecordingCandidates[0]);
+      }
     } catch (saveError) {
       setShareAccessReady(false);
       setError(
@@ -454,6 +431,52 @@ export function App() {
       );
     } finally {
       setSavingShareKey(false);
+    }
+  }
+
+  async function confirmShareAccess() {
+    const passcode = sharePasscode.trim();
+    if (
+      passcode.length < 4 ||
+      verifyingShareAccess ||
+      !runtime?.gemini_share_enabled ||
+      !runtime.gemini_share_ready
+    ) {
+      return;
+    }
+
+    clearApiAccessToken();
+    setVerifyingShareAccess(true);
+    setShareAccessReady(false);
+    setShareStatus("비밀번호 확인 중");
+    setError(null);
+    try {
+      const result = await verifyGeminiSharePasscode(passcode);
+      if (!result.valid || !result.key_ready) {
+        setShareStatus("서버 PC에서 기본 키 등록이 필요합니다.");
+        return;
+      }
+
+      setShareAccessReady(true);
+      if (!file && recentRecordingCandidates[0]) {
+        setShareStatus(
+          "확인 완료 · 최신 1순위 녹음을 전사하고 PC에 TXT로 자동 저장합니다."
+        );
+        await selectFile(recentRecordingCandidates[0]);
+      } else if (file) {
+        setShareStatus("확인 완료 · 전사부터 PC TXT 저장까지 자동 진행합니다.");
+      } else {
+        setShareStatus("확인 완료 · 녹음 파일을 선택하면 끝까지 자동 진행합니다.");
+      }
+    } catch (verificationError) {
+      setShareAccessReady(false);
+      setShareStatus(
+        verificationError instanceof Error
+          ? verificationError.message
+          : "공유 비밀번호를 확인하지 못했습니다."
+      );
+    } finally {
+      setVerifyingShareAccess(false);
     }
   }
 
@@ -476,6 +499,7 @@ export function App() {
     setTranscriptionProgress(null);
     setActiveWorkflowId(null);
     setAutoDownloadStatus(null);
+    setServerExportStatus(null);
     setStage("idle");
   }
 
@@ -533,6 +557,7 @@ export function App() {
     setCopied(false);
     setTranscriptionProgress(null);
     setAutoDownloadStatus(null);
+    setServerExportStatus(null);
 
     try {
       setStage(optimizedPackage ? "transcribing" : "optimizing");
@@ -624,6 +649,7 @@ export function App() {
     setTranscriptionProgress(null);
     setActiveWorkflowId(null);
     setAutoDownloadStatus(null);
+    setServerExportStatus(null);
     setStage("idle");
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
@@ -674,16 +700,24 @@ export function App() {
   function handleRecentFilesChange(event: ChangeEvent<HTMLInputElement>) {
     const selected = Array.from(event.target.files || []);
     if (!selected.length) return;
-    setRecentRecordingCandidates(rankRecentRecordings(selected).slice(0, 6));
+    const ranked = rankRecentRecordings(selected).slice(0, 6);
+    setRecentRecordingCandidates(ranked);
     setError(null);
+    if (shareAccessReady) {
+      void selectFile(ranked[0]);
+    }
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     const selected = Array.from(event.dataTransfer.files || []);
     if (selected.length > 1) {
-      setRecentRecordingCandidates(rankRecentRecordings(selected).slice(0, 6));
+      const ranked = rankRecentRecordings(selected).slice(0, 6);
+      setRecentRecordingCandidates(ranked);
       setError(null);
+      if (shareAccessReady) {
+        void selectFile(ranked[0]);
+      }
       return;
     }
     if (selected[0]) {
@@ -880,29 +914,54 @@ export function App() {
 
           {shareMode ? (
             <div className="share-access">
-              <label className="key-field">
-                <span>
-                  <KeyRound size={16} />
-                   공유 비밀번호
-                   <small>확인되면 전사가 자동 시작됩니다.</small>
-                </span>
-                <span className="secret-input single">
-                  <input
-                    type="password"
-                    value={sharePasscode}
-                    onChange={(event) => {
-                      clearApiAccessToken();
-                      setSharePasscode(event.target.value);
-                      setShareAccessReady(false);
-                    }}
-                    placeholder="4자리 이상"
-                    inputMode="numeric"
-                    maxLength={12}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </span>
-              </label>
+              <form
+                className="passcode-confirm-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void confirmShareAccess();
+                }}
+              >
+                <label className="key-field">
+                  <span>
+                    <KeyRound size={16} />
+                    공유 비밀번호
+                    <small>한 번 확인하면 TXT 저장까지 자동 진행됩니다.</small>
+                  </span>
+                  <span className="secret-input single">
+                    <input
+                      type="password"
+                      value={sharePasscode}
+                      onChange={(event) => {
+                        clearApiAccessToken();
+                        setSharePasscode(event.target.value);
+                        setShareAccessReady(false);
+                        setShareStatus(null);
+                      }}
+                      placeholder="4자리 이상"
+                      inputMode="numeric"
+                      maxLength={12}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </span>
+                </label>
+                <button
+                  className="secondary-button passcode-confirm-button"
+                  type="submit"
+                  disabled={
+                    verifyingShareAccess ||
+                    sharePasscode.trim().length < 4 ||
+                    !runtime?.gemini_share_ready
+                  }
+                >
+                  {verifyingShareAccess ? (
+                    <Loader2 className="spin" size={17} />
+                  ) : (
+                    <ShieldCheck size={17} />
+                  )}
+                  확인하고 자동 전사
+                </button>
+              </form>
 
               {shareStatus && (
                 <p className={shareAccessReady ? "share-status connected" : "share-status"}>

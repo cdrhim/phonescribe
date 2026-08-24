@@ -134,6 +134,7 @@ def test_background_workflow_survives_client_request_and_keeps_text_out_of_state
         make_test_settings(tmp_path),
         enable_gemini_transcription=True,
         gemini_api_key="test-gemini-key",
+        auto_export_dir=tmp_path / "downloads" / "PhoneScribe",
     )
     media_info = MediaInfo(
         filename="phone.m4a",
@@ -253,6 +254,11 @@ def test_background_workflow_survives_client_request_and_keeps_text_out_of_state
     assert status["status"] == "complete"
     assert status["transcript"]["text"] == "background transcript"
     assert status["package"]["source"]["filename"] == "phone.m4a"
+    assert status["auto_exported"] is True
+    assert status["auto_export_error"] is None
+    assert (settings.auto_export_dir / "meeting.txt").read_text(encoding="utf-8") == (
+        "background transcript"
+    )
 
     state_path = settings.tmp_dir / "workflows" / f"{workflow_id}.json"
     assert "background transcript" not in state_path.read_text(encoding="utf-8")

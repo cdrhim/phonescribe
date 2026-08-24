@@ -527,6 +527,20 @@ h1 {
   gap: 11px;
 }
 
+.passcode-confirm-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.passcode-confirm-button {
+  min-height: 44px;
+  border-color: #111111;
+  background: #111111;
+  color: #ffffff;
+}
+
 .share-status {
   display: flex;
   align-items: center;
@@ -550,6 +564,16 @@ h1 {
   background: transparent;
   cursor: pointer;
   text-decoration: underline;
+}
+
+@media (max-width: 560px) {
+  .passcode-confirm-form {
+    grid-template-columns: 1fr;
+  }
+
+  .passcode-confirm-button {
+    width: 100%;
+  }
 }
 
 .share-key-setup {

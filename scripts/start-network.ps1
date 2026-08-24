@@ -7,12 +7,14 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $healthUrl = "http://127.0.0.1:8766/api/health"
 $logDir = Join-Path $projectRoot "data\logs"
+$phoneScribeDownloads = Join-Path ([Environment]::GetFolderPath("UserProfile")) "Downloads\PhoneScribe"
 
 # Remote requests are protected by a passcode-issued bearer session. These values
 # contain no secrets and are inherited only by the background server process.
 $env:LOCAL_MEETSCRIBE_REMOTE_ACCESS = "true"
 $env:LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC = "43200"
 $env:LOCAL_MEETSCRIBE_CORS_ORIGINS = "https://phonescribe.vercel.app,http://127.0.0.1:5173,http://localhost:5173"
+$env:LOCAL_MEETSCRIBE_AUTO_EXPORT_DIR = $phoneScribeDownloads
 
 function Test-LocalMeetScribeHealth {
     try {

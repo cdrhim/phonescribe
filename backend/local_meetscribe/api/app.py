@@ -163,16 +163,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 package_id=package_id,
                 status="transcribing",
             )
-            transcribe_gemini_package(
+            transcript_result = transcribe_gemini_package(
                 output_dir,
                 active_settings,
                 api_key=api_key,
+            )
+            auto_exported, auto_export_error = _auto_export_transcript(
+                transcript_result.txt_path,
+                transcript_result.suggested_filename,
+                active_settings.auto_export_dir,
             )
             _write_workflow_state(
                 state_path,
                 workflow_id=workflow_id,
                 package_id=package_id,
                 status="complete",
+                auto_exported=auto_exported,
+                auto_export_error=auto_export_error,
             )
         except Exception as exc:  # noqa: BLE001 - background work must persist failure state.
             if phase == "transcribing" and _gemini_outputs_complete(output_dir):
@@ -180,11 +187,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "Background workflow %s recovered completed transcript artifacts",
                     workflow_id,
                 )
+                auto_exported, auto_export_error = _auto_export_stored_transcript(
+                    output_dir,
+                    active_settings.auto_export_dir,
+                )
                 _write_workflow_state(
                     state_path,
                     workflow_id=workflow_id,
                     package_id=package_id,
                     status="complete",
+                    auto_exported=auto_exported,
+                    auto_export_error=auto_export_error,
                 )
                 return
             if phase == "optimizing":
@@ -664,12 +677,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         package_dir = active_settings.data_dir / "optimized" / package_id
         if status == "failed" and _gemini_outputs_complete(package_dir):
             status = "complete"
+            auto_exported, auto_export_error = _auto_export_stored_transcript(
+                package_dir,
+                active_settings.auto_export_dir,
+            )
+            state["auto_exported"] = auto_exported
+            state["auto_export_error"] = auto_export_error
             try:
                 _write_workflow_state(
                     state_path,
                     workflow_id=workflow_id,
                     package_id=package_id,
                     status="complete",
+                    auto_exported=auto_exported,
+                    auto_export_error=auto_export_error,
                 )
             except OSError:
                 LOGGER.info("Could not persist recovered workflow %s", workflow_id)
@@ -678,6 +699,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "package_id": package_id,
             "status": status,
             "error": None if status == "complete" else state.get("error"),
+            "auto_exported": state.get("auto_exported"),
+            "auto_export_error": state.get("auto_export_error"),
         }
         if (package_dir / "manifest.json").exists():
             response["package"] = _optimized_package_payload(package_dir, package_id)
@@ -1106,6 +1129,8 @@ def _write_workflow_state(
     package_id: str,
     status: str,
     error: str | None = None,
+    auto_exported: bool | None = None,
+    auto_export_error: str | None = None,
 ) -> None:
     payload = {
         "workflow_id": workflow_id,
@@ -1114,6 +1139,10 @@ def _write_workflow_state(
         "error": error,
         "updated_at": time.time(),
     }
+    if auto_exported is not None:
+        payload["auto_exported"] = auto_exported
+    if auto_export_error is not None:
+        payload["auto_export_error"] = auto_export_error
     path.parent.mkdir(parents=True, exist_ok=True)
     value = json.dumps(payload, ensure_ascii=False, indent=2)
     for attempt in range(5):
@@ -1158,6 +1187,62 @@ def _gemini_outputs_complete(package_dir: Path) -> bool:
         )
     except OSError:
         return False
+
+
+def _auto_export_stored_transcript(
+    package_dir: Path,
+    export_dir: Path | None,
+) -> tuple[bool | None, str | None]:
+    if export_dir is None:
+        return None, None
+    try:
+        payload = _read_json_object(package_dir / "gemini_transcript.json")
+        suggested_filename = str(payload.get("suggested_filename") or "transcript")
+    except LocalMeetScribeError:
+        suggested_filename = "transcript"
+    return _auto_export_transcript(
+        package_dir / "gemini_transcript.txt",
+        suggested_filename,
+        export_dir,
+    )
+
+
+def _auto_export_transcript(
+    source_path: Path,
+    suggested_filename: str,
+    export_dir: Path | None,
+) -> tuple[bool | None, str | None]:
+    if export_dir is None:
+        return None, None
+
+    try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = _safe_filename(suggested_filename)
+        base_name = Path(safe_name).stem if safe_name.casefold().endswith(".txt") else safe_name
+        destination = _reserve_unique_export_path(export_dir, base_name, ".txt")
+        try:
+            shutil.copy2(source_path, destination)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        LOGGER.error("Automatic transcript export failed (%s)", type(exc).__name__)
+        return False, "서버 PC의 Downloads\\PhoneScribe에 TXT를 저장하지 못했습니다."
+
+    return True, None
+
+
+def _reserve_unique_export_path(export_dir: Path, base_name: str, suffix: str) -> Path:
+    for index in range(1, 10_000):
+        numbered_suffix = "" if index == 1 else f"_{index}"
+        candidate = export_dir / f"{base_name}{numbered_suffix}{suffix}"
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return candidate
+    raise OSError("Could not reserve a unique transcript export path")
 
 
 def _request_system_awake() -> Callable[[], None]:

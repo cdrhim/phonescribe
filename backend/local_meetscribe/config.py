@@ -39,6 +39,7 @@ class Settings:
         "http://127.0.0.1:5173",
         "http://localhost:5173",
     )
+    auto_export_dir: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -99,6 +100,7 @@ def get_settings() -> Settings:
             "LOCAL_MEETSCRIBE_CORS_ORIGINS",
             ("http://127.0.0.1:5173", "http://localhost:5173"),
         ),
+        auto_export_dir=_env_optional_path("LOCAL_MEETSCRIBE_AUTO_EXPORT_DIR"),
     )
 
 
@@ -109,8 +111,10 @@ def ensure_runtime_dirs(settings: Settings) -> None:
         settings.uploads_dir,
         settings.jobs_dir,
         settings.tmp_dir,
+        settings.auto_export_dir,
     ):
-        path.mkdir(parents=True, exist_ok=True)
+        if path is not None:
+            path.mkdir(parents=True, exist_ok=True)
 
 
 def _default_tool(name: str) -> str:
@@ -147,3 +151,10 @@ def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
         return default
     parsed = tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())
     return parsed or default
+
+
+def _env_optional_path(name: str) -> Path | None:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()

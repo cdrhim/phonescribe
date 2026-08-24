@@ -144,6 +144,8 @@ export interface TranscriptionWorkflowStart {
 
 export interface TranscriptionWorkflowStatus extends TranscriptionWorkflowStart {
   error: string | null;
+  auto_exported?: boolean | null;
+  auto_export_error?: string | null;
   package?: OptimizedPackageResult;
   transcription_progress?: GeminiTranscriptionProgress;
   transcript?: GeminiTranscriptResult;
