@@ -145,12 +145,7 @@ def test_background_workflow_survives_client_request_and_keeps_text_out_of_state
     monkeypatch.setattr(
         app_module,
         "quick_scan_glossary",
-        lambda *_args, **_kwargs: GlossaryScanResult(
-            terms=[],
-            preview_text="",
-            detected_language="ko",
-            scan_seconds=30,
-        ),
+        lambda *_args, **_kwargs: pytest.fail("shared mode must skip the quick scan"),
     )
 
     def fake_optimize(
@@ -239,9 +234,10 @@ def test_background_workflow_survives_client_request_and_keeps_text_out_of_state
     client = TestClient(app_module.create_app(settings))
     analysis = client.post(
         "/api/optimizer/analyze",
-        data={"destination": "gemini", "language": "auto"},
+        data={"destination": "gemini", "language": "auto", "quick_scan": "false"},
         files={"file": ("phone.m4a", b"phone recording", "audio/mp4")},
     ).json()
+    assert analysis["quick_scan"]["detected_language"] == "unknown"
 
     start_response = client.post(
         "/api/workflows",

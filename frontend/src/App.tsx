@@ -22,8 +22,10 @@ import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
 import {
   type OptimizerOptions,
   analyzeOptimizer,
+  clearApiAccessToken,
   configureGeminiShareKey,
   createOptimizerPackage,
+  downloadApiFile,
   getTranscriptionWorkflow,
   getRuntime,
   startTranscriptionWorkflow,
@@ -71,6 +73,7 @@ export function App() {
   const [sourceName, setSourceName] = useState("");
   const [sourceBytes, setSourceBytes] = useState(0);
   const [runtime, setRuntime] = useState<RuntimeProfile | null>(null);
+  const [runtimeChecked, setRuntimeChecked] = useState(false);
   const [scan, setScan] = useState<QuickScanResult | null>(null);
   const [recommendation, setRecommendation] =
     useState<OptimizerRecommendationResponse | null>(null);
@@ -102,10 +105,14 @@ export function App() {
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const restoreAttemptedRef = useRef(false);
   const workflowStartingRef = useRef(false);
+  const analysisStartingRef = useRef(false);
   const autoStartSuppressedRef = useRef(false);
 
   useEffect(() => {
-    void getRuntime().then(setRuntime).catch(() => setRuntime(null));
+    void getRuntime()
+      .then(setRuntime)
+      .catch(() => setRuntime(null))
+      .finally(() => setRuntimeChecked(true));
   }, []);
 
   useEffect(() => {
@@ -154,6 +161,7 @@ export function App() {
     if (!runtime?.gemini_share_enabled || !runtime.gemini_share_ready) return;
     const passcode = sharePasscode.trim();
     if (passcode.length < 4) {
+      clearApiAccessToken();
       setShareAccessReady(false);
       setShareStatus(null);
       return;
@@ -215,6 +223,20 @@ export function App() {
 
   useEffect(() => {
     if (
+      !runtimeChecked ||
+      !file ||
+      recommendation ||
+      stage !== "idle" ||
+      analysisStartingRef.current ||
+      (shareMode && !shareAccessReady)
+    ) {
+      return;
+    }
+    void analyzeSelectedFile(file);
+  }, [file, recommendation, runtimeChecked, shareAccessReady, shareMode, stage]);
+
+  useEffect(() => {
+    if (
       !shareMode ||
       stage !== "ready" ||
       !canStart ||
@@ -235,26 +257,35 @@ export function App() {
 
     let cancelled = false;
     let timer: number | null = null;
-    const downloadWhenVisible = () => {
+    let downloadStarting = false;
+    const downloadWhenVisible = async () => {
       if (cancelled) return;
       if (document.visibilityState !== "visible") {
         setAutoDownloadStatus("화면을 다시 켜면 TXT 전사문이 자동 다운로드됩니다.");
         return;
       }
-      triggerBrowserDownload(
-        withDownloadName(transcript.txt_url, `${safeSaveBaseName}.txt`),
-        `${safeSaveBaseName}.txt`
-      );
-      markWorkflowAutoDownloaded(activeWorkflowId);
-      setAutoDownloadStatus("TXT 전사문을 자동 다운로드했습니다.");
+      if (downloadStarting) return;
+      downloadStarting = true;
+      try {
+        await downloadApiFile(transcript.txt_url, `${safeSaveBaseName}.txt`);
+        if (cancelled) return;
+        markWorkflowAutoDownloaded(activeWorkflowId);
+        setAutoDownloadStatus("TXT 전사문을 자동 다운로드했습니다.");
+      } catch {
+        if (!cancelled) {
+          setAutoDownloadStatus("자동 다운로드를 다시 준비하고 있습니다.");
+        }
+      } finally {
+        downloadStarting = false;
+      }
     };
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") downloadWhenVisible();
+      if (document.visibilityState === "visible") void downloadWhenVisible();
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     if (document.visibilityState === "visible") {
-      timer = window.setTimeout(downloadWhenVisible, 350);
+      timer = window.setTimeout(() => void downloadWhenVisible(), 350);
     } else {
       setAutoDownloadStatus("화면을 다시 켜면 TXT 전사문이 자동 다운로드됩니다.");
     }
@@ -442,10 +473,20 @@ export function App() {
     setTranscriptionProgress(null);
     setActiveWorkflowId(null);
     setAutoDownloadStatus(null);
-    setStage("analyzing");
+    setStage("idle");
+  }
 
+  async function analyzeSelectedFile(selected: File) {
+    if (analysisStartingRef.current) return;
+    analysisStartingRef.current = true;
+    setStage("analyzing");
+    setError(null);
     try {
-      const analysis = await analyzeOptimizer(geminiOptimizerOptions(selected), "auto");
+      const analysis = await analyzeOptimizer(
+        geminiOptimizerOptions(selected),
+        "auto",
+        !shareMode
+      );
       setRecommendation({
         source: analysis.source,
         original_bytes: analysis.original_bytes,
@@ -475,6 +516,8 @@ export function App() {
           ? analysisError.message
           : "녹음 파일을 분석하지 못했습니다."
       );
+    } finally {
+      analysisStartingRef.current = false;
     }
   }
 
@@ -589,6 +632,19 @@ export function App() {
     window.setTimeout(() => setCopied(false), 1800);
   }
 
+  async function downloadResult(url: string, downloadName: string) {
+    setError(null);
+    try {
+      await downloadApiFile(url, downloadName);
+    } catch (downloadError) {
+      setError(
+        downloadError instanceof Error
+          ? downloadError.message
+          : "파일을 다운로드하지 못했습니다."
+      );
+    }
+  }
+
   function chooseNamingMode(mode: NamingMode) {
     setNamingMode(mode);
     if (mode === "original" && displaySourceName) {
@@ -661,7 +717,11 @@ export function App() {
                 <span>
                   {stage === "analyzing"
                     ? "길이, 언어, 전사 방식을 확인하고 있습니다."
-                    : "분석 완료"}
+                    : recommendation
+                      ? "분석 완료"
+                      : shareMode
+                        ? "비밀번호 확인 후 자동 업로드됩니다."
+                        : "업로드 준비 중"}
                 </span>
               </div>
               <button
@@ -741,6 +801,7 @@ export function App() {
                     type="password"
                     value={sharePasscode}
                     onChange={(event) => {
+                      clearApiAccessToken();
                       setSharePasscode(event.target.value);
                       setShareAccessReady(false);
                     }}
@@ -921,7 +982,17 @@ export function App() {
             <span>
               오디오 최적화 완료 · {optimizedPackage.chunks.length}개 파일
             </span>
-            <a href={optimizedPackage.package_url}>ZIP</a>
+            <button
+              type="button"
+              onClick={() =>
+                void downloadResult(
+                  optimizedPackage.package_url,
+                  `${safeSaveBaseName}_audio.zip`
+                )
+              }
+            >
+              ZIP
+            </button>
           </div>
         )}
 
@@ -948,20 +1019,26 @@ export function App() {
                 >
                   {copied ? <Check size={18} /> : <Clipboard size={18} />}
                 </button>
-                <a
+                <button
                   className="download-button"
-                  href={withDownloadName(transcript.txt_url, `${safeSaveBaseName}.txt`)}
+                  type="button"
+                  onClick={() =>
+                    void downloadResult(transcript.txt_url, `${safeSaveBaseName}.txt`)
+                  }
                 >
                   <Download size={16} />
                   TXT
-                </a>
-                <a
+                </button>
+                <button
                   className="download-button"
-                  href={withDownloadName(transcript.json_url, `${safeSaveBaseName}.json`)}
+                  type="button"
+                  onClick={() =>
+                    void downloadResult(transcript.json_url, `${safeSaveBaseName}.json`)
+                  }
                 >
                   <Download size={16} />
                   JSON
-                </a>
+                </button>
               </div>
             </div>
 
@@ -1024,16 +1101,19 @@ export function App() {
                 </a>
               )}
               {optimizedPackage && (
-                <a
+                <button
                   className="download-button"
-                  href={withDownloadName(
-                    optimizedPackage.package_url,
-                    `${safeSaveBaseName}_audio.zip`
-                  )}
+                  type="button"
+                  onClick={() =>
+                    void downloadResult(
+                      optimizedPackage.package_url,
+                      `${safeSaveBaseName}_audio.zip`
+                    )
+                  }
                 >
                   <Download size={16} />
                   최적화 ZIP
-                </a>
+                </button>
               )}
             </div>
             <p className="rename-note">
@@ -1061,16 +1141,19 @@ export function App() {
               패키지 만들기
             </button>
             {optimizedPackage && (
-              <a
+              <button
                 className="text-link"
-                href={withDownloadName(
-                  optimizedPackage.package_url,
-                  `${safeSaveBaseName}_audio.zip`
-                )}
+                type="button"
+                onClick={() =>
+                  void downloadResult(
+                    optimizedPackage.package_url,
+                    `${safeSaveBaseName}_audio.zip`
+                  )
+                }
               >
                 최적화 ZIP 다운로드
                 <Download size={14} />
-              </a>
+              </button>
             )}
           </div>
         </details>
@@ -1360,21 +1443,6 @@ function sanitizeDownloadBaseName(value: string): string {
     .trim()
     .replace(/[. ]+$/g, "")
     .slice(0, 96);
-}
-
-function withDownloadName(url: string, downloadName: string): string {
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}download_name=${encodeURIComponent(downloadName)}`;
-}
-
-function triggerBrowserDownload(url: string, downloadName: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = downloadName;
-  anchor.style.display = "none";
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
 }
 
 function wasWorkflowAutoDownloaded(workflowId: string): boolean {

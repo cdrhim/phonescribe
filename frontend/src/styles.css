@@ -630,9 +630,15 @@ h1 {
   font-size: 11px;
 }
 
-.resume-line a {
+.resume-line button {
+  padding: 0;
+  border: 0;
+  background: none;
   color: #111111;
+  cursor: pointer;
+  font: inherit;
   font-weight: 800;
+  text-decoration: underline;
 }
 
 .result-section {

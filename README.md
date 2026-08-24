@@ -118,11 +118,12 @@ model to the stable audio-capable `gemini-3.5-flash` and `gemini-3.5-flash-lite`
 audio and completed chunks remain on disk, so a retry does not require another upload or repeat
 successful chunks.
 
-With the shared passcode flow, enter the passcode and choose a recording. As soon as the upload is
-analyzed and the passcode is verified, optimization and transcription start automatically without
-a second button press. On a phone, keep the page open until the initial upload and analysis finish.
-The PC then performs optimization and Gemini transcription in the background. The phone screen may
-turn off or the browser may close; reopening the same workflow URL restores progress and results.
+With the shared passcode flow, choose a recording and enter the passcode. The file is uploaded only
+after the passcode is verified, then optimization and transcription start automatically without a
+second button press. Shared mode skips the optional local language scan so the phone only needs to
+stay awake for the initial file transfer. As soon as the progress moves to optimization, the PC owns
+the workflow. The phone screen may turn off or the browser may close; reopening the same workflow
+URL restores progress and results.
 When the page is visible after completion, the TXT transcript downloads automatically once. The
 page requests a Screen Wake Lock while busy when the browser exposes that API. Standard Wake Lock
 requires HTTPS, so it works with a Tailscale Serve URL but may be unavailable on a plain Wi-Fi
@@ -143,16 +144,24 @@ Start or verify the Wi-Fi server with:
 powershell -ExecutionPolicy Bypass -File .\scripts\start-network.ps1
 ```
 
-For private access from anywhere, install Tailscale on this PC and the phone or laptop that will
-open LocalMeetScribe, sign both into the same tailnet, then run:
+For the public Vercel frontend, install Tailscale on this PC, sign in, and expose only the local API
+through a stable HTTPS Funnel:
 
 ```powershell
-tailscale serve --bg http://127.0.0.1:8766
+tailscale funnel --bg http://127.0.0.1:8766
 ```
 
-Tailscale provides a stable private HTTPS `*.ts.net` address. Keep Tailscale Funnel disabled:
-Funnel makes the service public, while Serve limits it to devices and users allowed by the
-tailnet.
+Set `VITE_API_BASE_URL` in the Vercel project to the Funnel `https://...ts.net` origin. Start the
+server with `scripts/start-network.ps1`; it enables remote session protection and allows only the
+`https://phonescribe.vercel.app` browser origin. Health, runtime discovery, and passcode verification
+remain public. Every upload, workflow-status request, and download requires the short-lived bearer
+session returned after a correct passcode. The token is held only in memory and is cleared when the
+passcode changes or the server restarts.
+
+Tailscale runs as a Windows service and the LocalMeetScribe scheduled task starts the backend at
+sign-in. The phone and PC displays may turn off after the initial upload, but the PC itself must stay
+powered on and connected to the internet. Windows prevents system sleep only while a workflow is
+actively optimizing or transcribing.
 
 After transcription, choose `Original filename`, `Auto recommendation`, or enter a custom basename.
 The selected name is applied to the TXT, JSON, optimized ZIP, and a downloadable copy of the

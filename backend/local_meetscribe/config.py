@@ -33,6 +33,12 @@ class Settings:
     faster_whisper_cpu_model: str = "small"
     faster_whisper_cuda_model: str = "turbo"
     faster_whisper_cpu_threads: int = 0
+    remote_access_enabled: bool = False
+    remote_session_ttl_sec: int = 12 * 60 * 60
+    cors_origins: tuple[str, ...] = (
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    )
 
     @property
     def db_path(self) -> Path:
@@ -84,6 +90,15 @@ def get_settings() -> Settings:
         faster_whisper_cpu_model=os.getenv("LOCAL_MEETSCRIBE_FASTER_WHISPER_CPU_MODEL", "small"),
         faster_whisper_cuda_model=os.getenv("LOCAL_MEETSCRIBE_FASTER_WHISPER_CUDA_MODEL", "turbo"),
         faster_whisper_cpu_threads=_env_int("LOCAL_MEETSCRIBE_FASTER_WHISPER_CPU_THREADS", 0),
+        remote_access_enabled=_env_bool("LOCAL_MEETSCRIBE_REMOTE_ACCESS", False),
+        remote_session_ttl_sec=max(
+            300,
+            _env_int("LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC", 12 * 60 * 60),
+        ),
+        cors_origins=_env_csv(
+            "LOCAL_MEETSCRIBE_CORS_ORIGINS",
+            ("http://127.0.0.1:5173", "http://localhost:5173"),
+        ),
     )
 
 
@@ -124,3 +139,11 @@ def _env_int(name: str, default: int) -> int:
         return int(value.strip())
     except ValueError:
         return default
+
+
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    parsed = tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())
+    return parsed or default

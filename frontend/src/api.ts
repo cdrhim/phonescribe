@@ -53,10 +53,21 @@ export interface OptimizerOptions {
   denoise: boolean;
 }
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+let apiAccessToken: string | null = null;
+
+export function clearApiAccessToken(): void {
+  apiAccessToken = null;
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(url, init);
+    const headers = new Headers(init?.headers);
+    if (apiAccessToken && !headers.has("Authorization")) {
+      headers.set("Authorization", `Bearer ${apiAccessToken}`);
+    }
+    response = await fetch(apiUrl(url), { ...init, headers });
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(
@@ -115,10 +126,12 @@ export function recommendOptimizer(
 
 export function analyzeOptimizer(
   options: OptimizerOptions,
-  language: Language
+  language: Language,
+  quickScan = true
 ): Promise<OptimizerAnalysisResponse> {
   const form = optimizerForm(options);
   form.append("language", language);
+  form.append("quick_scan", String(quickScan));
   return request<OptimizerAnalysisResponse>("/api/optimizer/analyze", {
     method: "POST",
     body: form
@@ -185,10 +198,19 @@ export function getTranscriptionWorkflow(
 
 export function verifyGeminiSharePasscode(
   sharePasscode: string
-): Promise<{ valid: boolean; key_ready: boolean }> {
-  return request<{ valid: boolean; key_ready: boolean }>("/api/gemini-share/verify", {
+): Promise<{ valid: boolean; key_ready: boolean; expires_in: number }> {
+  clearApiAccessToken();
+  return request<{
+    valid: boolean;
+    key_ready: boolean;
+    access_token: string;
+    expires_in: number;
+  }>("/api/gemini-share/verify", {
     method: "POST",
     headers: { "X-LocalMeetScribe-Passcode": sharePasscode }
+  }).then((result) => {
+    apiAccessToken = result.access_token;
+    return result;
   });
 }
 
@@ -265,9 +287,42 @@ export function saveTranscript(transcript: Transcript): Promise<Transcript> {
 }
 
 export function exportUrl(jobId: string, kind: ExportKind): string {
-  return `/api/jobs/${jobId}/exports/${kind}`;
+  return apiUrl(`/api/jobs/${jobId}/exports/${kind}`);
 }
 
 export function audioUrl(jobId: string): string {
-  return `/api/jobs/${jobId}/audio`;
+  return apiUrl(`/api/jobs/${jobId}/audio`);
+}
+
+export async function downloadApiFile(url: string, downloadName: string): Promise<void> {
+  const headers = new Headers();
+  if (apiAccessToken) headers.set("Authorization", `Bearer ${apiAccessToken}`);
+  const response = await fetch(apiUrl(withDownloadName(url, downloadName)), {
+    headers,
+    cache: "no-store"
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(body.detail ?? response.statusText);
+  }
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = downloadName;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+function apiUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) return url;
+  const normalized = url.startsWith("/") ? url : `/${url}`;
+  return `${API_BASE_URL}${normalized}`;
+}
+
+function withDownloadName(url: string, downloadName: string): string {
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}download_name=${encodeURIComponent(downloadName)}`;
 }

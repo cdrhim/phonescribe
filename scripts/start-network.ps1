@@ -8,6 +8,12 @@ $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $healthUrl = "http://127.0.0.1:8766/api/health"
 $logDir = Join-Path $projectRoot "data\logs"
 
+# Remote requests are protected by a passcode-issued bearer session. These values
+# contain no secrets and are inherited only by the background server process.
+$env:LOCAL_MEETSCRIBE_REMOTE_ACCESS = "true"
+$env:LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC = "43200"
+$env:LOCAL_MEETSCRIBE_CORS_ORIGINS = "https://phonescribe.vercel.app,http://127.0.0.1:5173,http://localhost:5173"
+
 function Test-LocalMeetScribeHealth {
     try {
         $response = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
@@ -67,4 +73,5 @@ if (-not $Quiet) {
         ForEach-Object {
             Write-Output ("  {0}: http://{1}:8766/" -f $_.InterfaceAlias, $_.IPAddress)
         }
+    Write-Output "  Public frontend: https://phonescribe.vercel.app/"
 }

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -26,7 +27,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from local_meetscribe.config import Settings, ensure_runtime_dirs, get_settings
@@ -70,6 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     share_store = GeminiShareStore(active_settings.data_dir)
     share_failures: dict[str, list[float]] = {}
     share_failure_lock = threading.Lock()
+    remote_sessions: dict[str, float] = {}
+    remote_session_lock = threading.Lock()
     active_workflow_inputs: set[str] = set()
     active_workflow_lock = threading.Lock()
 
@@ -94,6 +97,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="공유 비밀번호가 맞지 않습니다.")
         with share_failure_lock:
             share_failures.pop(client_id, None)
+
+    def issue_remote_session() -> str:
+        now = time.time()
+        token = secrets.token_urlsafe(32)
+        with remote_session_lock:
+            expired = [value for value, expires_at in remote_sessions.items() if expires_at <= now]
+            for value in expired:
+                remote_sessions.pop(value, None)
+            remote_sessions[token] = now + active_settings.remote_session_ttl_sec
+        return token
+
+    def remote_session_is_valid(authorization: str | None) -> bool:
+        scheme, separator, token = (authorization or "").partition(" ")
+        if not separator or scheme.casefold() != "bearer" or not token:
+            return False
+        now = time.time()
+        with remote_session_lock:
+            expires_at = remote_sessions.get(token)
+            if expires_at is None:
+                return False
+            if expires_at <= now:
+                remote_sessions.pop(token, None)
+                return False
+        return True
 
     def run_transcription_workflow(
         workflow_id: str,
@@ -183,11 +210,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="LocalMeetScribe", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=list(active_settings.cors_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def protect_remote_api(request: Request, call_next: Callable):
+        public_api_paths = {
+            "/api/health",
+            "/api/runtime",
+            "/api/gemini-share/verify",
+        }
+        requires_session = (
+            active_settings.remote_access_enabled
+            and request.method != "OPTIONS"
+            and request.url.path.startswith("/api/")
+            and request.url.path not in public_api_paths
+            and not _is_loopback_request(request)
+        )
+        if requires_session and not remote_session_is_valid(
+            request.headers.get("authorization")
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "공유 비밀번호를 다시 확인하세요."},
+            )
+        return await call_next(request)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -223,13 +273,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def verify_gemini_share(
         request: Request,
         share_passcode: Annotated[str | None, Header(alias="X-LocalMeetScribe-Passcode")] = None,
-    ) -> dict[str, bool]:
+    ) -> dict[str, object]:
         if not share_store.passcode_configured:
             raise HTTPException(status_code=404, detail="Shared Gemini access is not configured.")
         require_share_passcode(request, share_passcode)
         return {
             "valid": True,
             "key_ready": bool(active_settings.gemini_api_key or share_store.api_key_configured),
+            "access_token": issue_remote_session(),
+            "expires_in": active_settings.remote_session_ttl_sec,
         }
 
     @app.post("/api/admin/gemini-share-key")
@@ -264,6 +316,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         speech_filter: Annotated[bool, Form()] = True,
         denoise: Annotated[bool, Form()] = False,
         language: Annotated[str, Form()] = "auto",
+        run_quick_scan: Annotated[bool, Form(alias="quick_scan")] = True,
     ) -> dict[str, object]:
         if language not in {"auto", "ko", "en"}:
             raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
@@ -297,35 +350,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 source_path.stat().st_size,
                 optimizer_request,
             )
-            try:
-                scan = quick_scan_glossary(
-                    source_path,
-                    scan_dir,
-                    active_settings,
-                    language=language,  # type: ignore[arg-type]
-                )
-                quick_scan: dict[str, object] = {
-                    "glossary": scan.terms,
-                    "preview_text": scan.preview_text,
-                    "detected_language": scan.detected_language,
-                    "scan_seconds": scan.scan_seconds,
-                    "warning": scan.warning,
-                }
-            except Exception as exc:  # noqa: BLE001 - glossary scan is optional.
-                LOGGER.info(
-                    "Quick scan unavailable for staged upload %s (%s)",
-                    upload_id,
-                    type(exc).__name__,
-                )
+            if not run_quick_scan:
                 quick_scan = {
                     "glossary": [],
                     "preview_text": "",
                     "detected_language": "unknown",
                     "scan_seconds": 0,
-                    "warning": "빠른 언어 스캔을 건너뛰었습니다.",
+                    "warning": None,
                 }
-            finally:
-                shutil.rmtree(scan_dir, ignore_errors=True)
+            else:
+                try:
+                    scan = quick_scan_glossary(
+                        source_path,
+                        scan_dir,
+                        active_settings,
+                        language=language,  # type: ignore[arg-type]
+                    )
+                    quick_scan = {
+                        "glossary": scan.terms,
+                        "preview_text": scan.preview_text,
+                        "detected_language": scan.detected_language,
+                        "scan_seconds": scan.scan_seconds,
+                        "warning": scan.warning,
+                    }
+                except Exception as exc:  # noqa: BLE001 - glossary scan is optional.
+                    LOGGER.info(
+                        "Quick scan unavailable for staged upload %s (%s)",
+                        upload_id,
+                        type(exc).__name__,
+                    )
+                    quick_scan = {
+                        "glossary": [],
+                        "preview_text": "",
+                        "detected_language": "unknown",
+                        "scan_seconds": 0,
+                        "warning": "빠른 언어 스캔을 건너뛰었습니다.",
+                    }
+                finally:
+                    shutil.rmtree(scan_dir, ignore_errors=True)
 
             return {
                 "upload_id": upload_id,
@@ -1212,7 +1274,12 @@ def _prune_staged_uploads(staged_root: Path) -> None:
 
 
 def _is_loopback_request(request: Request) -> bool:
-    host = request.client.host if request.client else ""
+    client_host = request.client.host if request.client else ""
+    request_host = request.url.hostname or ""
+    return _is_loopback_host(client_host) and _is_loopback_host(request_host)
+
+
+def _is_loopback_host(host: str) -> bool:
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
