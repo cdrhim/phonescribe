@@ -164,6 +164,11 @@ mobile browser restore the tab after the screen turns off without losing workflo
 server restarts or the token expires, the page keeps the workflow ID and shows an inline passcode
 form; successful re-verification resumes polling and TXT download without another upload.
 
+`다른 파일 선택` stays available even while restoring a job or waiting for authentication.
+It opens the file picker directly; cancelling keeps the current recording. Selecting a new file
+clears the old workflow's browser recovery state and ignores its pending responses, while leaving
+all accepted server jobs and transcript files untouched.
+
 Tailscale runs as a Windows service and the LocalMeetScribe scheduled task starts the backend at
 sign-in. The phone and PC displays may turn off after the initial upload, but the PC itself must stay
 powered on and connected to the internet. Windows prevents system sleep only while a workflow is
@@ -216,6 +221,7 @@ Frontend:
 
 ```bash
 cd frontend
+npm test
 npm run build
 ```
 

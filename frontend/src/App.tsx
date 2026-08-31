@@ -14,7 +14,6 @@ import {
   Loader2,
   MonitorSmartphone,
   Play,
-  RotateCcw,
   ShieldCheck,
   Smartphone,
   Upload
@@ -111,10 +110,13 @@ export function App() {
   const recentInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
-  const restoreAttemptedRef = useRef(false);
   const workflowStartingRef = useRef(false);
   const analysisStartingRef = useRef(false);
   const autoStartSuppressedRef = useRef(false);
+  // Switching recordings detaches the UI, never cancels a server-side workflow.
+  const selectionVersionRef = useRef(0);
+  const pollingVersionRef = useRef(0);
+  const pollingInFlightRef = useRef<number | null>(null);
 
   useEffect(() => {
     void getRuntime()
@@ -135,17 +137,14 @@ export function App() {
 
   useEffect(
     () => () => {
-      if (workflowTimerRef.current !== null) {
-        window.clearInterval(workflowTimerRef.current);
-      }
+      selectionVersionRef.current += 1;
+      stopProgressPolling();
       void wakeLockRef.current?.release();
     },
     []
   );
 
   useEffect(() => {
-    if (restoreAttemptedRef.current) return;
-    restoreAttemptedRef.current = true;
     const saved = loadPersistedWorkflow();
     const resumableWorkflowId = saved?.workflowId || workflowIdFromUrl();
     if (saved) {
@@ -331,19 +330,27 @@ export function App() {
   }, [busy]);
 
   function stopProgressPolling() {
+    pollingVersionRef.current += 1;
     if (workflowTimerRef.current !== null) {
       window.clearInterval(workflowTimerRef.current);
       workflowTimerRef.current = null;
     }
   }
 
-  async function refreshWorkflow(currentWorkflowId: string) {
+  async function refreshWorkflow(currentWorkflowId: string, pollingVersion: number) {
+    if (
+      pollingVersion !== pollingVersionRef.current ||
+      pollingInFlightRef.current === pollingVersion
+    ) return;
+    pollingInFlightRef.current = pollingVersion;
     try {
       const workflow = await getTranscriptionWorkflow(currentWorkflowId);
+      if (pollingVersion !== pollingVersionRef.current) return;
       setError(null);
       setAccessNeedsReconnect(false);
       applyWorkflowStatus(workflow);
     } catch (workflowError) {
+      if (pollingVersion !== pollingVersionRef.current) return;
       const message =
         workflowError instanceof Error
           ? workflowError.message
@@ -359,14 +366,19 @@ export function App() {
         return;
       }
       setError("연결을 다시 확인하고 있습니다. PC의 전사 작업은 계속 진행됩니다.");
+    } finally {
+      if (pollingInFlightRef.current === pollingVersion) {
+        pollingInFlightRef.current = null;
+      }
     }
   }
 
   function beginWorkflowPolling(currentWorkflowId: string) {
     stopProgressPolling();
-    void refreshWorkflow(currentWorkflowId);
+    const pollingVersion = pollingVersionRef.current;
+    void refreshWorkflow(currentWorkflowId, pollingVersion);
     workflowTimerRef.current = window.setInterval(
-      () => void refreshWorkflow(currentWorkflowId),
+      () => void refreshWorkflow(currentWorkflowId, pollingVersion),
       1000
     );
   }
@@ -425,6 +437,7 @@ export function App() {
     const apiKey = geminiApiKey.trim();
     const passcode = sharePasscode.trim();
     if (apiKey.length < 20 || passcode.length < 4 || savingShareKey) return;
+    const selectionVersion = selectionVersionRef.current;
     setSavingShareKey(true);
     setError(null);
     try {
@@ -434,7 +447,7 @@ export function App() {
       setShowKeySetup(false);
       setShareAccessReady(true);
       setShareStatus("기본 키 저장 완료 · 파일을 받으면 TXT 저장까지 자동 진행합니다.");
-      if (!file && recentRecordingCandidates[0]) {
+      if (selectionVersion === selectionVersionRef.current && !file && recentRecordingCandidates[0]) {
         await selectFile(recentRecordingCandidates[0]);
       }
     } catch (saveError) {
@@ -448,6 +461,7 @@ export function App() {
   }
 
   async function confirmShareAccess() {
+    const selectionVersion = selectionVersionRef.current;
     const passcode = sharePasscode.trim();
     if (
       passcode.length < 4 ||
@@ -472,6 +486,10 @@ export function App() {
 
       setShareAccessReady(true);
       setAccessNeedsReconnect(false);
+      if (selectionVersion !== selectionVersionRef.current) {
+        setShareStatus("확인 완료 · 새로 선택한 녹음 파일로 진행합니다.");
+        return;
+      }
       if (activeWorkflowId) {
         setShareStatus("연결 복구 완료 · 작업 결과를 불러오고 있습니다.");
         setError(null);
@@ -501,30 +519,16 @@ export function App() {
   }
 
   async function selectFile(selected: File) {
-    stopProgressPolling();
-    clearPersistedWorkflow();
-    autoStartSuppressedRef.current = false;
+    resetFile();
     setFile(selected);
     setSourceName(selected.name);
     setSourceBytes(selected.size);
-    setScan(null);
-    setRecommendation(null);
-    setStagedUploadId(null);
-    setOptimizedPackage(null);
-    setTranscript(null);
-    setError(null);
-    setCopied(false);
-    setNamingMode("original");
     setSaveBaseName(baseNameFromFile(selected.name));
-    setTranscriptionProgress(null);
-    setActiveWorkflowId(null);
-    setAutoDownloadStatus(null);
-    setServerExportStatus(null);
-    setStage("idle");
   }
 
   async function analyzeSelectedFile(selected: File) {
     if (analysisStartingRef.current) return;
+    const selectionVersion = selectionVersionRef.current;
     analysisStartingRef.current = true;
     setStage("analyzing");
     setError(null);
@@ -534,6 +538,7 @@ export function App() {
         "auto",
         !shareMode
       );
+      if (selectionVersion !== selectionVersionRef.current) return;
       setRecommendation({
         source: analysis.source,
         original_bytes: analysis.original_bytes,
@@ -557,6 +562,7 @@ export function App() {
         saveBaseName: baseNameFromFile(selected.name)
       });
     } catch (analysisError) {
+      if (selectionVersion !== selectionVersionRef.current) return;
       if (isApiAuthenticationError(analysisError)) {
         setStage("idle");
         requireAccessReconnect();
@@ -569,12 +575,13 @@ export function App() {
           : "녹음 파일을 분석하지 못했습니다."
       );
     } finally {
-      analysisStartingRef.current = false;
+      if (selectionVersion === selectionVersionRef.current) analysisStartingRef.current = false;
     }
   }
 
   async function startTranscription() {
     if (!canStart || !recommendation || workflowStartingRef.current) return;
+    const selectionVersion = selectionVersionRef.current;
     workflowStartingRef.current = true;
     stopProgressPolling();
     setError(null);
@@ -595,6 +602,7 @@ export function App() {
           sharePasscode: shareMode ? sharePasscode.trim() : undefined
         }
       );
+      if (selectionVersion !== selectionVersionRef.current) return;
       setActiveWorkflowId(workflow.workflow_id);
       setWorkflowUrl(workflow.workflow_id);
       savePersistedWorkflow({
@@ -609,6 +617,7 @@ export function App() {
       });
       beginWorkflowPolling(workflow.workflow_id);
     } catch (transcriptionError) {
+      if (selectionVersion !== selectionVersionRef.current) return;
       stopProgressPolling();
       if (isApiAuthenticationError(transcriptionError)) {
         setStage("ready");
@@ -622,12 +631,13 @@ export function App() {
           : "전사 작업을 완료하지 못했습니다."
       );
     } finally {
-      workflowStartingRef.current = false;
+      if (selectionVersion === selectionVersionRef.current) workflowStartingRef.current = false;
     }
   }
 
   async function createPackageOnly() {
     if ((!file && !stagedUploadId) || !recommendation || busy) return;
+    const selectionVersion = selectionVersionRef.current;
     autoStartSuppressedRef.current = true;
     setError(null);
     setStage("optimizing");
@@ -636,6 +646,7 @@ export function App() {
         geminiOptimizerOptions(file ?? undefined),
         stagedUploadId ?? undefined
       );
+      if (selectionVersion !== selectionVersionRef.current) return;
       setOptimizedPackage(packageResult);
       setStagedUploadId(null);
       setStage("ready");
@@ -650,6 +661,7 @@ export function App() {
         saveBaseName
       });
     } catch (packageError) {
+      if (selectionVersion !== selectionVersionRef.current) return;
       setStage("failed");
       setError(
         packageError instanceof Error
@@ -660,10 +672,16 @@ export function App() {
   }
 
   function resetFile() {
+    selectionVersionRef.current += 1;
     stopProgressPolling();
     clearPersistedWorkflow();
     setWorkflowUrl(null);
     autoStartSuppressedRef.current = false;
+    analysisStartingRef.current = false;
+    workflowStartingRef.current = false;
+    resetRecentCandidates();
+    setAccessNeedsReconnect(false);
+    setShareStatus(null);
     setFile(null);
     setSourceName("");
     setSourceBytes(0);
@@ -697,10 +715,12 @@ export function App() {
   }
 
   async function downloadResult(url: string, downloadName: string) {
+    const selectionVersion = selectionVersionRef.current;
     setError(null);
     try {
       await downloadApiFile(url, downloadName);
     } catch (downloadError) {
+      if (selectionVersion !== selectionVersionRef.current) return;
       if (isApiAuthenticationError(downloadError)) {
         requireAccessReconnect();
         return;
@@ -742,6 +762,13 @@ export function App() {
       resetRecentCandidates();
       void selectFile(selected);
     }
+  }
+
+  function openFilePicker() {
+    if (!fileInputRef.current) return;
+    // Clear only the native input; cancelling the picker keeps the current job.
+    fileInputRef.current.value = "";
+    fileInputRef.current.click();
   }
 
   function handleRecentFilesChange(event: ChangeEvent<HTMLInputElement>) {
@@ -859,7 +886,7 @@ export function App() {
                 <button
                   className="secondary-button"
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={openFilePicker}
                 >
                   <FileAudio size={17} />
                   파일 1개 선택
@@ -934,16 +961,21 @@ export function App() {
                 </span>
               </div>
               <button
-                className="icon-button standalone"
+                className="secondary-button change-file-button"
                 type="button"
-                onClick={resetFile}
+                onClick={openFilePicker}
                 title="다른 파일 선택"
                 aria-label="다른 파일 선택"
-                disabled={busy}
               >
-                <RotateCcw size={18} />
+                <Upload size={17} />
+                다른 파일 선택
               </button>
             </div>
+          )}
+          {hasSource && (
+            <p className="file-switch-note">
+              연결 확인 중에도 변경할 수 있습니다. PC에 접수된 작업과 기존 결과는 삭제되지 않습니다.
+            </p>
           )}
           <input
             ref={fileInputRef}

@@ -399,7 +399,7 @@ h1 {
 
 .selected-file {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 42px;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   min-height: 76px;
@@ -423,6 +423,23 @@ h1 {
 .selected-file span {
   color: #707070;
   font-size: 11px;
+}
+
+.file-switch-note {
+  margin: -8px 0 0;
+  color: #707070;
+  font-size: 11px;
+}
+
+@media (max-width: 560px) {
+  .selected-file {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .selected-file .change-file-button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
 }
 
 .visually-hidden {
