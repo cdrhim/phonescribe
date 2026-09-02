@@ -1,4 +1,6 @@
 import type {
+  CloudRecordingReady,
+  CloudUploadDescriptor,
   ExportKind,
   GeminiTranscriptionProgress,
   GeminiTranscriptResult,
@@ -55,6 +57,9 @@ export interface OptimizerOptions {
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const API_ACCESS_TOKEN_STORAGE_KEY = "local-meetscribe.remote-session.v1";
+const MAX_CLOUD_PART_SIZE_BYTES = 6 * 1024 * 1024;
+const CLOUD_UPLOAD_RETRY_DELAYS_MS = [0, 1000, 3000, 5000, 10000, 20000];
+const CLOUD_UPLOAD_ATTEMPT_TIMEOUT_MS = 120000;
 let apiAccessToken: string | null = restoreApiAccessToken();
 
 export class ApiRequestError extends Error {
@@ -73,6 +78,13 @@ export function hasApiAccessToken(): boolean {
 
 export function isApiAuthenticationError(error: unknown): boolean {
   return error instanceof ApiRequestError && error.status === 401;
+}
+
+export function isApiTransientError(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof ApiRequestError && isTransientUploadStatus(error.status))
+  );
 }
 
 export function clearApiAccessToken(): void {
@@ -151,15 +163,60 @@ export function recommendOptimizer(
 export function analyzeOptimizer(
   options: OptimizerOptions,
   language: Language,
-  quickScan = true
+  quickScan = true,
+  signal?: AbortSignal
 ): Promise<OptimizerAnalysisResponse> {
   const form = optimizerForm(options);
   form.append("language", language);
   form.append("quick_scan", String(quickScan));
   return request<OptimizerAnalysisResponse>("/api/optimizer/analyze", {
     method: "POST",
-    body: form
+    body: form,
+    signal
   });
+}
+
+export function createCloudUploadDescriptor(file: File): Promise<CloudUploadDescriptor> {
+  return request<CloudUploadDescriptor>("/api/cloud-recordings/upload-descriptor", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      content_type: file.type || "application/octet-stream",
+      size_bytes: file.size
+    })
+  });
+}
+
+export async function uploadCloudRecording(
+  file: File,
+  descriptor: CloudUploadDescriptor,
+  onProgress?: (uploadedBytes: number, totalBytes: number) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  validateCloudUploadDescriptor(file, descriptor);
+  const parts = [...descriptor.parts].sort(
+    (left, right) => left.part_number - right.part_number
+  );
+  let completedBytes = 0;
+  onProgress?.(0, file.size);
+
+  for (const part of parts) {
+    if (signal?.aborted) throw abortError();
+    const payload = file.slice(part.byte_start, part.byte_end, file.type);
+    await uploadSignedPart(payload, descriptor.content_type, part, signal);
+    completedBytes += part.size_bytes;
+    onProgress?.(Math.min(file.size, completedBytes), file.size);
+  }
+}
+
+export function completeCloudRecordingUpload(
+  recordingId: string
+): Promise<CloudRecordingReady> {
+  return request<CloudRecordingReady>(
+    `/api/cloud-recordings/${encodeURIComponent(recordingId)}/complete`,
+    { method: "POST" }
+  );
 }
 
 export function createOptimizerPackage(
@@ -193,6 +250,7 @@ export function startTranscriptionWorkflow(
   input: {
     uploadId?: string;
     packageId?: string;
+    cloudRecordingId?: string;
     apiKey?: string;
     sharePasscode?: string;
   }
@@ -200,6 +258,9 @@ export function startTranscriptionWorkflow(
   const form = optimizerForm(options, false);
   if (input.uploadId) form.append("upload_id", input.uploadId);
   if (input.packageId) form.append("package_id", input.packageId);
+  if (input.cloudRecordingId) {
+    form.append("cloud_recording_id", input.cloudRecordingId);
+  }
   const headers: Record<string, string> = {};
   if (input.apiKey) headers["X-Gemini-API-Key"] = input.apiKey;
   if (input.sharePasscode) {
@@ -210,6 +271,126 @@ export function startTranscriptionWorkflow(
     headers: Object.keys(headers).length ? headers : undefined,
     body: form
   });
+}
+
+function validateCloudUploadDescriptor(
+  file: File,
+  descriptor: CloudUploadDescriptor
+): void {
+  if (!descriptor.recording_id || !descriptor.bucket_id || !descriptor.parts.length) {
+    throw new Error("클라우드 업로드 정보가 올바르지 않습니다.");
+  }
+  const parts = [...descriptor.parts].sort(
+    (left, right) => left.part_number - right.part_number
+  );
+  let expectedStart = 0;
+  for (const [expectedPartNumber, part] of parts.entries()) {
+    if (
+      part.upload.protocol !== "signed-put" ||
+      !isHttpsUrl(part.upload.url) ||
+      part.part_number !== expectedPartNumber ||
+      part.byte_start !== expectedStart ||
+      part.byte_end <= part.byte_start ||
+      part.size_bytes !== part.byte_end - part.byte_start ||
+      part.size_bytes > MAX_CLOUD_PART_SIZE_BYTES ||
+      !part.object_path
+    ) {
+      throw new Error("클라우드 업로드 조각 정보가 올바르지 않습니다.");
+    }
+    expectedStart = part.byte_end;
+  }
+  if (expectedStart !== file.size) {
+    throw new Error("클라우드 업로드 크기가 녹음 파일과 일치하지 않습니다.");
+  }
+}
+
+async function uploadSignedPart(
+  payload: Blob,
+  contentType: string,
+  part: CloudUploadDescriptor["parts"][number],
+  signal?: AbortSignal
+): Promise<void> {
+  let lastFailure: unknown = null;
+  for (const delayMs of CLOUD_UPLOAD_RETRY_DELAYS_MS) {
+    if (delayMs > 0) await abortableDelay(delayMs, signal);
+    if (signal?.aborted) throw abortError();
+    const attemptController = new AbortController();
+    let timedOut = false;
+    const handleUserAbort = () => attemptController.abort();
+    signal?.addEventListener("abort", handleUserAbort, { once: true });
+    if (signal?.aborted) handleUserAbort();
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      attemptController.abort();
+    }, CLOUD_UPLOAD_ATTEMPT_TIMEOUT_MS);
+    try {
+      const headers = new Headers(part.upload.headers);
+      if (!headers.has("Content-Type")) {
+        headers.set("Content-Type", contentType || "application/octet-stream");
+      }
+      const response = await fetch(part.upload.url, {
+        method: "PUT",
+        headers,
+        body: payload,
+        signal: attemptController.signal
+      });
+      if (response.ok) return;
+      lastFailure = new Error(`클라우드 업로드가 거절되었습니다. (HTTP ${response.status})`);
+      if (!isTransientUploadStatus(response.status)) throw lastFailure;
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      if (timedOut) {
+        lastFailure = new Error("클라우드 업로드 응답 시간이 초과되었습니다.");
+        continue;
+      }
+      if (isAbortException(error)) throw abortError();
+      lastFailure = error;
+      if (!(error instanceof TypeError)) throw error;
+    } finally {
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", handleUserAbort);
+    }
+  }
+  throw lastFailure instanceof Error
+    ? lastFailure
+    : new Error("클라우드 업로드를 완료하지 못했습니다.");
+}
+
+function isHttpsUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && Boolean(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isTransientUploadStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function isAbortException(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, delayMs);
+    const handleAbort = () => {
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", handleAbort);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
+}
+
+function abortError(): DOMException {
+  return new DOMException("Upload aborted", "AbortError");
 }
 
 export function getTranscriptionWorkflow(

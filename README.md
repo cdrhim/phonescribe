@@ -155,6 +155,13 @@ browsers receive only the passcode field and never receive the API key. Five fai
 attempts from one client trigger a one-minute cooldown. This is a convenience lock for a trusted
 LAN, not a substitute for HTTPS and authentication on an internet-facing deployment.
 
+Before exposing the server through Funnel, set an unpredictable passcode of at least 8 characters
+from the server PC, then restart the service so existing browser sessions are discarded:
+
+```powershell
+local-meetscribe share configure-passcode
+```
+
 Start or verify the Wi-Fi server with:
 
 ```powershell
@@ -187,6 +194,59 @@ Tailscale runs as a Windows service and the LocalMeetScribe scheduled task start
 sign-in. The phone and PC displays may turn off after the initial upload, but the PC itself must stay
 powered on and connected to the internet. Windows prevents system sleep only while a workflow is
 actively optimizing or transcribing.
+
+## Supabase Recording Storage
+
+PhoneScribe can hand a completed phone recording to Supabase before the local PC starts the
+workflow. The data path is:
+
+1. The local PC creates short-lived, object-scoped signed upload descriptors.
+2. The phone uploads directly to the private `recordings` Storage bucket with short-lived signed
+   PUT URLs and retries each small object independently.
+3. Only after every part is present does the PC accept a background workflow and return its
+   `workflow_id`.
+4. The PC downloads the private recording, optimizes it, sends the optimized audio to Gemini, saves
+   a TXT copy to `Downloads\PhoneScribe`, and writes transcript metadata and segments to Supabase.
+
+The browser never receives the Supabase server secret. Recordings are split into 6 MiB Storage
+objects, so a transient mobile-network failure retries only one small object. Raw transcript and raw
+segment text are database-immutable; review edits may change only the corresponding clean text
+fields.
+
+Apply the migrations in timestamp order from `supabase/migrations`. They create the private bucket,
+recording/job/transcript tables, owner-scoped RLS rules, raw-text guards, and the retention RPCs.
+Audio objects expire after 30 days by default. Cleanup deletes objects through the Storage API and
+keeps the recording metadata, job, transcript, and transcript segments. Failed or interrupted
+cleanup leases can be retried safely.
+
+Accepted workflows are persisted before the phone is told that it is safe to lock. If the PC
+service restarts, queued, optimizing, and transcribing jobs are recovered from non-secret local
+state; an OS-held per-recording lease prevents duplicate workers. Supabase status and transcript
+writes use a local outbox and retry automatically after temporary outages. Retention runs once at
+service startup and then periodically. API keys, passcodes, signed upload URLs, audio bytes, and
+transcript text are never stored in the workflow state or outbox.
+
+Configure the server-only Supabase **Secret key** on the PC. This is an API key from Supabase
+Project Settings, not the database password:
+
+```powershell
+local-meetscribe supabase configure --url https://YOUR_PROJECT_REF.supabase.co
+local-meetscribe supabase status
+```
+
+The first command prompts for the key without echoing it and stores it with Windows user-scoped
+DPAPI encryption under the runtime data directory. Do not put this key in Vercel, frontend
+environment variables, source control, screenshots, or chat. The Vercel site needs only its existing
+`VITE_API_BASE_URL` pointing to the PC's HTTPS Funnel.
+
+The exact screen-off boundary is the returned `workflow_id`: keep the phone page visible while it is
+recording and uploading, and until the page says the server accepted the job. From that point,
+optimization, Gemini transcription, Supabase persistence, and the PC TXT save continue without the
+phone. A hidden or locked mobile browser cannot reliably record or finish an upload; guaranteed
+locked-screen capture requires a native Android foreground-service app. The PC must remain powered,
+awake, connected, and running LocalMeetScribe until the workflow completes. If the phone is locked
+at completion, its browser downloads the TXT when the page becomes visible again; the PC copy is
+saved independently.
 
 `Recent recording recommendation` lets a phone user select several recordings from the system
 picker without uploading them. The page ranks up to six candidates using a recording timestamp in

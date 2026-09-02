@@ -19,19 +19,20 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
         cors_origins=("https://phonescribe.vercel.app",),
     )
     share_store = GeminiShareStore(settings.data_dir)
-    share_store.configure_passcode("3543")
+    share_store.configure_passcode("35433543")
     client = TestClient(create_app(settings), base_url="https://phone.example.ts.net")
 
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/runtime").status_code == 200
     assert client.get("/api/jobs").status_code == 401
-    assert client.get(
-        "/api/jobs", headers={"Authorization": "Bearer forged"}
-    ).status_code == 401
-    assert client.post(
-        "/api/optimizer/analyze",
-        files={"file": ("phone.m4a", b"recording", "audio/mp4")},
-    ).status_code == 401
+    assert client.get("/api/jobs", headers={"Authorization": "Bearer forged"}).status_code == 401
+    assert (
+        client.post(
+            "/api/optimizer/analyze",
+            files={"file": ("phone.m4a", b"recording", "audio/mp4")},
+        ).status_code
+        == 401
+    )
 
     rejected = client.post(
         "/api/gemini-share/verify",
@@ -41,11 +42,11 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
 
     verified = client.post(
         "/api/gemini-share/verify",
-        headers={"X-LocalMeetScribe-Passcode": "3543"},
+        headers={"X-LocalMeetScribe-Passcode": "35433543"},
     )
     assert verified.status_code == 200
     token = verified.json()["access_token"]
-    assert token and token != "3543"
+    assert token and token != "35433543"
     authorized = {"Authorization": f"Bearer {token}"}
     assert client.get("/api/jobs", headers=authorized).status_code == 200
 
@@ -68,7 +69,7 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
         data={"api_key": "replacement-test-key-1234567890"},
         headers={
             **authorized,
-            "X-LocalMeetScribe-Passcode": "3543",
+            "X-LocalMeetScribe-Passcode": "35433543",
         },
     )
     assert remote_admin.status_code == 403
@@ -90,10 +91,7 @@ def test_remote_cors_allows_only_configured_frontend(tmp_path: Path) -> None:
         },
     )
     assert allowed.status_code == 200
-    assert (
-        allowed.headers["access-control-allow-origin"]
-        == "https://phonescribe.vercel.app"
-    )
+    assert allowed.headers["access-control-allow-origin"] == "https://phonescribe.vercel.app"
 
     denied = client.options(
         "/api/runtime",

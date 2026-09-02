@@ -13,12 +13,60 @@ from local_meetscribe.evaluation import evaluate_transcripts
 from local_meetscribe.pipeline.models import download_profile, get_model_status
 from local_meetscribe.pipeline.orchestrator import TranscriptionPipeline
 from local_meetscribe.schemas import TranscriptionRequest
+from local_meetscribe.security import GeminiShareStore, SupabaseConfigStore
 from local_meetscribe.utils.errors import LocalMeetScribeError
 from local_meetscribe.utils.logging import configure_logging
 
 app = typer.Typer(no_args_is_help=True)
 models_app = typer.Typer(no_args_is_help=True)
+supabase_app = typer.Typer(no_args_is_help=True)
+share_app = typer.Typer(no_args_is_help=True)
 app.add_typer(models_app, name="models")
+app.add_typer(supabase_app, name="supabase")
+app.add_typer(share_app, name="share")
+
+
+@share_app.command("configure-passcode")
+def configure_share_passcode() -> None:
+    """Prompt locally for a new internet-sharing passcode."""
+    passcode = typer.prompt(
+        "New share passcode (at least 8 characters)",
+        hide_input=True,
+        confirmation_prompt=True,
+    )
+    store = GeminiShareStore(get_settings().data_dir)
+    try:
+        store.configure_passcode(passcode)
+    except LocalMeetScribeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo("PhoneScribe share passcode updated. Existing browser sessions expire on restart.")
+
+
+@supabase_app.command("configure")
+def configure_supabase(
+    project_url: Annotated[str, typer.Option("--url", help="Supabase project HTTPS URL.")],
+) -> None:
+    """Encrypt and save the server-only Supabase credential on this PC."""
+    resolved_key = typer.prompt("Supabase service role key", hide_input=True)
+    store = SupabaseConfigStore(get_settings().data_dir)
+    try:
+        store.save(
+            project_url=project_url,
+            service_role_key=resolved_key,
+            bucket="recordings",
+        )
+    except LocalMeetScribeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo("Supabase cloud upload configured for private bucket 'recordings'.")
+
+
+@supabase_app.command("status")
+def supabase_status() -> None:
+    """Show whether a local encrypted Supabase credential exists."""
+    store = SupabaseConfigStore(get_settings().data_dir)
+    typer.echo("configured" if store.configured else "not configured")
 
 
 @app.command()

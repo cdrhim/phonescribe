@@ -25,14 +25,18 @@ import {
   type OptimizerOptions,
   analyzeOptimizer,
   clearApiAccessToken,
+  completeCloudRecordingUpload,
   configureGeminiShareKey,
+  createCloudUploadDescriptor,
   createOptimizerPackage,
   downloadApiFile,
   getTranscriptionWorkflow,
   getRuntime,
   hasApiAccessToken,
   isApiAuthenticationError,
+  isApiTransientError,
   startTranscriptionWorkflow,
+  uploadCloudRecording,
   verifyGeminiSharePasscode
 } from "./api";
 import type {
@@ -56,19 +60,22 @@ type WorkflowStage =
 
 type NamingMode = "original" | "recommended" | "custom";
 type RecordingState = "idle" | "starting" | "recording" | "stopping";
+type WakeLockStatus = "idle" | "requesting" | "active" | "unavailable" | "released";
 
 const workflowSteps = ["분석", "최적화", "전사", "완료"];
 const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
 const LAST_AUTO_DOWNLOADED_WORKFLOW_KEY =
   "local-meetscribe.last-auto-downloaded-workflow.v1";
+const AUTO_DOWNLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 
 interface PersistedWorkflow {
   version: 1;
   workflowId: string | null;
   stagedUploadId: string | null;
+  cloudRecordingId: string | null;
   sourceName: string;
   sourceBytes: number;
-  recommendation: OptimizerRecommendationResponse;
+  recommendation: OptimizerRecommendationResponse | null;
   optimizedPackage: OptimizedPackageResult | null;
   saveBaseName: string;
 }
@@ -84,6 +91,9 @@ export function App() {
   const [recommendation, setRecommendation] =
     useState<OptimizerRecommendationResponse | null>(null);
   const [stagedUploadId, setStagedUploadId] = useState<string | null>(null);
+  const [cloudRecordingId, setCloudRecordingId] = useState<string | null>(null);
+  const [cloudUploadProgress, setCloudUploadProgress] = useState<number | null>(null);
+  const [cloudUploadNotice, setCloudUploadNotice] = useState<string | null>(null);
   const [optimizedPackage, setOptimizedPackage] =
     useState<OptimizedPackageResult | null>(null);
   const [transcript, setTranscript] = useState<GeminiTranscriptResult | null>(null);
@@ -105,7 +115,7 @@ export function App() {
   const [originalAudioUrl, setOriginalAudioUrl] = useState<string | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] =
     useState<GeminiTranscriptionProgress | null>(null);
-  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [wakeLockStatus, setWakeLockStatus] = useState<WakeLockStatus>("idle");
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
@@ -121,6 +131,7 @@ export function App() {
   const recordingStartedAtRef = useRef<number | null>(null);
   const workflowStartingRef = useRef(false);
   const analysisStartingRef = useRef(false);
+  const uploadAbortRef = useRef<AbortController | null>(null);
   const autoStartSuppressedRef = useRef(false);
   // Switching recordings detaches the UI, never cancels a server-side workflow.
   const selectionVersionRef = useRef(0);
@@ -147,6 +158,7 @@ export function App() {
   useEffect(
     () => () => {
       selectionVersionRef.current += 1;
+      uploadAbortRef.current?.abort();
       stopProgressPolling();
       void wakeLockRef.current?.release();
       const recorder = mediaRecorderRef.current;
@@ -169,6 +181,7 @@ export function App() {
       setSourceBytes(saved.sourceBytes);
       setRecommendation(saved.recommendation);
       setStagedUploadId(saved.stagedUploadId);
+      setCloudRecordingId(saved.cloudRecordingId);
       setOptimizedPackage(saved.optimizedPackage);
       setSaveBaseName(saved.saveBaseName);
     }
@@ -194,12 +207,13 @@ export function App() {
     stage === "analyzing" || stage === "optimizing" || stage === "transcribing";
   const recordingActive = recordingState !== "idle";
   const keepScreenAwake = stage === "analyzing" || recordingActive;
+  const wakeLockActive = wakeLockStatus === "active";
   const recordingSupported = Boolean(
     typeof MediaRecorder !== "undefined" && navigator.mediaDevices?.getUserMedia
   );
   const canStart = Boolean(
-    (stagedUploadId || optimizedPackage) &&
-      recommendation &&
+    (stagedUploadId || cloudRecordingId || optimizedPackage) &&
+      (recommendation || cloudRecordingId) &&
       keyReady &&
       cloudConsent &&
       !busy
@@ -219,12 +233,23 @@ export function App() {
       recommendation ||
       stage !== "idle" ||
       analysisStartingRef.current ||
-      (shareMode && !shareAccessReady)
+      (shareMode && !shareAccessReady) ||
+      (Boolean(runtime?.cloud_upload_enabled) && (!keyReady || !cloudConsent))
     ) {
       return;
     }
     void analyzeSelectedFile(file);
-  }, [file, recommendation, runtimeChecked, shareAccessReady, shareMode, stage]);
+  }, [
+    cloudConsent,
+    file,
+    keyReady,
+    recommendation,
+    runtime?.cloud_upload_enabled,
+    runtimeChecked,
+    shareAccessReady,
+    shareMode,
+    stage
+  ]);
 
   useEffect(() => {
     if (
@@ -250,8 +275,24 @@ export function App() {
     let cancelled = false;
     let timer: number | null = null;
     let downloadStarting = false;
+    let finished = false;
+    let retryIndex = 0;
+    const clearRetryTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const scheduleDownload = (delayMs: number) => {
+      if (cancelled || finished || document.visibilityState !== "visible") return;
+      clearRetryTimer();
+      timer = window.setTimeout(() => {
+        timer = null;
+        void downloadWhenVisible();
+      }, delayMs);
+    };
     const downloadWhenVisible = async () => {
-      if (cancelled) return;
+      if (cancelled || finished) return;
       if (document.visibilityState !== "visible") {
         setAutoDownloadStatus(
           `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
@@ -264,14 +305,32 @@ export function App() {
         await downloadApiFile(transcript.txt_url, `${safeSaveBaseName}.txt`);
         if (cancelled) return;
         markWorkflowAutoDownloaded(activeWorkflowId);
+        finished = true;
+        clearRetryTimer();
         setAutoDownloadStatus(`${statusPrefix}이 기기에도 TXT를 자동 다운로드했습니다.`);
       } catch (downloadError) {
         if (!cancelled) {
           if (isApiAuthenticationError(downloadError)) {
+            finished = true;
+            clearRetryTimer();
             requireAccessReconnect();
             setAutoDownloadStatus("비밀번호를 다시 확인하면 TXT를 자동 다운로드합니다.");
+          } else if (
+            isApiTransientError(downloadError) &&
+            retryIndex < AUTO_DOWNLOAD_RETRY_DELAYS_MS.length
+          ) {
+            const retryDelay = AUTO_DOWNLOAD_RETRY_DELAYS_MS[retryIndex];
+            retryIndex += 1;
+            setAutoDownloadStatus(
+              `TXT 자동 다운로드 연결을 다시 확인합니다. ${Math.ceil(retryDelay / 1000)}초 후 재시도합니다.`
+            );
+            scheduleDownload(retryDelay);
           } else {
-            setAutoDownloadStatus("자동 다운로드를 다시 준비하고 있습니다.");
+            finished = true;
+            clearRetryTimer();
+            setAutoDownloadStatus(
+              "TXT 자동 다운로드를 완료하지 못했습니다. TXT 버튼을 눌러 다시 받아 주세요."
+            );
           }
         }
       } finally {
@@ -279,12 +338,21 @@ export function App() {
       }
     };
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") void downloadWhenVisible();
+      if (document.visibilityState === "visible") {
+        scheduleDownload(350);
+      } else {
+        clearRetryTimer();
+        if (!finished) {
+          setAutoDownloadStatus(
+            `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+          );
+        }
+      }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     if (document.visibilityState === "visible") {
-      timer = window.setTimeout(() => void downloadWhenVisible(), 350);
+      scheduleDownload(350);
     } else {
       setAutoDownloadStatus(
         `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
@@ -293,7 +361,7 @@ export function App() {
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      if (timer !== null) window.clearTimeout(timer);
+      clearRetryTimer();
     };
   }, [activeWorkflowId, safeSaveBaseName, serverExportStatus, stage, transcript]);
 
@@ -304,12 +372,16 @@ export function App() {
     async function acquireWakeLock() {
       if (
         !keepScreenAwake ||
-        !wakeLockApi ||
         document.visibilityState !== "visible" ||
         wakeLockRef.current
       ) {
         return;
       }
+      if (!wakeLockApi) {
+        setWakeLockStatus("unavailable");
+        return;
+      }
+      setWakeLockStatus("requesting");
       try {
         const sentinel = await wakeLockApi.request("screen");
         if (cancelled) {
@@ -317,15 +389,15 @@ export function App() {
           return;
         }
         wakeLockRef.current = sentinel;
-        setWakeLockActive(true);
+        setWakeLockStatus("active");
         sentinel.addEventListener("release", () => {
           if (wakeLockRef.current === sentinel) {
             wakeLockRef.current = null;
-            setWakeLockActive(false);
+            setWakeLockStatus("released");
           }
         });
       } catch {
-        setWakeLockActive(false);
+        setWakeLockStatus("unavailable");
       }
     }
 
@@ -344,7 +416,7 @@ export function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       const sentinel = wakeLockRef.current;
       wakeLockRef.current = null;
-      setWakeLockActive(false);
+      setWakeLockStatus("idle");
       if (sentinel && !sentinel.released) {
         void sentinel.release();
       }
@@ -645,38 +717,205 @@ export function App() {
   async function analyzeSelectedFile(selected: File) {
     if (analysisStartingRef.current) return;
     const selectionVersion = selectionVersionRef.current;
+    const transferController = new AbortController();
     analysisStartingRef.current = true;
+    uploadAbortRef.current = transferController;
     setStage("analyzing");
     setError(null);
+    setCloudUploadNotice(null);
+    setCloudUploadProgress(null);
     try {
+      if (runtime?.cloud_upload_enabled) {
+        try {
+          const descriptor = await createCloudUploadDescriptor(selected);
+          if (selectionVersion !== selectionVersionRef.current) return;
+          await uploadCloudRecording(
+            selected,
+            descriptor,
+            (uploadedBytes, totalBytes) => {
+              if (selectionVersion !== selectionVersionRef.current) return;
+              const progress = totalBytes > 0 ? uploadedBytes / totalBytes : 0;
+              setCloudUploadProgress(Math.min(1, Math.max(0, progress)));
+            },
+            transferController.signal
+          );
+          if (selectionVersion !== selectionVersionRef.current) return;
+          const completed = await completeCloudRecordingUpload(descriptor.recording_id);
+          if (selectionVersion !== selectionVersionRef.current) return;
+          setCloudRecordingId(completed.recording_id);
+          setCloudUploadProgress(1);
+          setCloudUploadNotice(
+            "업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
+          );
+          savePersistedWorkflow({
+            version: 1,
+            workflowId: null,
+            stagedUploadId: null,
+            cloudRecordingId: completed.recording_id,
+            sourceName: selected.name,
+            sourceBytes: selected.size,
+            recommendation: null,
+            optimizedPackage: null,
+            saveBaseName: baseNameFromFile(selected.name)
+          });
+
+          workflowStartingRef.current = true;
+          try {
+            const workflow = await startTranscriptionWorkflow(
+              geminiOptimizerOptions(selected),
+              {
+                cloudRecordingId: completed.recording_id,
+                apiKey: shareMode ? undefined : geminiApiKey.trim() || undefined,
+                sharePasscode: shareMode ? sharePasscode.trim() : undefined
+              }
+            );
+            if (selectionVersion !== selectionVersionRef.current) return;
+            setActiveWorkflowId(workflow.workflow_id);
+            setWorkflowUrl(workflow.workflow_id);
+            savePersistedWorkflow({
+              version: 1,
+              workflowId: workflow.workflow_id,
+              stagedUploadId: null,
+              cloudRecordingId: completed.recording_id,
+              sourceName: selected.name,
+              sourceBytes: selected.size,
+              recommendation: null,
+              optimizedPackage: null,
+              saveBaseName: baseNameFromFile(selected.name)
+            });
+            setCloudUploadNotice(
+              "서버 작업 접수 완료 · 이제 화면을 꺼도 전사와 저장이 계속됩니다."
+            );
+            setStage("optimizing");
+            beginWorkflowPolling(workflow.workflow_id);
+          } catch (workflowError) {
+            if (selectionVersion !== selectionVersionRef.current) return;
+            if (isApiAuthenticationError(workflowError)) {
+              setStage("ready");
+              requireAccessReconnect();
+              return;
+            }
+            setStage("failed");
+            setCloudUploadNotice(
+              "녹음 업로드 완료 · 전사 작업을 다시 접수할 수 있습니다."
+            );
+            setError(
+              workflowError instanceof Error
+                ? workflowError.message
+                : "서버에 전사 작업을 접수하지 못했습니다."
+            );
+          } finally {
+            if (selectionVersion === selectionVersionRef.current) {
+              workflowStartingRef.current = false;
+            }
+          }
+          return;
+        } catch (cloudUploadError) {
+          if (
+            selectionVersion !== selectionVersionRef.current ||
+            isAbortError(cloudUploadError)
+          ) {
+            return;
+          }
+          if (isApiAuthenticationError(cloudUploadError)) {
+            setStage("idle");
+            requireAccessReconnect();
+            return;
+          }
+          setCloudUploadProgress(null);
+          setCloudUploadNotice(
+            "클라우드 업로드를 사용할 수 없어 PC 직접 업로드로 자동 전환했습니다."
+          );
+        }
+      }
+
       const analysis = await analyzeOptimizer(
         geminiOptimizerOptions(selected),
         "auto",
-        !shareMode
+        !shareMode,
+        transferController.signal
       );
       if (selectionVersion !== selectionVersionRef.current) return;
-      setRecommendation({
+      const analyzedRecommendation: OptimizerRecommendationResponse = {
         source: analysis.source,
         original_bytes: analysis.original_bytes,
         recommendation: analysis.recommendation
-      });
+      };
+      setRecommendation(analyzedRecommendation);
       setStagedUploadId(analysis.upload_id);
       setScan(analysis.quick_scan);
-      setStage("ready");
       savePersistedWorkflow({
         version: 1,
         workflowId: null,
         stagedUploadId: analysis.upload_id,
+        cloudRecordingId: null,
         sourceName: selected.name,
         sourceBytes: selected.size,
-        recommendation: {
-          source: analysis.source,
-          original_bytes: analysis.original_bytes,
-          recommendation: analysis.recommendation
-        },
+        recommendation: analyzedRecommendation,
         optimizedPackage: null,
         saveBaseName: baseNameFromFile(selected.name)
       });
+
+      if (shareMode && keyReady && cloudConsent && !autoStartSuppressedRef.current) {
+        setCloudUploadNotice(
+          "PC 직접 업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
+        );
+        workflowStartingRef.current = true;
+        try {
+          const workflow = await startTranscriptionWorkflow(
+            geminiOptimizerOptions(undefined),
+            {
+              uploadId: analysis.upload_id,
+              sharePasscode: sharePasscode.trim()
+            }
+          );
+          if (selectionVersion !== selectionVersionRef.current) return;
+          setActiveWorkflowId(workflow.workflow_id);
+          setWorkflowUrl(workflow.workflow_id);
+          savePersistedWorkflow({
+            version: 1,
+            workflowId: workflow.workflow_id,
+            stagedUploadId: analysis.upload_id,
+            cloudRecordingId: null,
+            sourceName: selected.name,
+            sourceBytes: selected.size,
+            recommendation: analyzedRecommendation,
+            optimizedPackage: null,
+            saveBaseName: baseNameFromFile(selected.name)
+          });
+          setCloudUploadNotice(
+            "서버 작업 접수 완료 · 이제 화면을 꺼도 전사와 저장이 계속됩니다."
+          );
+          setStage("optimizing");
+          beginWorkflowPolling(workflow.workflow_id);
+        } catch (workflowError) {
+          if (selectionVersion !== selectionVersionRef.current) return;
+          if (isApiAuthenticationError(workflowError)) {
+            setCloudUploadNotice(
+              "PC 직접 업로드 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
+            );
+            setStage("ready");
+            requireAccessReconnect();
+            return;
+          }
+          setStage("failed");
+          setCloudUploadNotice(
+            "PC 직접 업로드 완료 · 전사 작업을 다시 접수할 수 있습니다."
+          );
+          setError(
+            workflowError instanceof Error
+              ? workflowError.message
+              : "서버에 전사 작업을 접수하지 못했습니다."
+          );
+        } finally {
+          if (selectionVersion === selectionVersionRef.current) {
+            workflowStartingRef.current = false;
+          }
+        }
+        return;
+      }
+
+      setStage("ready");
     } catch (analysisError) {
       if (selectionVersion !== selectionVersionRef.current) return;
       if (isApiAuthenticationError(analysisError)) {
@@ -691,13 +930,19 @@ export function App() {
           : "녹음 파일을 분석하지 못했습니다."
       );
     } finally {
+      if (uploadAbortRef.current === transferController) {
+        uploadAbortRef.current = null;
+      }
       if (selectionVersion === selectionVersionRef.current) analysisStartingRef.current = false;
     }
   }
 
   async function startTranscription() {
-    if (!canStart || !recommendation || workflowStartingRef.current) return;
+    if (!canStart || workflowStartingRef.current) return;
     const selectionVersion = selectionVersionRef.current;
+    const enqueueingUploadedSource = Boolean(
+      !optimizedPackage && (cloudRecordingId || stagedUploadId)
+    );
     workflowStartingRef.current = true;
     stopProgressPolling();
     setError(null);
@@ -708,12 +953,21 @@ export function App() {
     setServerExportStatus(null);
 
     try {
-      setStage(optimizedPackage ? "transcribing" : "optimizing");
+      if (enqueueingUploadedSource) {
+        setStage("analyzing");
+        setCloudUploadNotice(
+          `${cloudRecordingId ? "클라우드" : "PC 직접"} 업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요.`
+        );
+      } else {
+        setStage(optimizedPackage ? "transcribing" : "optimizing");
+      }
       const workflow = await startTranscriptionWorkflow(
         geminiOptimizerOptions(file ?? undefined),
         {
           uploadId: optimizedPackage ? undefined : stagedUploadId ?? undefined,
           packageId: optimizedPackage?.id,
+          cloudRecordingId:
+            optimizedPackage || stagedUploadId ? undefined : cloudRecordingId ?? undefined,
           apiKey: shareMode ? undefined : geminiApiKey.trim() || undefined,
           sharePasscode: shareMode ? sharePasscode.trim() : undefined
         }
@@ -725,22 +979,37 @@ export function App() {
         version: 1,
         workflowId: workflow.workflow_id,
         stagedUploadId,
+        cloudRecordingId,
         sourceName: displaySourceName,
         sourceBytes: displaySourceBytes,
         recommendation,
         optimizedPackage,
         saveBaseName
       });
+      if (enqueueingUploadedSource) {
+        setCloudUploadNotice(
+          "서버 작업 접수 완료 · 이제 화면을 꺼도 전사와 저장이 계속됩니다."
+        );
+        setStage("optimizing");
+      }
       beginWorkflowPolling(workflow.workflow_id);
     } catch (transcriptionError) {
       if (selectionVersion !== selectionVersionRef.current) return;
       stopProgressPolling();
       if (isApiAuthenticationError(transcriptionError)) {
+        if (enqueueingUploadedSource) {
+          setCloudUploadNotice(
+            "업로드 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
+          );
+        }
         setStage("ready");
         requireAccessReconnect();
         return;
       }
       setStage("failed");
+      if (enqueueingUploadedSource) {
+        setCloudUploadNotice("업로드 완료 · 전사 작업을 다시 접수할 수 있습니다.");
+      }
       setError(
         transcriptionError instanceof Error
           ? transcriptionError.message
@@ -770,6 +1039,7 @@ export function App() {
         version: 1,
         workflowId: null,
         stagedUploadId: null,
+        cloudRecordingId: null,
         sourceName: displaySourceName,
         sourceBytes: displaySourceBytes,
         recommendation,
@@ -789,6 +1059,8 @@ export function App() {
 
   function resetFile() {
     selectionVersionRef.current += 1;
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
     stopProgressPolling();
     clearPersistedWorkflow();
     setWorkflowUrl(null);
@@ -804,6 +1076,9 @@ export function App() {
     setScan(null);
     setRecommendation(null);
     setStagedUploadId(null);
+    setCloudRecordingId(null);
+    setCloudUploadProgress(null);
+    setCloudUploadNotice(null);
     setOptimizedPackage(null);
     setTranscript(null);
     setError(null);
@@ -1002,7 +1277,8 @@ export function App() {
                 </strong>
                 <span>{formatClock(recordingElapsedSec)}</span>
                 <small>
-                  화면 자동 잠금을 막고 있습니다. 녹음을 마치면 업로드·전사가 자동으로 이어집니다.
+                  {recordingWakeLockMessage(wakeLockStatus)} 녹음을 마치면 업로드·전사가
+                  자동으로 이어집니다.
                 </small>
               </div>
               <button
@@ -1106,10 +1382,14 @@ export function App() {
               <div>
                 <strong>{displaySourceName}</strong>
                 <span>
-                  {stage === "analyzing"
-                    ? "길이, 언어, 전사 방식을 확인하고 있습니다."
+                  {stage === "analyzing" && cloudUploadProgress !== null
+                    ? `클라우드 업로드 ${Math.round(cloudUploadProgress * 100)}%`
+                    : stage === "analyzing"
+                      ? "길이, 언어, 전사 방식을 확인하고 있습니다."
                     : recommendation
                       ? "분석 완료"
+                      : cloudRecordingId
+                        ? "클라우드 업로드 완료"
                       : shareMode
                         ? "비밀번호 확인 후 자동 업로드됩니다."
                         : "업로드 준비 중"}
@@ -1130,6 +1410,32 @@ export function App() {
           {hasSource && (
             <p className="file-switch-note">
               연결 확인 중에도 변경할 수 있습니다. PC에 접수된 작업과 기존 결과는 삭제되지 않습니다.
+            </p>
+          )}
+          {cloudUploadProgress !== null && stage === "analyzing" && (
+            <div className="transcription-progress" aria-live="polite">
+              <div className="progress-heading">
+                <span>녹음 업로드</span>
+                <strong>{Math.round(cloudUploadProgress * 100)}%</strong>
+              </div>
+              <div
+                className="progress-track"
+                role="progressbar"
+                aria-label="녹음 클라우드 업로드 진행률"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(cloudUploadProgress * 100)}
+              >
+                <span style={{ width: `${Math.round(cloudUploadProgress * 100)}%` }} />
+              </div>
+              <div className="progress-meta">
+                <span>연결이 흔들리면 현재 조각만 다시 보내고 이어집니다.</span>
+              </div>
+            </div>
+          )}
+          {cloudUploadNotice && (
+            <p className="cloud-upload-notice" role="status">
+              {cloudUploadNotice}
             </p>
           )}
           <input
@@ -1180,8 +1486,8 @@ export function App() {
             </p>
           )}
           <p className="recording-limit-note">
-            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료·업로드 후에는
-            화면을 꺼도 PC 서버가 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의
+            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료·업로드 후
+            서버 작업 접수가 완료되면 화면을 꺼도 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의
             녹음을 보장하려면 Android 전용 앱이 필요합니다.
           </p>
         </section>
@@ -1371,6 +1677,7 @@ export function App() {
             <input
               type="checkbox"
               checked={cloudConsent}
+              disabled={busy}
               onChange={(event) => setCloudConsent(event.target.checked)}
             />
             <span>
@@ -1398,9 +1705,11 @@ export function App() {
               <MonitorSmartphone size={16} />
               <span>
                 {stage === "analyzing"
-                  ? wakeLockActive
-                    ? "화면 켜짐 유지 중 · 분석 완료까지 이 화면을 유지합니다."
-                    : "파일 업로드와 분석이 끝날 때까지 휴대폰 화면을 켜 두세요."
+                  ? wakeLockStatus === "active"
+                    ? "화면 켜짐 유지 중 · 서버 작업 접수 완료까지 기다려 주세요."
+                    : wakeLockStatus === "requesting"
+                      ? "자동 잠금 방지 연결 중 · 서버 작업 접수 완료까지 화면을 켜 두세요."
+                      : "자동 잠금 방지가 작동하지 않습니다 · 서버 작업 접수 완료까지 화면을 직접 켜 두세요."
                   : wakeLockActive
                     ? "화면 켜짐 유지 중 · 화면이 꺼져도 PC 작업은 계속됩니다."
                     : "화면이 꺼지거나 브라우저를 닫아도 PC에서 계속 처리됩니다."}
@@ -1788,7 +2097,9 @@ function loadPersistedWorkflow(): PersistedWorkflow | null {
       typeof parsed.sourceName !== "string" ||
       typeof parsed.sourceBytes !== "number" ||
       typeof parsed.saveBaseName !== "string" ||
-      !parsed.recommendation
+      (!parsed.recommendation &&
+        typeof parsed.cloudRecordingId !== "string" &&
+        typeof parsed.workflowId !== "string")
     ) {
       return null;
     }
@@ -1798,9 +2109,11 @@ function loadPersistedWorkflow(): PersistedWorkflow | null {
         typeof parsed.workflowId === "string" ? parsed.workflowId : null,
       stagedUploadId:
         typeof parsed.stagedUploadId === "string" ? parsed.stagedUploadId : null,
+      cloudRecordingId:
+        typeof parsed.cloudRecordingId === "string" ? parsed.cloudRecordingId : null,
       sourceName: parsed.sourceName,
       sourceBytes: parsed.sourceBytes,
-      recommendation: parsed.recommendation,
+      recommendation: parsed.recommendation || null,
       optimizedPackage: parsed.optimizedPackage || null,
       saveBaseName: parsed.saveBaseName
     };
@@ -1891,6 +2204,24 @@ function recordingPermissionMessage(error: unknown): string {
     }
   }
   return "녹음을 시작하지 못했습니다. 마이크 권한과 브라우저 상태를 확인하세요.";
+}
+
+function recordingWakeLockMessage(status: WakeLockStatus): string {
+  if (status === "active") return "화면 자동 잠금 방지 중입니다.";
+  if (status === "requesting") {
+    return "화면 자동 잠금 방지를 연결 중입니다. 연결될 때까지 화면을 켜 두세요.";
+  }
+  if (status === "released") {
+    return "화면 자동 잠금 방지가 해제되었습니다. 녹음 중에는 화면을 직접 켜 두세요.";
+  }
+  if (status === "unavailable") {
+    return "화면 자동 잠금 방지를 사용할 수 없습니다. 녹음 중에는 화면을 직접 켜 두세요.";
+  }
+  return "화면 자동 잠금 방지를 준비 중입니다. 녹음 중에는 화면을 켜 두세요.";
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function formatBytes(bytes: number): string {

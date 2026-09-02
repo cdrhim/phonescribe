@@ -4,6 +4,7 @@ models/
 outputs/
 frontend/dist/
 frontend/node_modules/
+supabase/.temp/
 
 # Secrets and tokens
 .env

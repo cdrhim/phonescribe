@@ -34,12 +34,20 @@ class Settings:
     faster_whisper_cuda_model: str = "turbo"
     faster_whisper_cpu_threads: int = 0
     remote_access_enabled: bool = False
-    remote_session_ttl_sec: int = 12 * 60 * 60
+    remote_session_ttl_sec: int = 2 * 60 * 60
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
     )
     auto_export_dir: Path | None = None
+    supabase_enabled: bool = False
+    supabase_url: str | None = None
+    supabase_service_role_key: str | None = None
+    supabase_bucket: str = "recordings"
+    supabase_owner_id: str | None = None
+    supabase_part_size_bytes: int = 6 * 1024 * 1024
+    supabase_max_recording_bytes: int = 4 * 1024 * 1024 * 1024
+    supabase_request_timeout_sec: int = 30
 
     @property
     def db_path(self) -> Path:
@@ -94,13 +102,42 @@ def get_settings() -> Settings:
         remote_access_enabled=_env_bool("LOCAL_MEETSCRIBE_REMOTE_ACCESS", False),
         remote_session_ttl_sec=max(
             300,
-            _env_int("LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC", 12 * 60 * 60),
+            _env_int("LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC", 2 * 60 * 60),
         ),
         cors_origins=_env_csv(
             "LOCAL_MEETSCRIBE_CORS_ORIGINS",
             ("http://127.0.0.1:5173", "http://localhost:5173"),
         ),
         auto_export_dir=_env_optional_path("LOCAL_MEETSCRIBE_AUTO_EXPORT_DIR"),
+        supabase_enabled=_env_bool("LOCAL_MEETSCRIBE_SUPABASE_ENABLED", False),
+        supabase_url=(os.getenv("LOCAL_MEETSCRIBE_SUPABASE_URL") or "").strip().rstrip("/") or None,
+        supabase_service_role_key=(
+            os.getenv("LOCAL_MEETSCRIBE_SUPABASE_SERVICE_ROLE_KEY") or ""
+        ).strip()
+        or None,
+        supabase_bucket="recordings",
+        supabase_owner_id=(os.getenv("LOCAL_MEETSCRIBE_SUPABASE_OWNER_ID") or "").strip() or None,
+        supabase_part_size_bytes=max(
+            6 * 1024 * 1024,
+            min(
+                24 * 1024 * 1024,
+                _env_int(
+                    "LOCAL_MEETSCRIBE_SUPABASE_PART_SIZE_BYTES",
+                    6 * 1024 * 1024,
+                ),
+            ),
+        ),
+        supabase_max_recording_bytes=max(
+            1,
+            _env_int(
+                "LOCAL_MEETSCRIBE_SUPABASE_MAX_RECORDING_BYTES",
+                4 * 1024 * 1024 * 1024,
+            ),
+        ),
+        supabase_request_timeout_sec=max(
+            5,
+            _env_int("LOCAL_MEETSCRIBE_SUPABASE_REQUEST_TIMEOUT_SEC", 30),
+        ),
     )
 
 

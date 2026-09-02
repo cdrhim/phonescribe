@@ -20,6 +20,34 @@ export interface RuntimeProfile {
   gemini_share_enabled: boolean;
   gemini_share_ready: boolean;
   local_admin: boolean;
+  cloud_upload_enabled?: boolean;
+}
+
+export interface CloudUploadPart {
+  part_number: number;
+  byte_start: number;
+  byte_end: number;
+  size_bytes: number;
+  object_path: string;
+  upload: {
+    protocol: "signed-put";
+    url: string;
+    headers: Record<string, string>;
+  };
+}
+
+export interface CloudUploadDescriptor {
+  recording_id: string;
+  bucket_id: string;
+  object_path: string;
+  content_type: string;
+  parts: CloudUploadPart[];
+  expires_in: number;
+}
+
+export interface CloudRecordingReady {
+  recording_id: string;
+  status: "ready";
 }
 
 export interface QuickScanResult {

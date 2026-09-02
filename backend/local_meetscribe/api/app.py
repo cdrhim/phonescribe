@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -11,10 +12,10 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, BinaryIO
 
 from fastapi import (
     BackgroundTasks,
@@ -29,7 +30,13 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
+from local_meetscribe.cloud.supabase import (
+    CloudTranscriptSegment,
+    SupabaseCloudClient,
+    SupabaseCloudError,
+)
 from local_meetscribe.config import Settings, ensure_runtime_dirs, get_settings
 from local_meetscribe.db import JobStore
 from local_meetscribe.pipeline.asr import has_cuda_runtime
@@ -57,24 +64,267 @@ from local_meetscribe.schemas import (
     TranscriptPatch,
     load_transcript,
 )
-from local_meetscribe.security import GeminiShareStore
+from local_meetscribe.security import GeminiShareStore, SupabaseConfigStore
 from local_meetscribe.utils.errors import LocalMeetScribeError
 
 LOGGER = logging.getLogger(__name__)
 STAGED_UPLOAD_TTL_SEC = 24 * 60 * 60
+CLOUD_CLEANUP_BATCH_SIZE = 25
+CLOUD_CLEANUP_INTERVAL_SEC = 15 * 60
+CLOUD_MAINTENANCE_INTERVAL_SEC = 30
+RECOVERABLE_WORKFLOW_STATUSES = frozenset({"queued", "optimizing", "transcribing"})
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+class CloudUploadDescriptorRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(max_length=160)
+    size_bytes: int = Field(gt=0)
+
+
+class _WorkflowInputLease:
+    """An OS-owned cross-process lock released automatically after a crash."""
+
+    def __init__(self, handle: BinaryIO) -> None:
+        self.handle = handle
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        try:
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(  # type: ignore[attr-defined]
+                    self.handle.fileno(),
+                    fcntl.LOCK_UN,  # type: ignore[attr-defined]
+                )
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.handle.close()
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    supabase_client: SupabaseCloudClient | None = None,
+) -> FastAPI:
     active_settings = settings or get_settings()
     ensure_runtime_dirs(active_settings)
     store = JobStore(active_settings)
     share_store = GeminiShareStore(active_settings.data_dir)
+    supabase_store = SupabaseConfigStore(active_settings.data_dir)
     share_failures: dict[str, list[float]] = {}
     share_failure_lock = threading.Lock()
     remote_sessions: dict[str, float] = {}
     remote_session_lock = threading.Lock()
     active_workflow_inputs: set[str] = set()
     active_workflow_lock = threading.Lock()
+    cloud_outbox_lock = threading.Lock()
+    cloud_cleanup_lock = threading.Lock()
+    cloud_cleanup_last_started = float("-inf")
+    maintenance_stop = threading.Event()
+    maintenance_wake = threading.Event()
+
+    def current_supabase_client() -> SupabaseCloudClient | None:
+        if supabase_client is not None:
+            return supabase_client
+        stored = None
+        try:
+            stored = supabase_store.load()
+        except LocalMeetScribeError as exc:
+            LOGGER.warning(
+                "Saved Supabase configuration could not be loaded (%s)",
+                type(exc).__name__,
+            )
+        url = active_settings.supabase_url or (stored.project_url if stored else None)
+        key = active_settings.supabase_service_role_key or (
+            stored.service_role_key if stored else None
+        )
+        bucket = (
+            active_settings.supabase_bucket
+            if active_settings.supabase_url or active_settings.supabase_service_role_key
+            else (stored.bucket if stored else active_settings.supabase_bucket)
+        )
+        try:
+            return SupabaseCloudClient.from_settings(
+                active_settings,
+                url=url,
+                service_role_key=key,
+                bucket=bucket,
+            )
+        except SupabaseCloudError as exc:
+            LOGGER.warning("Supabase upload is disabled (%s)", type(exc).__name__)
+            return None
+
+    def run_cloud_cleanup_if_due(client: SupabaseCloudClient) -> None:
+        nonlocal cloud_cleanup_last_started
+        cleanup = getattr(client, "try_cleanup_expired_recordings", None)
+        if not callable(cleanup):
+            return
+        now = time.monotonic()
+        with cloud_cleanup_lock:
+            if now - cloud_cleanup_last_started < CLOUD_CLEANUP_INTERVAL_SEC:
+                return
+            cloud_cleanup_last_started = now
+        try:
+            result = cleanup(limit=CLOUD_CLEANUP_BATCH_SIZE)
+        except Exception as exc:  # noqa: BLE001 - maintenance must never affect uploads.
+            LOGGER.warning("Cloud retention maintenance failed (%s)", type(exc).__name__)
+            return
+        LOGGER.info(
+            "Cloud retention cleanup attempted %d recordings; deleted=%d failed=%d",
+            result.attempted,
+            result.deleted,
+            result.failed,
+        )
+
+    def schedule_cloud_cleanup(_client: SupabaseCloudClient) -> None:
+        # The lifespan-owned daemon performs cleanup. Waking it keeps descriptor
+        # creation non-blocking while retaining the opportunistic behavior.
+        maintenance_wake.set()
+
+    def try_flush_cloud_outbox_file(
+        path: Path,
+        client: SupabaseCloudClient | None,
+    ) -> bool:
+        if client is None:
+            return False
+        try:
+            payload = _read_json_object(path)
+            workflow_id = str(payload.get("workflow_id") or "")
+            recording_id = str(payload.get("recording_id") or "")
+            package_id = str(payload.get("package_id") or "")
+            status = str(payload.get("status") or "")
+            stage = str(payload.get("stage") or status)
+            if not re.fullmatch(r"[a-f0-9]{32}", workflow_id):
+                raise LocalMeetScribeError("Cloud outbox workflow ID is invalid.")
+            if not package_id or not recording_id or not status:
+                raise LocalMeetScribeError("Cloud outbox entry is incomplete.")
+            client.sync_workflow_status(
+                recording_id=recording_id,
+                workflow_id=workflow_id,
+                status=status,
+                stage=stage,
+                progress=float(str(payload.get("progress") or 0.0)),
+                error_message=(
+                    str(payload.get("error_message"))[:500]
+                    if payload.get("error_message")
+                    else None
+                ),
+            )
+            if bool(payload.get("include_transcript")):
+                transcript = _read_json_object(
+                    active_settings.data_dir / "optimized" / package_id / "gemini_transcript.json"
+                )
+                raw_chunks = transcript.get("chunks")
+                chunks = raw_chunks if isinstance(raw_chunks, list) else []
+                client.persist_transcript(
+                    recording_id=recording_id,
+                    workflow_id=workflow_id,
+                    provider=str(transcript.get("provider") or "gemini"),
+                    model_name=str(transcript.get("model") or active_settings.gemini_model),
+                    text_raw=str(transcript.get("text") or ""),
+                    segments=[
+                        CloudTranscriptSegment(
+                            start_sec=float(item.get("start_sec") or 0.0),
+                            end_sec=float(item.get("end_sec") or 0.0),
+                            text=str(item.get("text") or ""),
+                        )
+                        for item in chunks
+                        if isinstance(item, dict)
+                    ],
+                    suggested_filename=str(transcript.get("suggested_filename") or "transcript"),
+                )
+            _update_json_object(
+                _workflow_state_path(active_settings, workflow_id),
+                {
+                    "cloud_sync_complete": True,
+                    "cloud_synced_at": time.time(),
+                },
+            )
+            path.unlink(missing_ok=True)
+            return True
+        except Exception as exc:  # noqa: BLE001 - a durable outbox must survive all failures.
+            LOGGER.warning(
+                "Cloud outbox delivery failed for %s (%s)",
+                path.stem,
+                type(exc).__name__,
+            )
+            return False
+
+    def persist_workflow_state(
+        *,
+        workflow_id: str,
+        package_id: str,
+        status: str,
+        cloud_recording_id: str | None,
+        cloud_client: SupabaseCloudClient | None,
+        error: str | None = None,
+        auto_exported: bool | None = None,
+        auto_export_error: str | None = None,
+        durable_fields: Mapping[str, object] | None = None,
+        attempt_cloud_delivery: bool = True,
+    ) -> None:
+        state_path = _workflow_state_path(active_settings, workflow_id)
+        progress_by_status = {
+            "queued": 0.0,
+            "optimizing": 0.15,
+            "transcribing": 0.5,
+            "complete": 1.0,
+            "failed": 1.0,
+        }
+        if cloud_recording_id:
+            with cloud_outbox_lock:
+                _write_workflow_state(
+                    state_path,
+                    workflow_id=workflow_id,
+                    package_id=package_id,
+                    status=status,
+                    error=error,
+                    auto_exported=auto_exported,
+                    auto_export_error=auto_export_error,
+                    cloud_recording_id=cloud_recording_id,
+                    cloud_sync_complete=False,
+                    durable_fields=durable_fields,
+                )
+                outbox_path = _cloud_outbox_path(active_settings, workflow_id)
+                _write_json_object(
+                    outbox_path,
+                    {
+                        "schema_version": 1,
+                        "workflow_id": workflow_id,
+                        "recording_id": cloud_recording_id,
+                        "package_id": package_id,
+                        "status": status,
+                        "stage": status,
+                        "progress": progress_by_status.get(status, 0.0),
+                        "error_message": error,
+                        "include_transcript": status == "complete",
+                        "updated_at": time.time(),
+                    },
+                )
+                if attempt_cloud_delivery:
+                    try_flush_cloud_outbox_file(outbox_path, cloud_client)
+            maintenance_wake.set()
+            return
+        _write_workflow_state(
+            state_path,
+            workflow_id=workflow_id,
+            package_id=package_id,
+            status=status,
+            error=error,
+            auto_exported=auto_exported,
+            auto_export_error=auto_export_error,
+            durable_fields=durable_fields,
+        )
 
     def require_share_passcode(request: Request, passcode: str | None) -> None:
         client_id = request.client.host if request.client else "unknown"
@@ -126,27 +376,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         workflow_id: str,
         package_id: str,
         upload_id: str | None,
+        cloud_recording_id: str | None,
+        cloud_client: SupabaseCloudClient | None,
         optimizer_request: OptimizerRequest,
         api_key: str,
         workflow_input_key: str,
+        workflow_lease: _WorkflowInputLease,
     ) -> None:
-        state_path = _workflow_state_path(active_settings, workflow_id)
         output_root = active_settings.data_dir / "optimized"
         output_dir = output_root / package_id
-        phase = "optimizing" if upload_id else "transcribing"
+        phase = "optimizing" if upload_id or cloud_recording_id else "transcribing"
+        cloud_download_dir: Path | None = None
+
+        def persist_state(
+            status: str,
+            *,
+            error: str | None = None,
+            auto_exported: bool | None = None,
+            auto_export_error: str | None = None,
+        ) -> None:
+            persist_workflow_state(
+                workflow_id=workflow_id,
+                package_id=package_id,
+                status=status,
+                error=error,
+                auto_exported=auto_exported,
+                auto_export_error=auto_export_error,
+                cloud_recording_id=cloud_recording_id,
+                cloud_client=cloud_client,
+            )
+
         release_system_awake = _request_system_awake()
         try:
-            if upload_id:
-                _write_workflow_state(
-                    state_path,
-                    workflow_id=workflow_id,
-                    package_id=package_id,
-                    status="optimizing",
-                )
-                staged_upload_dir, source_path = _resolve_staged_upload(
-                    active_settings.tmp_dir / "optimizer-uploads",
-                    upload_id,
-                )
+            if (upload_id or cloud_recording_id) and not _optimized_package_complete(output_dir):
+                persist_state("optimizing")
+                shutil.rmtree(output_dir, ignore_errors=True)
+                if cloud_recording_id:
+                    if cloud_client is None:
+                        raise SupabaseCloudError("Supabase cloud upload is not configured.")
+                    recording = cloud_client.get_recording(cloud_recording_id)
+                    cloud_download_dir = active_settings.tmp_dir / "cloud-downloads" / workflow_id
+                    source_path = cloud_download_dir / _safe_filename(recording.original_filename)
+                    cloud_client.download_recording(cloud_recording_id, source_path)
+                    staged_upload_dir = None
+                else:
+                    staged_upload_dir, source_path = _resolve_staged_upload(
+                        active_settings.tmp_dir / "optimizer-uploads",
+                        upload_id or "",
+                    )
                 optimize_audio_package(
                     source_path,
                     output_root,
@@ -154,15 +431,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     optimizer_request,
                     package_id=package_id,
                 )
-                shutil.rmtree(staged_upload_dir, ignore_errors=True)
+                if not _optimized_package_complete(output_dir):
+                    raise LocalMeetScribeError(
+                        "The optimized recording package is incomplete. Select the recording again."
+                    )
+                if staged_upload_dir is not None:
+                    shutil.rmtree(staged_upload_dir, ignore_errors=True)
+                if cloud_download_dir is not None:
+                    shutil.rmtree(cloud_download_dir, ignore_errors=True)
+
+            if not _optimized_package_complete(output_dir):
+                raise LocalMeetScribeError(
+                    "The optimized recording package is incomplete. Select the recording again."
+                )
 
             phase = "transcribing"
-            _write_workflow_state(
-                state_path,
-                workflow_id=workflow_id,
-                package_id=package_id,
-                status="transcribing",
-            )
+            persist_state("transcribing")
             transcript_result = transcribe_gemini_package(
                 output_dir,
                 active_settings,
@@ -173,11 +457,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 transcript_result.suggested_filename,
                 active_settings.auto_export_dir,
             )
-            _write_workflow_state(
-                state_path,
-                workflow_id=workflow_id,
-                package_id=package_id,
-                status="complete",
+            persist_state(
+                "complete",
                 auto_exported=auto_exported,
                 auto_export_error=auto_export_error,
             )
@@ -191,11 +472,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     output_dir,
                     active_settings.auto_export_dir,
                 )
-                _write_workflow_state(
-                    state_path,
-                    workflow_id=workflow_id,
-                    package_id=package_id,
-                    status="complete",
+                persist_state(
+                    "complete",
                     auto_exported=auto_exported,
                     auto_export_error=auto_export_error,
                 )
@@ -208,19 +486,230 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 phase,
                 type(exc).__name__,
             )
-            _write_workflow_state(
-                state_path,
-                workflow_id=workflow_id,
-                package_id=package_id,
-                status="failed",
-                error=_background_error_message(exc),
-            )
+            persist_state("failed", error=_background_error_message(exc))
         finally:
+            if cloud_download_dir is not None:
+                shutil.rmtree(cloud_download_dir, ignore_errors=True)
             release_system_awake()
+            workflow_lease.release()
             with active_workflow_lock:
                 active_workflow_inputs.discard(workflow_input_key)
 
-    app = FastAPI(title="LocalMeetScribe", version="0.1.0")
+    def try_reserve_workflow_input(
+        workflow_input_key: str,
+    ) -> tuple[_WorkflowInputLease | None, str | None]:
+        with active_workflow_lock:
+            if workflow_input_key in active_workflow_inputs:
+                return None, "active"
+            lease = _try_acquire_workflow_input_lease(
+                active_settings.tmp_dir / "workflow-locks",
+                workflow_input_key,
+            )
+            if lease is None:
+                return None, "locked"
+            active_workflow_inputs.add(workflow_input_key)
+            return lease, None
+
+    def recovery_api_key() -> str:
+        configured = (active_settings.gemini_api_key or "").strip()
+        if configured:
+            return configured
+        try:
+            return (share_store.load_api_key() or "").strip()
+        except LocalMeetScribeError as exc:
+            LOGGER.warning("Saved Gemini key could not be loaded (%s)", type(exc).__name__)
+            return ""
+
+    def recover_workflows() -> None:
+        workflow_dir = active_settings.tmp_dir / "workflows"
+        workflow_dir.mkdir(parents=True, exist_ok=True)
+        for state_path in sorted(workflow_dir.glob("*.json")):
+            lease: _WorkflowInputLease | None = None
+            workflow_input_key = ""
+            try:
+                state = _read_json_object(state_path)
+                workflow_id = str(state.get("workflow_id") or "")
+                package_id = str(state.get("package_id") or "")
+                status = str(state.get("status") or "")
+                if (
+                    not re.fullmatch(r"[a-f0-9]{32}", workflow_id)
+                    or state_path.stem != workflow_id
+                    or not re.fullmatch(r"[a-f0-9]{32}", package_id)
+                ):
+                    raise LocalMeetScribeError("Workflow recovery state is invalid.")
+                cloud_recording_id = str(state.get("cloud_recording_id") or "") or None
+                if cloud_recording_id and not bool(state.get("cloud_sync_complete")):
+                    with cloud_outbox_lock:
+                        outbox_path = _cloud_outbox_path(active_settings, workflow_id)
+                        if not outbox_path.exists():
+                            _write_json_object(
+                                outbox_path,
+                                _cloud_outbox_payload_from_state(state),
+                            )
+                if status not in RECOVERABLE_WORKFLOW_STATUSES:
+                    continue
+
+                input_kind, input_id, workflow_input_key = _recovery_input(state, package_id)
+                lease, reservation_error = try_reserve_workflow_input(workflow_input_key)
+                if lease is None:
+                    if reservation_error == "active":
+                        persist_workflow_state(
+                            workflow_id=workflow_id,
+                            package_id=package_id,
+                            status="failed",
+                            error=(
+                                "A newer recovery worker already owns this recording. "
+                                "Retry the recording only if that workflow fails."
+                            ),
+                            cloud_recording_id=cloud_recording_id,
+                            cloud_client=current_supabase_client(),
+                            durable_fields={"error_code": "duplicate_recovery_worker"},
+                            attempt_cloud_delivery=False,
+                        )
+                    continue
+
+                output_dir = active_settings.data_dir / "optimized" / package_id
+                if _gemini_outputs_complete(output_dir):
+                    try:
+                        auto_exported, auto_export_error = _auto_export_stored_transcript(
+                            output_dir,
+                            active_settings.auto_export_dir,
+                        )
+                        persist_workflow_state(
+                            workflow_id=workflow_id,
+                            package_id=package_id,
+                            status="complete",
+                            cloud_recording_id=cloud_recording_id,
+                            cloud_client=current_supabase_client(),
+                            auto_exported=auto_exported,
+                            auto_export_error=auto_export_error,
+                            durable_fields={
+                                "attempt_count": int(str(state.get("attempt_count") or 0)) + 1,
+                                "recovered_after_restart": True,
+                            },
+                            attempt_cloud_delivery=False,
+                        )
+                    finally:
+                        lease.release()
+                        lease = None
+                        with active_workflow_lock:
+                            active_workflow_inputs.discard(workflow_input_key)
+                    continue
+
+                api_key = recovery_api_key()
+                cloud_client = current_supabase_client() if cloud_recording_id else None
+                recovery_error: str | None = None
+                error_code: str | None = None
+                if not api_key:
+                    recovery_error = (
+                        "서버 재시작 후 전사를 계속하려면 서버 PC에 기본 Gemini API key를 "
+                        "등록한 뒤 녹음을 다시 시작하세요. 요청 헤더의 API key는 저장되지 않습니다."
+                    )
+                    error_code = "recovery_key_unavailable"
+                elif (
+                    input_kind == "cloud"
+                    and cloud_client is None
+                    and not (_optimized_package_complete(output_dir))
+                ):
+                    recovery_error = (
+                        "서버 재시작 후 클라우드 녹음을 다시 받으려면 서버 PC에서 "
+                        "Supabase 연결을 복구한 뒤 다시 시도하세요."
+                    )
+                    error_code = "recovery_cloud_unavailable"
+                if recovery_error:
+                    try:
+                        persist_workflow_state(
+                            workflow_id=workflow_id,
+                            package_id=package_id,
+                            status="failed",
+                            error=recovery_error,
+                            cloud_recording_id=cloud_recording_id,
+                            cloud_client=cloud_client,
+                            durable_fields={
+                                "error_code": error_code or "recovery_unavailable",
+                                "requires_api_key": error_code == "recovery_key_unavailable",
+                            },
+                            attempt_cloud_delivery=False,
+                        )
+                    finally:
+                        lease.release()
+                        lease = None
+                        with active_workflow_lock:
+                            active_workflow_inputs.discard(workflow_input_key)
+                    continue
+
+                optimizer_request = _optimizer_request_from_payload(state.get("optimizer_request"))
+                _update_json_object(
+                    state_path,
+                    {
+                        "attempt_count": int(str(state.get("attempt_count") or 0)) + 1,
+                        "recovered_after_restart": True,
+                    },
+                )
+                recovery_thread = threading.Thread(
+                    target=run_transcription_workflow,
+                    args=(
+                        workflow_id,
+                        package_id,
+                        input_id if input_kind == "upload" else None,
+                        cloud_recording_id if input_kind == "cloud" else None,
+                        cloud_client,
+                        optimizer_request,
+                        api_key,
+                        workflow_input_key,
+                        lease,
+                    ),
+                    name=f"phonescribe-recovery-{workflow_id[:8]}",
+                    daemon=True,
+                )
+                recovery_thread.start()
+                lease = None  # Ownership transferred to the recovery worker.
+            except Exception as exc:  # noqa: BLE001 - one corrupt state cannot stop startup.
+                if lease is not None:
+                    lease.release()
+                    with active_workflow_lock:
+                        active_workflow_inputs.discard(workflow_input_key)
+                LOGGER.warning(
+                    "Skipped workflow recovery state %s (%s)",
+                    state_path.stem,
+                    type(exc).__name__,
+                )
+
+    def maintenance_loop() -> None:
+        while not maintenance_stop.is_set():
+            client = current_supabase_client()
+            if client is not None:
+                outbox_dir = active_settings.tmp_dir / "cloud-outbox"
+                outbox_dir.mkdir(parents=True, exist_ok=True)
+                for outbox_path in sorted(outbox_dir.glob("*.json")):
+                    if maintenance_stop.is_set():
+                        break
+                    with cloud_outbox_lock:
+                        try_flush_cloud_outbox_file(outbox_path, client)
+                if not maintenance_stop.is_set():
+                    run_cloud_cleanup_if_due(client)
+            maintenance_wake.wait(CLOUD_MAINTENANCE_INTERVAL_SEC)
+            maintenance_wake.clear()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        maintenance_stop.clear()
+        maintenance_wake.clear()
+        recover_workflows()
+        maintenance_thread = threading.Thread(
+            target=maintenance_loop,
+            name="phonescribe-cloud-maintenance",
+            daemon=True,
+        )
+        maintenance_thread.start()
+        try:
+            yield
+        finally:
+            maintenance_stop.set()
+            maintenance_wake.set()
+            maintenance_thread.join(timeout=2.0)
+
+    app = FastAPI(title="LocalMeetScribe", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(active_settings.cors_origins),
@@ -243,9 +732,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             and request.url.path not in public_api_paths
             and not _is_loopback_request(request)
         )
-        if requires_session and not remote_session_is_valid(
-            request.headers.get("authorization")
-        ):
+        if requires_session and not remote_session_is_valid(request.headers.get("authorization")):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "공유 비밀번호를 다시 확인하세요."},
@@ -260,6 +747,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def runtime(request: Request) -> dict[str, str | bool]:
         cuda = has_cuda_runtime()
         saved_share_key = share_store.api_key_configured
+        cloud_upload_enabled = current_supabase_client() is not None
         return {
             "device": "cuda" if cuda else "cpu",
             "cuda": cuda,
@@ -270,15 +758,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
             "accurate_model": active_settings.faster_whisper_cuda_model,
             "gemini_transcription_enabled": active_settings.enable_gemini_transcription,
-            "gemini_api_key_configured": bool(
-                active_settings.gemini_api_key or saved_share_key
-            ),
+            "gemini_api_key_configured": bool(active_settings.gemini_api_key or saved_share_key),
             "gemini_model": active_settings.gemini_model,
             "gemini_share_enabled": share_store.passcode_configured,
             "gemini_share_ready": bool(
                 share_store.passcode_configured
                 and (active_settings.gemini_api_key or saved_share_key)
             ),
+            "supabase_configured": bool(
+                active_settings.supabase_url and active_settings.supabase_service_role_key
+            )
+            or supabase_store.configured,
+            "cloud_upload_enabled": cloud_upload_enabled,
             "local_admin": _is_loopback_request(request),
         }
 
@@ -314,6 +805,92 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except LocalMeetScribeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"configured": True}
+
+    @app.post("/api/admin/supabase-config")
+    def configure_supabase(
+        request: Request,
+        project_url: Annotated[str, Form()],
+        service_role_key: Annotated[str, Form()],
+        share_passcode: Annotated[
+            str | None,
+            Header(alias="X-LocalMeetScribe-Passcode"),
+        ] = None,
+    ) -> dict[str, bool]:
+        if not _is_loopback_request(request):
+            raise HTTPException(
+                status_code=403,
+                detail="Supabase 설정은 서버 PC에서만 변경할 수 있습니다.",
+            )
+        if share_store.passcode_configured:
+            require_share_passcode(request, share_passcode)
+        try:
+            supabase_store.save(
+                project_url=project_url,
+                service_role_key=service_role_key,
+                bucket="recordings",
+            )
+            configured = current_supabase_client() is not None
+            maintenance_wake.set()
+        except LocalMeetScribeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"configured": configured, "cloud_upload_enabled": configured}
+
+    @app.post("/api/cloud-recordings/upload-descriptor", status_code=201)
+    def create_cloud_upload_descriptor(
+        payload: CloudUploadDescriptorRequest,
+    ) -> dict[str, object]:
+        client = current_supabase_client()
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Supabase cloud upload is not configured. Use local upload instead.",
+            )
+        schedule_cloud_cleanup(client)
+        try:
+            descriptor = client.create_upload_descriptor(
+                filename=payload.filename,
+                content_type=payload.content_type,
+                size_bytes=payload.size_bytes,
+            )
+        except SupabaseCloudError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "recording_id": descriptor.recording_id,
+            "bucket_id": descriptor.bucket_id,
+            "object_path": descriptor.object_path,
+            "content_type": descriptor.content_type,
+            "expires_in": descriptor.expires_in,
+            "parts": [
+                {
+                    "part_number": part.part_number,
+                    "byte_start": part.byte_start,
+                    "byte_end": part.byte_end,
+                    "size_bytes": part.size_bytes,
+                    "object_path": part.object_path,
+                    "upload": {
+                        "protocol": "signed-put",
+                        "url": part.upload_url,
+                        "headers": {
+                            "content-type": descriptor.content_type,
+                            "cache-control": "max-age=3600",
+                            "x-upsert": "false",
+                        },
+                    },
+                }
+                for part in descriptor.parts
+            ],
+        }
+
+    @app.post("/api/cloud-recordings/{recording_id}/complete")
+    def complete_cloud_recording(recording_id: str) -> dict[str, str]:
+        client = current_supabase_client()
+        if client is None:
+            raise HTTPException(status_code=503, detail="Supabase cloud upload is not configured.")
+        try:
+            recording = client.complete_recording(recording_id)
+        except SupabaseCloudError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"recording_id": recording.id, "status": recording.storage_status}
 
     @app.post("/api/optimizer/analyze")
     def optimizer_analyze(
@@ -550,6 +1127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         upload_id: Annotated[str | None, Form()] = None,
         package_id: Annotated[str | None, Form()] = None,
+        cloud_recording_id: Annotated[str | None, Form()] = None,
         destination: Annotated[str, Form()] = "gemini",
         openai_model: Annotated[str, Form()] = "gpt-4o-transcribe",
         word_timestamps: Annotated[bool, Form()] = False,
@@ -566,10 +1144,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             Header(alias="X-LocalMeetScribe-Passcode"),
         ] = None,
     ) -> dict[str, object]:
-        if bool(upload_id) == bool(package_id):
+        if sum(bool(value) for value in (upload_id, package_id, cloud_recording_id)) != 1:
             raise HTTPException(
                 status_code=400,
-                detail="Provide one staged upload ID or one optimized package ID.",
+                detail=(
+                    "Provide exactly one staged upload ID, optimized package ID, "
+                    "or cloud recording ID."
+                ),
             )
 
         optimizer_request = _optimizer_request(
@@ -590,6 +1171,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Background transcription workflows require the Gemini destination.",
             )
 
+        workflow_cloud_client: SupabaseCloudClient | None = None
         if upload_id:
             try:
                 _resolve_staged_upload(
@@ -599,15 +1181,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except LocalMeetScribeError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             resolved_package_id = uuid.uuid4().hex
+        elif cloud_recording_id:
+            workflow_cloud_client = current_supabase_client()
+            if workflow_cloud_client is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Supabase cloud upload is not configured.",
+                )
+            try:
+                cloud_recording = workflow_cloud_client.get_recording(cloud_recording_id)
+            except SupabaseCloudError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            if cloud_recording.storage_status != "ready":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cloud recording upload is not complete.",
+                )
+            cloud_recording_id = cloud_recording.id
+            resolved_package_id = uuid.uuid4().hex
         else:
             resolved_package_id = package_id or ""
             if not re.fullmatch(r"[a-f0-9]{32}", resolved_package_id):
                 raise HTTPException(status_code=404, detail="Optimized package not found.")
             if not (
-                active_settings.data_dir
-                / "optimized"
-                / resolved_package_id
-                / "manifest.json"
+                active_settings.data_dir / "optimized" / resolved_package_id / "manifest.json"
             ).exists():
                 raise HTTPException(status_code=404, detail="Optimized package not found.")
 
@@ -628,39 +1225,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         workflow_id = uuid.uuid4().hex
         workflow_input_key = (
-            f"upload:{upload_id}" if upload_id else f"package:{resolved_package_id}"
+            f"upload:{upload_id}"
+            if upload_id
+            else (
+                f"cloud:{cloud_recording_id}"
+                if cloud_recording_id
+                else f"package:{resolved_package_id}"
+            )
         )
-        with active_workflow_lock:
-            if workflow_input_key in active_workflow_inputs:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This recording already has an active transcription workflow.",
-                )
-            active_workflow_inputs.add(workflow_input_key)
-        state_path = _workflow_state_path(active_settings, workflow_id)
+        workflow_lease, _reservation_error = try_reserve_workflow_input(workflow_input_key)
+        if workflow_lease is None:
+            raise HTTPException(
+                status_code=409,
+                detail="This recording already has an active transcription workflow.",
+            )
+        input_kind = "upload" if upload_id else ("cloud" if cloud_recording_id else "package")
+        input_id = upload_id or cloud_recording_id or resolved_package_id
+        credential_mode = (
+            "ephemeral"
+            if gemini_api_key
+            and not share_store.passcode_configured
+            and not active_settings.gemini_api_key
+            else "server"
+        )
         try:
-            _write_workflow_state(
-                state_path,
+            persist_workflow_state(
                 workflow_id=workflow_id,
                 package_id=resolved_package_id,
                 status="queued",
+                cloud_recording_id=cloud_recording_id,
+                cloud_client=workflow_cloud_client,
+                durable_fields={
+                    "schema_version": 2,
+                    "input_kind": input_kind,
+                    "input_id": input_id or "",
+                    "workflow_input_key": workflow_input_key,
+                    "optimizer_request": _optimizer_request_payload(optimizer_request),
+                    "credential_mode": credential_mode,
+                    "attempt_count": 0,
+                    "created_at": time.time(),
+                },
             )
             background_tasks.add_task(
                 run_transcription_workflow,
                 workflow_id,
                 resolved_package_id,
                 upload_id,
+                cloud_recording_id,
+                workflow_cloud_client,
                 optimizer_request,
                 resolved_api_key,
                 workflow_input_key,
+                workflow_lease,
             )
         except Exception:
+            workflow_lease.release()
             with active_workflow_lock:
                 active_workflow_inputs.discard(workflow_input_key)
             raise
         return {
             "workflow_id": workflow_id,
             "package_id": resolved_package_id,
+            "cloud_recording_id": cloud_recording_id,
             "status": "queued",
         }
 
@@ -685,13 +1311,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             state["auto_exported"] = auto_exported
             state["auto_export_error"] = auto_export_error
             try:
-                _write_workflow_state(
-                    state_path,
+                persist_workflow_state(
                     workflow_id=workflow_id,
                     package_id=package_id,
                     status="complete",
                     auto_exported=auto_exported,
                     auto_export_error=auto_export_error,
+                    cloud_recording_id=str(state.get("cloud_recording_id") or "") or None,
+                    cloud_client=current_supabase_client(),
+                    attempt_cloud_delivery=False,
                 )
             except OSError:
                 LOGGER.info("Could not persist recovered workflow %s", workflow_id)
@@ -703,6 +1331,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auto_exported": state.get("auto_exported"),
             "auto_export_error": state.get("auto_export_error"),
         }
+        if state.get("cloud_recording_id"):
+            response["cloud_recording_id"] = state["cloud_recording_id"]
         if (package_dir / "manifest.json").exists():
             response["package"] = _optimized_package_payload(package_dir, package_id)
 
@@ -1113,6 +1743,61 @@ def _optimizer_request(
     )
 
 
+def _optimizer_request_payload(request: OptimizerRequest) -> dict[str, object]:
+    return {
+        "destination": request.destination,
+        "openai_model": request.openai_model,
+        "word_timestamps": request.word_timestamps,
+        "overrides": {
+            "codec": request.overrides.codec,
+            "bitrate_kbps": request.overrides.bitrate_kbps,
+            "chunk_minutes": request.overrides.chunk_minutes,
+            "remove_silence": request.overrides.remove_silence,
+            "loudnorm": request.overrides.loudnorm,
+            "speech_filter": request.overrides.speech_filter,
+            "denoise": request.overrides.denoise,
+        },
+    }
+
+
+def _optimizer_request_from_payload(value: object) -> OptimizerRequest:
+    if value is None:
+        return _optimizer_request(
+            destination="gemini",
+            openai_model="gpt-4o-transcribe",
+            word_timestamps=False,
+            codec=None,
+            bitrate_kbps=None,
+            chunk_minutes=None,
+            remove_silence=True,
+            loudnorm=True,
+            speech_filter=True,
+            denoise=False,
+        )
+    if not isinstance(value, dict):
+        raise LocalMeetScribeError("Workflow optimizer settings are invalid.")
+    raw_overrides = value.get("overrides")
+    overrides = raw_overrides if isinstance(raw_overrides, dict) else {}
+    return _optimizer_request(
+        destination=str(value.get("destination") or "gemini"),
+        openai_model=str(value.get("openai_model") or "gpt-4o-transcribe"),
+        word_timestamps=bool(value.get("word_timestamps", False)),
+        codec=str(overrides["codec"]) if overrides.get("codec") else None,
+        bitrate_kbps=(
+            int(overrides["bitrate_kbps"]) if overrides.get("bitrate_kbps") is not None else None
+        ),
+        chunk_minutes=(
+            float(overrides["chunk_minutes"])
+            if overrides.get("chunk_minutes") is not None
+            else None
+        ),
+        remove_silence=bool(overrides.get("remove_silence", True)),
+        loudnorm=bool(overrides.get("loudnorm", True)),
+        speech_filter=bool(overrides.get("speech_filter", True)),
+        denoise=bool(overrides.get("denoise", False)),
+    )
+
+
 def _safe_filename(value: str) -> str:
     name = unicodedata.normalize("NFC", Path(value).name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name)
@@ -1121,6 +1806,10 @@ def _safe_filename(value: str) -> str:
 
 def _workflow_state_path(settings: Settings, workflow_id: str) -> Path:
     return settings.tmp_dir / "workflows" / f"{workflow_id}.json"
+
+
+def _cloud_outbox_path(settings: Settings, workflow_id: str) -> Path:
+    return settings.tmp_dir / "cloud-outbox" / f"{workflow_id}.json"
 
 
 def _write_workflow_state(
@@ -1132,20 +1821,39 @@ def _write_workflow_state(
     error: str | None = None,
     auto_exported: bool | None = None,
     auto_export_error: str | None = None,
+    cloud_recording_id: str | None = None,
+    cloud_sync_complete: bool | None = None,
+    durable_fields: Mapping[str, object] | None = None,
 ) -> None:
-    payload = {
-        "workflow_id": workflow_id,
-        "package_id": package_id,
-        "status": status,
-        "error": error,
-        "updated_at": time.time(),
-    }
+    payload: dict[str, object] = {}
+    if path.exists():
+        with suppress(LocalMeetScribeError):
+            payload.update(_read_json_object(path))
+    if durable_fields:
+        payload.update(durable_fields)
+    payload.update(
+        {
+            "workflow_id": workflow_id,
+            "package_id": package_id,
+            "status": status,
+            "error": error,
+            "updated_at": time.time(),
+        }
+    )
     if auto_exported is not None:
         payload["auto_exported"] = auto_exported
     if auto_export_error is not None:
         payload["auto_export_error"] = auto_export_error
+    if cloud_recording_id is not None:
+        payload["cloud_recording_id"] = cloud_recording_id
+    if cloud_sync_complete is not None:
+        payload["cloud_sync_complete"] = cloud_sync_complete
+    _write_json_object(path, payload)
+
+
+def _write_json_object(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    value = json.dumps(payload, ensure_ascii=False, indent=2)
+    value = json.dumps(dict(payload), ensure_ascii=False, indent=2)
     for attempt in range(5):
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
@@ -1161,6 +1869,12 @@ def _write_workflow_state(
                 temporary.unlink(missing_ok=True)
 
 
+def _update_json_object(path: Path, updates: Mapping[str, object]) -> None:
+    current = _read_json_object(path) if path.exists() else {}
+    current.update(updates)
+    _write_json_object(path, current)
+
+
 def _read_json_object(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1171,6 +1885,85 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return payload
 
 
+def _cloud_outbox_payload_from_state(state: Mapping[str, object]) -> dict[str, object]:
+    status = str(state.get("status") or "failed")
+    return {
+        "schema_version": 1,
+        "workflow_id": str(state.get("workflow_id") or ""),
+        "recording_id": str(state.get("cloud_recording_id") or ""),
+        "package_id": str(state.get("package_id") or ""),
+        "status": status,
+        "stage": status,
+        "progress": {
+            "queued": 0.0,
+            "optimizing": 0.15,
+            "transcribing": 0.5,
+            "complete": 1.0,
+            "failed": 1.0,
+        }.get(status, 0.0),
+        "error_message": state.get("error"),
+        "include_transcript": status == "complete",
+        "updated_at": time.time(),
+    }
+
+
+def _recovery_input(
+    state: Mapping[str, object],
+    package_id: str,
+) -> tuple[str, str, str]:
+    schema_version = state.get("schema_version")
+    if schema_version is not None and schema_version != 2:
+        raise LocalMeetScribeError("Workflow recovery state version is unsupported.")
+    input_kind = str(state.get("input_kind") or "")
+    input_id = str(state.get("input_id") or "")
+    input_key = str(state.get("workflow_input_key") or "")
+    if not input_kind:
+        cloud_recording_id = str(state.get("cloud_recording_id") or "")
+        if cloud_recording_id:
+            input_kind = "cloud"
+            input_id = cloud_recording_id
+        elif package_id:
+            input_kind = "package"
+            input_id = package_id
+        input_key = f"{input_kind}:{input_id}"
+    if input_kind not in {"upload", "cloud", "package"} or not input_id:
+        raise LocalMeetScribeError("Workflow recovery input is missing.")
+    expected_key = f"{input_kind}:{input_id}"
+    if input_key != expected_key:
+        raise LocalMeetScribeError("Workflow recovery input key is invalid.")
+    return input_kind, input_id, input_key
+
+
+def _try_acquire_workflow_input_lease(
+    lock_dir: Path,
+    workflow_input_key: str,
+) -> _WorkflowInputLease | None:
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(workflow_input_key.encode("utf-8")).hexdigest()
+    handle = (lock_dir / f"{digest}.lock").open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(  # type: ignore[attr-defined]
+                handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+            )
+        return _WorkflowInputLease(handle)
+    except OSError:
+        handle.close()
+        return None
+
+
 def _background_error_message(exc: Exception) -> str:
     if isinstance(exc, LocalMeetScribeError):
         return str(exc)[:500]
@@ -1179,14 +1972,59 @@ def _background_error_message(exc: Exception) -> str:
 
 def _gemini_outputs_complete(package_dir: Path) -> bool:
     try:
-        return all(
-            path.is_file() and path.stat().st_size > 0
-            for path in (
-                package_dir / "gemini_transcript.txt",
-                package_dir / "gemini_transcript.json",
-            )
+        txt_path = package_dir / "gemini_transcript.txt"
+        json_path = package_dir / "gemini_transcript.json"
+        if not all(path.is_file() and path.stat().st_size > 0 for path in (txt_path, json_path)):
+            return False
+        transcript = _read_json_object(json_path)
+        transcript_text = transcript.get("text")
+        raw_transcript_chunks = transcript.get("chunks")
+        if not isinstance(transcript_text, str) or not isinstance(raw_transcript_chunks, list):
+            return False
+        if not raw_transcript_chunks or txt_path.read_text(encoding="utf-8") != transcript_text:
+            return False
+
+        manifest = _read_json_object(package_dir / "manifest.json")
+        raw_manifest_chunks = manifest.get("chunks")
+        if not isinstance(raw_manifest_chunks, list) or not raw_manifest_chunks:
+            return False
+        expected_filenames = {
+            str(item.get("filename") or "")
+            for item in raw_manifest_chunks
+            if isinstance(item, dict)
+        }
+        transcript_filenames = {
+            str(item.get("filename") or "")
+            for item in raw_transcript_chunks
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        }
+        return (
+            len(expected_filenames) == len(raw_manifest_chunks)
+            and len(transcript_filenames) == len(raw_transcript_chunks)
+            and "" not in expected_filenames
+            and expected_filenames == transcript_filenames
         )
-    except OSError:
+    except (LocalMeetScribeError, OSError, UnicodeError):
+        return False
+
+
+def _optimized_package_complete(package_dir: Path) -> bool:
+    try:
+        manifest = _read_json_object(package_dir / "manifest.json")
+        raw_chunks = manifest.get("chunks")
+        if not isinstance(raw_chunks, list) or not raw_chunks:
+            return False
+        for item in raw_chunks:
+            if not isinstance(item, dict):
+                return False
+            filename = str(item.get("filename") or "")
+            if not filename or Path(filename).name != filename:
+                return False
+            chunk_path = package_dir / filename
+            if not chunk_path.is_file() or chunk_path.stat().st_size <= 0:
+                return False
+        return True
+    except (LocalMeetScribeError, OSError):
         return False
 
 
@@ -1261,9 +2099,7 @@ def _request_system_awake() -> Callable[[], None]:
             return lambda: None
 
         def release() -> None:
-            ctypes.windll.kernel32.SetThreadExecutionState(
-                execution_state_continuous
-            )
+            ctypes.windll.kernel32.SetThreadExecutionState(execution_state_continuous)
 
         return release
     except (AttributeError, OSError):
@@ -1337,9 +2173,7 @@ def _resolve_staged_upload(staged_root: Path, upload_id: str) -> tuple[Path, Pat
         )
     source_files = [path for path in source_dir.iterdir() if path.is_file()]
     if len(source_files) != 1:
-        raise LocalMeetScribeError(
-            "The staged upload is incomplete. Select the recording again."
-        )
+        raise LocalMeetScribeError("The staged upload is incomplete. Select the recording again.")
     return upload_dir, source_files[0]
 
 
@@ -1347,12 +2181,29 @@ def _prune_staged_uploads(staged_root: Path) -> None:
     staged_root.mkdir(parents=True, exist_ok=True)
     root = staged_root.resolve()
     cutoff = time.time() - STAGED_UPLOAD_TTL_SEC
+    protected_uploads: set[str] = set()
+    workflow_dir = staged_root.parent / "workflows"
+    if workflow_dir.is_dir():
+        for state_path in workflow_dir.glob("*.json"):
+            try:
+                state = _read_json_object(state_path)
+                if (
+                    str(state.get("status") or "") in RECOVERABLE_WORKFLOW_STATUSES
+                    and state.get("input_kind") == "upload"
+                ):
+                    protected_uploads.add(str(state.get("input_id") or ""))
+            except LocalMeetScribeError:
+                continue
     for candidate in staged_root.iterdir():
         if not candidate.is_dir() or not re.fullmatch(r"[a-f0-9]{32}", candidate.name):
             continue
         try:
             resolved = candidate.resolve()
-            if resolved.parent != root or candidate.stat().st_mtime >= cutoff:
+            if (
+                resolved.parent != root
+                or candidate.name in protected_uploads
+                or candidate.stat().st_mtime >= cutoff
+            ):
                 continue
             shutil.rmtree(resolved, ignore_errors=True)
         except OSError:
