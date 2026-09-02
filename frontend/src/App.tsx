@@ -12,10 +12,12 @@ import {
   FilePenLine,
   KeyRound,
   Loader2,
+  Mic,
   MonitorSmartphone,
   Play,
   ShieldCheck,
   Smartphone,
+  Square,
   Upload
 } from "lucide-react";
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
@@ -53,6 +55,7 @@ type WorkflowStage =
   | "failed";
 
 type NamingMode = "original" | "recommended" | "custom";
+type RecordingState = "idle" | "starting" | "recording" | "stopping";
 
 const workflowSteps = ["분석", "최적화", "전사", "완료"];
 const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
@@ -106,10 +109,16 @@ export function App() {
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
+  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const recentInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef<number | null>(null);
   const workflowStartingRef = useRef(false);
   const analysisStartingRef = useRef(false);
   const autoStartSuppressedRef = useRef(false);
@@ -140,6 +149,14 @@ export function App() {
       selectionVersionRef.current += 1;
       stopProgressPolling();
       void wakeLockRef.current?.release();
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        recorder.onerror = null;
+        recorder.stop();
+      }
+      stopRecordingStream();
     },
     []
   );
@@ -175,6 +192,11 @@ export function App() {
     : serverKeyReady || geminiApiKey.trim().length > 0;
   const busy =
     stage === "analyzing" || stage === "optimizing" || stage === "transcribing";
+  const recordingActive = recordingState !== "idle";
+  const keepScreenAwake = stage === "analyzing" || recordingActive;
+  const recordingSupported = Boolean(
+    typeof MediaRecorder !== "undefined" && navigator.mediaDevices?.getUserMedia
+  );
   const canStart = Boolean(
     (stagedUploadId || optimizedPackage) &&
       recommendation &&
@@ -281,7 +303,7 @@ export function App() {
 
     async function acquireWakeLock() {
       if (
-        !busy ||
+        !keepScreenAwake ||
         !wakeLockApi ||
         document.visibilityState !== "visible" ||
         wakeLockRef.current
@@ -313,7 +335,7 @@ export function App() {
       }
     }
 
-    if (busy) {
+    if (keepScreenAwake) {
       void acquireWakeLock();
       document.addEventListener("visibilitychange", handleVisibilityChange);
     }
@@ -327,7 +349,20 @@ export function App() {
         void sentinel.release();
       }
     };
-  }, [busy]);
+  }, [keepScreenAwake]);
+
+  useEffect(() => {
+    if (recordingState !== "recording") return;
+    const updateElapsed = () => {
+      const startedAt = recordingStartedAtRef.current;
+      if (startedAt !== null) {
+        setRecordingElapsedSec(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+      }
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 500);
+    return () => window.clearInterval(timer);
+  }, [recordingState]);
 
   function stopProgressPolling() {
     pollingVersionRef.current += 1;
@@ -524,6 +559,87 @@ export function App() {
     setSourceName(selected.name);
     setSourceBytes(selected.size);
     setSaveBaseName(baseNameFromFile(selected.name));
+  }
+
+  async function startDirectRecording() {
+    if (!recordingSupported || recordingActive || busy) return;
+    setRecordingState("starting");
+    setRecordingElapsedSec(0);
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      recordingStreamRef.current = stream;
+      const mimeType = preferredRecordingMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 64000 })
+        : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      recordingChunksRef.current = [];
+      recordingStartedAtRef.current = Date.now();
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        setError("녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요.");
+        finishDirectRecording(null);
+      };
+      recorder.onstop = () => {
+        const chunks = recordingChunksRef.current;
+        const recordedType = recorder.mimeType || mimeType || chunks[0]?.type || "audio/webm";
+        const recording = chunks.length ? new Blob(chunks, { type: recordedType }) : null;
+        finishDirectRecording(recording);
+      };
+      recorder.start(1000);
+      setRecordingState("recording");
+    } catch (recordingError) {
+      stopRecordingStream();
+      setRecordingState("idle");
+      setError(recordingPermissionMessage(recordingError));
+    }
+  }
+
+  function stopDirectRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive" || recordingState === "stopping") return;
+    setRecordingState("stopping");
+    try {
+      recorder.requestData();
+    } catch {
+      // Some mobile browsers flush automatically when stop() is called.
+    }
+    recorder.stop();
+  }
+
+  function finishDirectRecording(recording: Blob | null) {
+    mediaRecorderRef.current = null;
+    recordingStartedAtRef.current = null;
+    recordingChunksRef.current = [];
+    stopRecordingStream();
+    setRecordingState("idle");
+    if (!recording || recording.size === 0) {
+      setError("녹음된 음성이 없습니다. 다시 녹음해 주세요.");
+      return;
+    }
+    const extension = recordingExtension(recording.type);
+    const recordedFile = new File(
+      [recording],
+      `PhoneScribe_${recordingTimestampForName(new Date())}.${extension}`,
+      { type: recording.type, lastModified: Date.now() }
+    );
+    void selectFile(recordedFile);
+  }
+
+  function stopRecordingStream() {
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
   }
 
   async function analyzeSelectedFile(selected: File) {
@@ -810,7 +926,7 @@ export function App() {
           <div>
             <p className="eyebrow">KOREAN + ENGLISH / PHONE RECORDINGS</p>
             <h1>Phone Scribe</h1>
-            <p className="tagline">휴대폰 녹음을 올리면 바로 전사문을 만듭니다.</p>
+            <p className="tagline">바로 녹음하거나 파일을 올리면 전사문을 만듭니다.</p>
           </div>
         </header>
 
@@ -872,16 +988,55 @@ export function App() {
         )}
 
         <section className="flow-section">
-          <SectionTitle index="01" title="녹음 파일" note="M4A · MP3 · WAV · AAC" />
-          {!hasSource && recentRecordingCandidates.length === 0 ? (
+          <SectionTitle index="01" title="녹음" note="바로 녹음 · 파일 선택" />
+          {recordingActive ? (
+            <div className="recording-panel" aria-live="polite">
+              <span className="recording-indicator" aria-hidden="true" />
+              <div>
+                <strong>
+                  {recordingState === "starting"
+                    ? "마이크 연결 중"
+                    : recordingState === "stopping"
+                      ? "녹음 파일 만드는 중"
+                      : "녹음 중"}
+                </strong>
+                <span>{formatClock(recordingElapsedSec)}</span>
+                <small>
+                  화면 자동 잠금을 막고 있습니다. 녹음을 마치면 업로드·전사가 자동으로 이어집니다.
+                </small>
+              </div>
+              <button
+                className="record-stop-button"
+                type="button"
+                disabled={recordingState !== "recording"}
+                onClick={stopDirectRecording}
+              >
+                {recordingState === "stopping" ? (
+                  <Loader2 className="spin" size={18} />
+                ) : (
+                  <Square size={17} fill="currentColor" />
+                )}
+                녹음 종료 후 자동 전사
+              </button>
+            </div>
+          ) : !hasSource && recentRecordingCandidates.length === 0 ? (
             <div
               className="drop-zone"
               onDragOver={(event) => event.preventDefault()}
               onDrop={handleDrop}
             >
               <Upload size={25} />
-              <strong>휴대폰 녹음 파일을 선택하세요</strong>
-              <span>파일은 먼저 이 컴퓨터에서 분석됩니다.</span>
+              <strong>지금 바로 녹음하거나 파일을 선택하세요</strong>
+              <span>녹음 종료 후 업로드·전사·TXT 저장까지 자동 진행됩니다.</span>
+              <button
+                className="direct-record-button"
+                type="button"
+                disabled={!recordingSupported}
+                onClick={() => void startDirectRecording()}
+              >
+                <Mic size={18} />
+                {recordingSupported ? "바로 녹음 시작" : "이 브라우저는 직접 녹음 미지원"}
+              </button>
               <div className="file-choice-actions">
                 <button
                   className="secondary-button"
@@ -981,7 +1136,7 @@ export function App() {
             ref={fileInputRef}
             className="visually-hidden"
             type="file"
-            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,audio/*"
+            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,.webm,audio/*"
             onChange={handleFileChange}
             aria-hidden="true"
             tabIndex={-1}
@@ -990,7 +1145,7 @@ export function App() {
             ref={recentInputRef}
             className="visually-hidden"
             type="file"
-            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,audio/*"
+            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,.webm,audio/*"
             multiple
             onChange={handleRecentFilesChange}
             aria-hidden="true"
@@ -1024,6 +1179,11 @@ export function App() {
               16 kHz mono MP3 · 약 30분 단위 · 발화 사이의 자연스러운 구간에서 분할
             </p>
           )}
+          <p className="recording-limit-note">
+            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료·업로드 후에는
+            화면을 꺼도 PC 서버가 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의
+            녹음을 보장하려면 Android 전용 앱이 필요합니다.
+          </p>
         </section>
 
         <section className="flow-section">
@@ -1686,6 +1846,51 @@ function formatClock(seconds: number): string {
   return hours > 0
     ? `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
     : `${minutes}:${String(secs).padStart(2, "0")}`;
+}
+
+function preferredRecordingMimeType(): string {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/mp4",
+    "audio/webm",
+    "audio/ogg;codecs=opus"
+  ];
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) || "";
+}
+
+function recordingExtension(mimeType: string): "m4a" | "ogg" | "webm" {
+  if (/mp4|m4a/i.test(mimeType)) return "m4a";
+  if (/ogg/i.test(mimeType)) return "ogg";
+  return "webm";
+}
+
+function recordingTimestampForName(date: Date): string {
+  const parts = [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ];
+  const time = [
+    String(date.getHours()).padStart(2, "0"),
+    String(date.getMinutes()).padStart(2, "0"),
+    String(date.getSeconds()).padStart(2, "0")
+  ];
+  return `${parts.join("")}_${time.join("")}`;
+}
+
+function recordingPermissionMessage(error: unknown): string {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+      return "마이크 권한이 필요합니다. 주소창의 권한 설정에서 마이크를 허용해 주세요.";
+    }
+    if (error.name === "NotFoundError") {
+      return "사용할 수 있는 마이크를 찾지 못했습니다.";
+    }
+    if (error.name === "NotReadableError") {
+      return "다른 앱이 마이크를 사용 중입니다. 다른 녹음 앱을 닫고 다시 시도하세요.";
+    }
+  }
+  return "녹음을 시작하지 못했습니다. 마이크 권한과 브라우저 상태를 확인하세요.";
 }
 
 function formatBytes(bytes: number): string {

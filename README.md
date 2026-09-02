@@ -125,10 +125,24 @@ the top-ranked recording automatically. Shared mode skips the optional local lan
 phone only needs to stay awake for the initial file transfer. As soon as the progress moves to optimization, the PC owns
 the workflow. The phone screen may turn off or the browser may close; reopening the same workflow
 URL restores progress and results.
+
+The phone page also offers `Start recording now`. It records from the browser microphone, chooses
+a supported Opus WebM or MP4 audio container, and turns the result into the same staged upload when
+the user presses `Stop recording and auto-transcribe`. If shared access is already confirmed, the
+upload and background workflow start automatically. Otherwise the recording stays in the current
+tab until the passcode is confirmed. The page requests a Screen Wake Lock only while recording or
+performing the initial upload/analysis.
+
+Mobile browsers cannot guarantee microphone capture after the user locks the phone or the operating
+system suspends the browser. The Wake Lock prevents automatic screen locking where supported, but a
+native Android app with a microphone foreground service is required for guaranteed recording with
+the screen off. After recording stops and the upload is accepted, processing no longer depends on
+the phone screen.
+
 When the page is visible after completion, the TXT transcript downloads automatically once. The
 network startup script also saves a collision-safe TXT copy to the server PC's
 `Downloads\PhoneScribe` folder, independently of the phone screen state. The
-page requests a Screen Wake Lock while busy when the browser exposes that API. Standard Wake Lock
+page requests a Screen Wake Lock when the browser exposes that API. Standard Wake Lock
 requires HTTPS, so it works with a Tailscale Serve URL but may be unavailable on a plain Wi-Fi
 `http://` address.
 While a background workflow is active on Windows, the server also requests that the PC stay awake;

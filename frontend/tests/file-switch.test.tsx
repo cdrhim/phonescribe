@@ -33,6 +33,7 @@ const runtime: RuntimeProfile = {
   gemini_model: "mock", gemini_share_enabled: true, gemini_share_ready: true,
   local_admin: false
 };
+let restoreRecordingBrowser: (() => void) | null = null;
 
 function analysis(filename: string, upload_id = "test-upload"): OptimizerAnalysisResponse {
   return {
@@ -77,6 +78,58 @@ function chooseFile(name = NEW_NAME) {
   fireEvent.change(fileInput(), { target: { files: [new File(["test"], name, { type: "audio/wav" })] } });
 }
 
+function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
+  const recorderDescriptor = Object.getOwnPropertyDescriptor(globalThis, "MediaRecorder");
+  const mediaDevicesDescriptor = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+
+  class MockMediaRecorder {
+    static isTypeSupported(type: string) {
+      return type === "audio/webm;codecs=opus";
+    }
+
+    state: RecordingState = "inactive";
+    mimeType = "audio/webm;codecs=opus";
+    ondataavailable: ((event: BlobEvent) => void) | null = null;
+    onstop: ((event: Event) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+
+    start() {
+      this.state = "recording";
+    }
+
+    requestData() {}
+
+    stop() {
+      this.state = "inactive";
+      this.ondataavailable?.({
+        data: new Blob(["recorded audio"], { type: this.mimeType })
+      } as BlobEvent);
+      this.onstop?.(new Event("stop"));
+    }
+  }
+
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: MockMediaRecorder
+  });
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: vi.fn(getUserMedia) }
+  });
+  restoreRecordingBrowser = () => {
+    if (recorderDescriptor) {
+      Object.defineProperty(globalThis, "MediaRecorder", recorderDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "MediaRecorder");
+    }
+    if (mediaDevicesDescriptor) {
+      Object.defineProperty(navigator, "mediaDevices", mediaDevicesDescriptor);
+    } else {
+      Reflect.deleteProperty(navigator, "mediaDevices");
+    }
+  };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
@@ -93,7 +146,45 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  restoreRecordingBrowser?.();
+  restoreRecordingBrowser = null;
   vi.restoreAllMocks();
+});
+
+describe("direct phone recording", () => {
+  it("turns the captured audio into a file and starts the existing automatic upload", async () => {
+    const stopTrack = vi.fn();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: stopTrack }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.analyzeOptimizer).mockResolvedValue(analysis("recorded.webm"));
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    await screen.findByText("녹음 중");
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+
+    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
+    const recordedFile = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
+    expect(recordedFile?.name).toMatch(/^PhoneScribe_\d{8}_\d{6}\.webm$/);
+    expect(recordedFile?.type).toBe("audio/webm;codecs=opus");
+    expect(recordedFile?.size).toBeGreaterThan(0);
+    expect(stopTrack).toHaveBeenCalledOnce();
+  });
+
+  it("shows a useful message when microphone permission is denied", async () => {
+    installRecordingBrowser(async () => {
+      throw new DOMException("denied", "NotAllowedError");
+    });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+
+    expect(
+      await screen.findByText("마이크 권한이 필요합니다. 주소창의 권한 설정에서 마이크를 허용해 주세요.")
+    ).toBeTruthy();
+  });
 });
 
 describe("switching recordings while a restored workflow is stuck", () => {
