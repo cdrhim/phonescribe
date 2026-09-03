@@ -44,7 +44,7 @@ final class PhoneScribeApi {
     static WorkResult uploadAndTranscribe(
             Session session, File recording, ProgressListener progress) throws IOException {
         if (!recording.isFile() || recording.length() <= 0L) {
-            throw new IOException("전송할 녹음 파일이 없습니다.");
+            throw new IOException("처리할 녹음 파일이 없습니다.");
         }
 
         JSONObject descriptorRequest = new JSONObject();
@@ -53,7 +53,7 @@ final class PhoneScribeApi {
             descriptorRequest.put("content_type", "audio/mp4");
             descriptorRequest.put("size_bytes", recording.length());
         } catch (JSONException impossible) {
-            throw new IOException("업로드 정보를 만들 수 없습니다.", impossible);
+            throw new IOException("녹음 처리 정보를 만들 수 없습니다.", impossible);
         }
 
         HttpResult descriptorResponse = session.authorizedRequest(
@@ -161,7 +161,7 @@ final class PhoneScribeApi {
             try {
                 URL target = new URL(part.uploadUrl);
                 if (!"https".equalsIgnoreCase(target.getProtocol())) {
-                    throw new IOException("안전하지 않은 업로드 주소가 거절되었습니다.");
+                    throw new IOException("안전하지 않은 처리 주소가 거절되었습니다.");
                 }
                 connection = (HttpURLConnection) target.openConnection();
                 connection.setRequestMethod("PUT");
@@ -185,7 +185,7 @@ final class PhoneScribeApi {
                     long remaining = part.sizeBytes;
                     while (remaining > 0L) {
                         int read = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                        if (read < 0) throw new IOException("녹음 파일이 업로드 중 변경되었습니다.");
+                        if (read < 0) throw new IOException("녹음 파일이 처리 중 변경되었습니다.");
                         output.write(buffer, 0, read);
                         remaining -= read;
                     }
@@ -207,7 +207,7 @@ final class PhoneScribeApi {
                 if (connection != null) connection.disconnect();
             }
         }
-        throw lastFailure == null ? new IOException("녹음 업로드에 실패했습니다.") : lastFailure;
+        throw lastFailure == null ? new IOException("녹음 처리에 실패했습니다.") : lastFailure;
     }
 
     private static void writeFormField(
@@ -417,7 +417,7 @@ final class PhoneScribeApi {
             String contentType = json.optString("content_type", "");
             JSONArray jsonParts = json.optJSONArray("parts");
             if (recordingId.isEmpty() || contentType.isEmpty() || jsonParts == null) {
-                throw new IOException("클라우드 업로드 정보가 올바르지 않습니다.");
+                throw new IOException("녹음 처리 정보가 올바르지 않습니다.");
             }
             List<UploadPart> parts = new ArrayList<>();
             try {
@@ -425,7 +425,7 @@ final class PhoneScribeApi {
                     JSONObject part = jsonParts.getJSONObject(index);
                     JSONObject upload = part.getJSONObject("upload");
                     if (!"signed-put".equals(upload.optString("protocol"))) {
-                        throw new IOException("지원하지 않는 클라우드 업로드 방식입니다.");
+                        throw new IOException("지원하지 않는 녹음 처리 방식입니다.");
                     }
                     JSONObject jsonHeaders = upload.optJSONObject("headers");
                     java.util.Map<String, String> headers = new java.util.LinkedHashMap<>();
@@ -446,14 +446,14 @@ final class PhoneScribeApi {
                             headers));
                 }
             } catch (JSONException error) {
-                throw new IOException("클라우드 업로드 조각 정보가 올바르지 않습니다.", error);
+                throw new IOException("녹음 분할 정보가 올바르지 않습니다.", error);
             }
             parts.sort(Comparator.comparingInt(part -> part.partNumber));
             return new UploadPlan(recordingId, contentType, parts);
         }
 
         void validate(long fileSize) throws IOException {
-            if (parts.isEmpty()) throw new IOException("클라우드 업로드 조각이 없습니다.");
+            if (parts.isEmpty()) throw new IOException("녹음 분할 정보가 없습니다.");
             long expectedStart = 0L;
             for (int index = 0; index < parts.size(); index++) {
                 UploadPart part = parts.get(index);
@@ -463,20 +463,20 @@ final class PhoneScribeApi {
                         || part.sizeBytes != part.byteEnd - part.byteStart
                         || part.sizeBytes > MAX_PART_SIZE
                         || part.objectPath.isEmpty()) {
-                    throw new IOException("클라우드 업로드 범위가 올바르지 않습니다.");
+                    throw new IOException("녹음 처리 범위가 올바르지 않습니다.");
                 }
                 try {
                     URL url = new URL(part.uploadUrl);
                     if (!"https".equalsIgnoreCase(url.getProtocol()) || url.getHost().isEmpty()) {
-                        throw new IOException("안전하지 않은 클라우드 업로드 주소입니다.");
+                        throw new IOException("안전하지 않은 녹음 처리 주소입니다.");
                     }
                 } catch (RuntimeException error) {
-                    throw new IOException("클라우드 업로드 주소가 올바르지 않습니다.", error);
+                    throw new IOException("녹음 처리 주소가 올바르지 않습니다.", error);
                 }
                 expectedStart = part.byteEnd;
             }
             if (expectedStart != fileSize) {
-                throw new IOException("클라우드 업로드 크기가 녹음 파일과 일치하지 않습니다.");
+                throw new IOException("녹음 처리 크기가 원본과 일치하지 않습니다.");
             }
         }
     }

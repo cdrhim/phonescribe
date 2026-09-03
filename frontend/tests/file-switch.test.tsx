@@ -171,7 +171,7 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
 async function recordNow() {
   fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
   await screen.findByText("녹음 중");
-  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
 }
 
 async function recordNowWithFakeTimers() {
@@ -180,7 +180,7 @@ async function recordNowWithFakeTimers() {
     await Promise.resolve();
   });
   expect(screen.getByText("녹음 중")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
@@ -267,11 +267,16 @@ describe("direct phone recording", () => {
 
     expect(screen.getByRole("button", { name: "바로 녹음 시작" })).toBeTruthy();
     expect(document.querySelector('input[type="file"]')).toBeNull();
+    expect(document.querySelector('input[type="checkbox"]')).toBeNull();
     expect(screen.queryByText("파일 1개 선택")).toBeNull();
     expect(screen.queryByText("최근 녹음 추천")).toBeNull();
+    expect(
+      screen.queryByText("최적화된 오디오를 Google Gemini로 전송합니다.")
+    ).toBeNull();
+    expect(document.body.textContent).not.toContain("자동 업로드");
   });
 
-  it("turns the captured audio into a file and starts the existing automatic upload", async () => {
+  it("turns the captured audio into a file and starts transcription preparation", async () => {
     const stopTrack = vi.fn();
     installRecordingBrowser(async () => ({
       getTracks: () => [{ stop: stopTrack }]
@@ -282,7 +287,7 @@ describe("direct phone recording", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
     await screen.findByText("녹음 중");
-    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
 
     await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
     const recordedFile = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
@@ -425,7 +430,7 @@ describe("recording transfer retry", () => {
     vi.mocked(api.createCloudUploadDescriptor)
       .mockRejectedValueOnce(
         new Error(
-          "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요."
+          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다."
         )
       )
       .mockResolvedValueOnce(cloudUploadDescriptor());
@@ -444,8 +449,8 @@ describe("recording transfer retry", () => {
     await recordNowWithFakeTimers();
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.createCloudUploadDescriptor).mock.calls[0][0];
-    expect(screen.getByText(/1초 후 같은 녹음을 자동으로 다시 전송/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "같은 녹음 다시 전송" })).toBeTruthy();
+    expect(screen.getByText(/1초 후 같은 녹음으로 다시 시도/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeTruthy();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -458,7 +463,7 @@ describe("recording transfer retry", () => {
     );
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
     expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
   });
 
   it("lets the user retry the same in-memory recording immediately", async () => {
@@ -475,7 +480,7 @@ describe("recording transfer retry", () => {
     expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
     const retryButton = await screen.findByRole("button", {
-      name: "같은 녹음 다시 전송"
+      name: "같은 녹음으로 다시 시도"
     });
 
     fireEvent.click(retryButton);
@@ -484,7 +489,7 @@ describe("recording transfer retry", () => {
     expect(vi.mocked(api.analyzeOptimizer).mock.calls[1][0].file).toBe(
       originalRecording
     );
-    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
   });
 
   it("cancels an automatic retry when a new recording resets the selection", async () => {
@@ -548,8 +553,8 @@ describe("recording transfer retry", () => {
 
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
-    expect(screen.getByText(/같은 업로드 조각을 자동 재시도했지만/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
+    expect(screen.getByText(/현재 녹음 조각의 연결을 여러 번 확인했지만/)).toBeTruthy();
   });
 
   it("does not automatically re-post workflow handoff after remote acceptance", async () => {
@@ -582,8 +587,8 @@ describe("recording transfer retry", () => {
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
     expect(api.uploadCloudRecording).toHaveBeenCalledOnce();
     expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
-    expect(screen.getByText(/녹음 업로드 완료 · 전사 작업을 다시 접수/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
+    expect(screen.getByText(/녹음 준비 완료 · 전사 작업을 다시 시작/)).toBeTruthy();
   });
 });
 
@@ -674,7 +679,7 @@ describe("Supabase signed upload", () => {
     expect(vi.mocked(api.startTranscriptionWorkflow).mock.calls[0][1]).toMatchObject({
       uploadId: "test-upload",
     });
-    expect(screen.getByText(/PC 직접 업로드 완료 · 서버에 전사 작업을 접수/)).toBeTruthy();
+    expect(screen.getByText(/PC 연결 완료 · 서버에 전사 작업을 접수/)).toBeTruthy();
     expect(screen.queryByText(/이제 화면을 꺼도 전사와 저장이 계속/)).toBeNull();
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBeNull();
 

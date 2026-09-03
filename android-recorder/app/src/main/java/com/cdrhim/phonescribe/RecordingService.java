@@ -68,7 +68,7 @@ public final class RecordingService extends Service {
                     retry ? ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                             : ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
                     buildForegroundNotification(
-                            retry ? "최근 녹음을 다시 전송하고 있습니다." : "비밀번호를 확인하고 있습니다.",
+                            retry ? "최근 녹음으로 다시 시도하고 있습니다." : "비밀번호를 확인하고 있습니다.",
                             false,
                             retry ? PROCESSING_CHANNEL_ID : RECORDING_CHANNEL_ID));
             acquireCpuWakeLock();
@@ -103,7 +103,7 @@ public final class RecordingService extends Service {
             RecordingStateStore.update(
                     this,
                     RecordingStateStore.FAILED,
-                    "Android가 녹음 서비스를 종료했습니다. 남아 있는 녹음은 다시 전송할 수 있습니다.",
+                    "Android가 녹음 서비스를 종료했습니다. 남아 있는 녹음으로 다시 시도할 수 있습니다.",
                     0L,
                     pendingFile == null ? "" : pendingFile.getName());
         }
@@ -189,10 +189,10 @@ public final class RecordingService extends Service {
             enterForeground(
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
                     buildForegroundNotification(
-                            "녹음을 Supabase로 전송하고 있습니다.", false, PROCESSING_CHANNEL_ID));
+                            "녹음을 처리하고 있습니다.", false, PROCESSING_CHANNEL_ID));
             processPendingRecording(pendingFile);
         } catch (Exception error) {
-            failAndStop(userMessage(error, "녹음 저장 또는 전송에 실패했습니다."));
+            failAndStop(userMessage(error, "녹음 저장 또는 처리에 실패했습니다."));
         }
     }
 
@@ -200,7 +200,7 @@ public final class RecordingService extends Service {
         try {
             File latest = RecordingStorage.latestPending(this);
             if (latest == null || latest.length() <= 0L) {
-                throw new IOException("다시 전송할 녹음 파일이 없습니다.");
+                throw new IOException("다시 시도할 녹음 파일이 없습니다.");
             }
             pendingFile = latest;
             updateState(
@@ -212,14 +212,14 @@ public final class RecordingService extends Service {
             RecordingStorage.publishRecording(this, pendingFile);
             processPendingRecording(pendingFile);
         } catch (Exception error) {
-            failAndStop(userMessage(error, "최근 녹음을 다시 전송하지 못했습니다."));
+            failAndStop(userMessage(error, "최근 녹음으로 다시 시도하지 못했습니다."));
         }
     }
 
     private void processPendingRecording(File source) throws IOException {
         updateState(
                 RecordingStateStore.UPLOADING,
-                "Supabase 업로드를 시작합니다.",
+                "녹음 처리를 시작합니다.",
                 0L,
                 source.getName());
         PhoneScribeApi.WorkResult result = PhoneScribeApi.uploadAndTranscribe(
@@ -229,11 +229,11 @@ public final class RecordingService extends Service {
                     if ("uploading".equals(stage)) {
                         updateState(
                                 RecordingStateStore.UPLOADING,
-                                "Supabase 업로드 중 · " + percent + "%",
+                                "녹음 처리 중 · " + percent + "%",
                                 0L,
                                 source.getName());
                         notifyForeground(
-                                "녹음 업로드 중 · " + percent + "%",
+                                "녹음 처리 중 · " + percent + "%",
                                 false,
                                 PROCESSING_CHANNEL_ID,
                                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
@@ -273,7 +273,7 @@ public final class RecordingService extends Service {
     private void failAndStop(String message) {
         updateState(
                 RecordingStateStore.FAILED,
-                message + " 앱에서 최근 녹음 다시 전송을 누를 수 있습니다.",
+                message + " 앱에서 최근 녹음으로 다시 시도를 누를 수 있습니다.",
                 0L,
                 pendingFile == null ? null : pendingFile.getName());
         finishForegroundWithResult("PhoneScribe 확인 필요", message);
@@ -301,7 +301,7 @@ public final class RecordingService extends Service {
                 PROCESSING_CHANNEL_ID,
                 getString(R.string.processing_channel),
                 NotificationManager.IMPORTANCE_DEFAULT);
-        processing.setDescription("녹음 업로드와 전사 완료 상태");
+        processing.setDescription("녹음 처리와 전사 완료 상태");
         manager.createNotificationChannel(processing);
     }
 
@@ -330,7 +330,7 @@ public final class RecordingService extends Service {
                     stopIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
             builder.addAction(new Notification.Action.Builder(
-                    R.drawable.ic_mic, "녹음 정지 · 자동 전사", stop).build());
+                    R.drawable.ic_mic, "녹음 정지 · 전사 시작", stop).build());
         }
         return builder.build();
     }

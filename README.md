@@ -85,14 +85,12 @@ LocalMeetScribe labels everything as `SPEAKER_00`.
 
 ## Optional Gemini Transcription
 
-The optimizer can turn phone `.m4a` recordings into Gemini-ready audio packages locally. A
-separate `Transcribe with Gemini` button can send that optimized package to Gemini after explicit
-consent.
+The optimizer can turn phone recordings into Gemini-ready audio packages locally. Starting a
+transcription processes that optimized package with Gemini.
 
 For local use, create a free key at <https://aistudio.google.com/apikey>, paste it into the page,
-accept the Google upload notice, upload the recording, and select `Optimize + transcribe`. The key
-remains only in the current browser tab and is sent to this local backend for that transcription
-request.
+record audio, and select `Stop recording and start transcription`. The key remains only in the
+current browser tab and is sent to this local backend for that transcription request.
 
 For a shared deployment, configure the key on the server instead:
 
@@ -118,20 +116,17 @@ model to the stable audio-capable `gemini-3.5-flash` and `gemini-3.5-flash-lite`
 audio and completed chunks remain on disk, so a retry does not require another upload or repeat
 successful chunks.
 
-With the shared passcode flow, choose a recording and enter the passcode. The file is uploaded only
-after the explicit `Confirm and auto-transcribe` action, then optimization and transcription start
-automatically without another button press. If the recent-recording list is open, confirmation picks
-the top-ranked recording automatically. Shared mode skips the optional local language scan so the
-phone only needs to stay awake for the initial file transfer. As soon as the progress moves to optimization, the PC owns
-the workflow. The phone screen may turn off or the browser may close; reopening the same workflow
-URL restores progress and results.
+With the shared passcode flow, enter the passcode, start recording, and press
+`Stop recording and start transcription`. Shared mode skips the optional local language scan so the
+phone only needs to stay awake until the server accepts the job. As soon as progress moves to
+optimization, the PC owns the workflow. The phone screen may turn off or the browser may close;
+reopening the same workflow URL restores progress and results.
 
-The phone page also offers `Start recording now`. It records from the browser microphone, chooses
-a supported Opus WebM or MP4 audio container, and turns the result into the same staged upload when
-the user presses `Stop recording and auto-transcribe`. If shared access is already confirmed, the
-upload and background workflow start automatically. Otherwise the recording stays in the current
-tab until the passcode is confirmed. The page requests a Screen Wake Lock only while recording or
-performing the initial upload/analysis.
+The phone page offers `Start recording now`. It records from the browser microphone, chooses a
+supported Opus WebM or MP4 audio container, and begins transcription preparation when the user
+presses `Stop recording and start transcription`. If shared access has not been confirmed, the
+recording stays in the current tab until the passcode is confirmed. The page requests a Screen Wake
+Lock while recording and until the server accepts the job.
 
 Mobile browsers cannot guarantee microphone capture after the user locks the phone or the operating
 system suspends the browser. The Wake Lock prevents automatic screen locking where supported. For
@@ -143,7 +138,7 @@ depends on the phone screen.
 
 The Android app uses a microphone foreground service and a partial CPU wake lock. Start recording
 while the activity is visible, then the display may be locked immediately. A persistent Android
-notification shows that the microphone is active and provides `Stop recording and auto-transcribe`.
+notification shows that the microphone is active and provides `Stop recording and start transcription`.
 Stopping performs the same protected workflow as the website:
 
 1. Save an AAC/M4A copy to `Recordings/PhoneScribe`.
@@ -296,8 +291,8 @@ local-meetscribe eval --pred transcript.json --ref reference.json
 
 - No telemetry.
 - No cloud transcription APIs in the default pipeline.
-- Gemini sends audio to Google only after a key, explicit consent, and the transcription button
-  are used. A server-configured key remains optional.
+- Gemini transcription begins only after the user explicitly starts transcription. A
+  server-configured key remains optional.
 - No transcript content in logs.
 - Models download only through `local-meetscribe models download` unless
   `LOCAL_MEETSCRIBE_ALLOW_MODEL_AUTODOWNLOAD=true`.

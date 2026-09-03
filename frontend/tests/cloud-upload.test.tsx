@@ -57,7 +57,7 @@ describe("cloud signed PUT uploader", () => {
     expect(
       isApiTransientError(
         new Error(
-          "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요."
+          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다."
         )
       )
     ).toBe(true);
@@ -202,7 +202,7 @@ describe("cloud signed PUT uploader", () => {
     const file = new File(["123456789012345"], "meeting.webm");
 
     await expect(uploadCloudRecording(file, broken)).rejects.toThrow(
-      "클라우드 업로드 조각 정보가 올바르지 않습니다."
+      "녹음 분할 정보를 확인하지 못했습니다."
     );
     expect(fetch).not.toHaveBeenCalled();
   });

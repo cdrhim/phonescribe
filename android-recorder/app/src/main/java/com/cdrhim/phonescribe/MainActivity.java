@@ -15,7 +15,6 @@ import android.os.Looper;
 import android.text.InputType;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -33,7 +32,6 @@ public final class MainActivity extends Activity {
 
     private EditText serverUrl;
     private EditText passcode;
-    private CheckBox consent;
     private TextView status;
     private TextView elapsed;
     private Button startButton;
@@ -62,7 +60,6 @@ public final class MainActivity extends Activity {
 
         serverUrl = findViewById(R.id.serverUrl);
         passcode = findViewById(R.id.passcode);
-        consent = findViewById(R.id.consent);
         status = findViewById(R.id.status);
         elapsed = findViewById(R.id.elapsed);
         startButton = findViewById(R.id.startButton);
@@ -154,10 +151,6 @@ public final class MainActivity extends Activity {
             }
             if (secret.isEmpty()) {
                 showMessage("공유 비밀번호를 입력하세요.");
-                return;
-            }
-            if (!consent.isChecked()) {
-                showMessage("Google Gemini 전송 동의를 확인하세요.");
                 return;
             }
             getSharedPreferences(PREFS, MODE_PRIVATE)

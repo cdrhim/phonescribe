@@ -109,7 +109,6 @@ export function App() {
   const [accessNeedsReconnect, setAccessNeedsReconnect] = useState(false);
   const [showKeySetup, setShowKeySetup] = useState(false);
   const [savingShareKey, setSavingShareKey] = useState(false);
-  const [cloudConsent, setCloudConsent] = useState(true);
   const [stage, setStage] = useState<WorkflowStage>("idle");
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -223,7 +222,6 @@ export function App() {
     (stagedUploadId || cloudRecordingId || optimizedPackage) &&
       (recommendation || cloudRecordingId) &&
       keyReady &&
-      cloudConsent &&
       !busy
   );
   const displaySourceName =
@@ -242,13 +240,12 @@ export function App() {
       stage !== "idle" ||
       analysisStartingRef.current ||
       (shareMode && !shareAccessReady) ||
-      (Boolean(runtime?.cloud_upload_enabled) && (!keyReady || !cloudConsent))
+      (Boolean(runtime?.cloud_upload_enabled) && !keyReady)
     ) {
       return;
     }
     void analyzeSelectedFile(file);
   }, [
-    cloudConsent,
     file,
     keyReady,
     recommendation,
@@ -560,7 +557,7 @@ export function App() {
       setGeminiApiKey("");
       setShowKeySetup(false);
       setShareAccessReady(true);
-      setShareStatus("기본 키 저장 완료 · 바로 녹음하면 TXT 저장까지 자동 진행합니다.");
+      setShareStatus("기본 키 저장 완료 · 녹음을 종료하고 전사를 시작하면 TXT 저장까지 이어집니다.");
     } catch (saveError) {
       setShareAccessReady(false);
       setError(
@@ -608,9 +605,9 @@ export function App() {
         return;
       }
       if (file) {
-        setShareStatus("확인 완료 · 전사부터 PC TXT 저장까지 자동 진행합니다.");
+        setShareStatus("확인 완료 · 전사 준비가 되었습니다.");
       } else {
-        setShareStatus("확인 완료 · 바로 녹음을 시작하면 끝까지 자동 진행합니다.");
+        setShareStatus("확인 완료 · 바로 녹음을 시작하세요.");
       }
     } catch (verificationError) {
       setShareAccessReady(false);
@@ -741,7 +738,7 @@ export function App() {
     if (retryIndex >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length) {
       setRecordingRetryScheduled(false);
       setRecordingRetryNotice(
-        "자동 재시도를 마쳤습니다. 녹음은 이 기기에 그대로 있습니다. 같은 녹음 다시 전송을 눌러 주세요."
+        "연결 재시도를 마쳤습니다. 녹음은 이 기기에 그대로 있습니다. 같은 녹음으로 다시 시도를 눌러 주세요."
       );
       return;
     }
@@ -752,7 +749,7 @@ export function App() {
     setRecordingRetryNotice(
       `연결이 잠시 끊겼습니다. 녹음은 이 기기에 그대로 있습니다. ${Math.ceil(
         delayMs / 1000
-      )}초 후 같은 녹음을 자동으로 다시 전송합니다. (${retryIndex + 1}/${
+      )}초 후 같은 녹음으로 다시 시도합니다. (${retryIndex + 1}/${
         RECORDING_UPLOAD_RETRY_DELAYS_MS.length
       })`
     );
@@ -760,7 +757,7 @@ export function App() {
       recordingRetryTimerRef.current = null;
       if (selectionVersion !== selectionVersionRef.current) return;
       setRecordingRetryScheduled(false);
-      setRecordingRetryNotice("같은 녹음을 다시 전송하고 있습니다.");
+      setRecordingRetryNotice("같은 녹음으로 다시 시도하고 있습니다.");
       void analyzeSelectedFile(selected, true);
     }, delayMs);
   }
@@ -770,7 +767,7 @@ export function App() {
     clearRecordingRetryTimer();
     recordingRetryAttemptRef.current = 0;
     setRecordingRetryScheduled(false);
-    setRecordingRetryNotice("같은 녹음을 지금 다시 전송하고 있습니다.");
+    setRecordingRetryNotice("같은 녹음으로 지금 다시 시도하고 있습니다.");
     void analyzeSelectedFile(file, true);
   }
 
@@ -784,7 +781,7 @@ export function App() {
     if (retrying) {
       clearRecordingRetryTimer();
       setRecordingRetryScheduled(false);
-      setRecordingRetryNotice("같은 녹음을 다시 전송하고 있습니다.");
+      setRecordingRetryNotice("같은 녹음으로 다시 시도하고 있습니다.");
     } else {
       clearRecordingRetryState();
     }
@@ -813,7 +810,7 @@ export function App() {
               setCloudUploadNotice(
                 `연결을 다시 확인하고 있습니다. ${Math.ceil(
                   delayMs / 1000
-                )}초 후 ${partNumber + 1}번 조각을 자동 재전송합니다. (${attempt}번째 전송)`
+                )}초 후 ${partNumber + 1}번 녹음 조각 연결을 다시 시도합니다. (${attempt}번째 시도)`
               );
             }
           );
@@ -823,7 +820,7 @@ export function App() {
           setCloudRecordingId(completed.recording_id);
           setCloudUploadProgress(1);
           setCloudUploadNotice(
-            "업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
+            "녹음 준비 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
           );
           savePersistedWorkflow({
             version: 1,
@@ -875,7 +872,7 @@ export function App() {
             }
             setStage("failed");
             setCloudUploadNotice(
-              "녹음 업로드 완료 · 전사 작업을 다시 접수할 수 있습니다."
+              "녹음 준비 완료 · 전사 작업을 다시 시작할 수 있습니다."
             );
             setError(
               workflowError instanceof Error
@@ -909,19 +906,19 @@ export function App() {
               setSameRecordingRetryAvailable(false);
               setRecordingRetryScheduled(false);
               setRecordingRetryNotice(
-                "같은 업로드 조각을 자동 재시도했지만 연결을 복구하지 못했습니다. 새 녹음 전까지 원본은 이 기기에 남아 있습니다."
+                "현재 녹음 조각의 연결을 여러 번 확인했지만 완료하지 못했습니다. 새 녹음 전까지 원본은 이 기기에 남아 있습니다."
               );
               setError(
                 cloudUploadError instanceof Error
                   ? cloudUploadError.message
-                  : "클라우드 업로드 연결을 복구하지 못했습니다."
+                  : "녹음 처리 연결을 복구하지 못했습니다."
               );
             }
             return;
           }
           setCloudUploadProgress(null);
           setCloudUploadNotice(
-            "클라우드 업로드를 사용할 수 없어 PC 직접 업로드로 자동 전환했습니다."
+            "녹음 처리 서비스에 연결할 수 없어 PC 연결 방식으로 계속 진행합니다."
           );
         }
       }
@@ -955,9 +952,9 @@ export function App() {
         saveBaseName: baseNameFromFile(selected.name)
       });
 
-      if (shareMode && keyReady && cloudConsent && !autoStartSuppressedRef.current) {
+      if (shareMode && keyReady && !autoStartSuppressedRef.current) {
         setCloudUploadNotice(
-          "PC 직접 업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
+          "PC 연결 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요."
         );
         workflowStartingRef.current = true;
         try {
@@ -991,7 +988,7 @@ export function App() {
           if (selectionVersion !== selectionVersionRef.current) return;
           if (isApiAuthenticationError(workflowError)) {
             setCloudUploadNotice(
-              "PC 직접 업로드 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
+              "PC 연결 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
             );
             setStage("ready");
             requireAccessReconnect();
@@ -999,7 +996,7 @@ export function App() {
           }
           setStage("failed");
           setCloudUploadNotice(
-            "PC 직접 업로드 완료 · 전사 작업을 다시 접수할 수 있습니다."
+            "PC 연결 완료 · 전사 작업을 다시 접수할 수 있습니다."
           );
           setError(
             workflowError instanceof Error
@@ -1032,7 +1029,7 @@ export function App() {
       setRecordingRetryNotice(
         remoteUploadAccepted
           ? null
-          : "녹음은 이 기기에 그대로 있습니다. 같은 녹음 다시 전송을 눌러 즉시 다시 시도할 수 있습니다."
+          : "녹음은 이 기기에 그대로 있습니다. 같은 녹음으로 다시 시도를 눌러 즉시 이어갈 수 있습니다."
       );
       setError(
         analysisError instanceof Error
@@ -1066,7 +1063,7 @@ export function App() {
       if (enqueueingUploadedSource) {
         setStage("analyzing");
         setCloudUploadNotice(
-          `${cloudRecordingId ? "클라우드" : "PC 직접"} 업로드 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요.`
+          `${cloudRecordingId ? "녹음 준비" : "PC 연결"} 완료 · 서버에 전사 작업을 접수하고 있습니다. 화면을 켜 두세요.`
         );
       } else {
         setStage(optimizedPackage ? "transcribing" : "optimizing");
@@ -1109,7 +1106,7 @@ export function App() {
       if (isApiAuthenticationError(transcriptionError)) {
         if (enqueueingUploadedSource) {
           setCloudUploadNotice(
-            "업로드 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
+            "녹음 준비 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
           );
         }
         setStage("ready");
@@ -1118,7 +1115,7 @@ export function App() {
       }
       setStage("failed");
       if (enqueueingUploadedSource) {
-        setCloudUploadNotice("업로드 완료 · 전사 작업을 다시 접수할 수 있습니다.");
+        setCloudUploadNotice("녹음 준비 완료 · 전사 작업을 다시 접수할 수 있습니다.");
       }
       setError(
         transcriptionError instanceof Error
@@ -1236,7 +1233,7 @@ export function App() {
     setError(
       activeWorkflowId
         ? "PC 작업은 보존되어 있습니다. 비밀번호를 다시 확인하면 결과를 바로 가져옵니다."
-        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 자동으로 이어집니다."
+        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 이어서 진행됩니다."
     );
     stopProgressPolling();
   }
@@ -1287,7 +1284,7 @@ export function App() {
               <span>
                 {activeWorkflowId
                   ? "PC의 작업은 그대로 있습니다. 비밀번호만 다시 확인하세요."
-                  : "현재 녹음을 유지한 채 자동으로 다시 시작합니다."}
+                  : "현재 녹음을 유지한 채 이어서 진행합니다."}
               </span>
             </div>
             <label className="secret-input single">
@@ -1317,7 +1314,7 @@ export function App() {
               ) : (
                 <ShieldCheck size={17} />
               )}
-              {activeWorkflowId ? "확인하고 결과 받기" : "확인하고 자동 재개"}
+              {activeWorkflowId ? "확인하고 결과 받기" : "확인하고 이어서 진행"}
             </button>
           </form>
         )}
@@ -1337,8 +1334,8 @@ export function App() {
                 </strong>
                 <span>{formatClock(recordingElapsedSec)}</span>
                 <small>
-                  {recordingWakeLockMessage(wakeLockStatus)} 녹음을 마치면 업로드·전사가
-                  자동으로 이어집니다.
+                  {recordingWakeLockMessage(wakeLockStatus)} 녹음 종료 및 전사 시작을 누르면
+                  전사와 TXT 저장까지 이어집니다.
                 </small>
               </div>
               <button
@@ -1352,14 +1349,14 @@ export function App() {
                 ) : (
                   <Square size={17} fill="currentColor" />
                 )}
-                녹음 종료 후 자동 전사
+                녹음 종료 및 전사 시작
               </button>
             </div>
           ) : !hasSource ? (
             <div className="drop-zone recording-only-zone">
               <Mic size={28} />
               <strong>지금 바로 녹음을 시작하세요</strong>
-              <span>녹음 종료 후 업로드·전사·TXT 저장까지 자동 진행됩니다.</span>
+              <span>녹음 종료 및 전사 시작을 누르면 전사와 TXT 저장까지 이어집니다.</span>
               <button
                 className="direct-record-button"
                 type="button"
@@ -1377,16 +1374,16 @@ export function App() {
                 <strong>{displaySourceName}</strong>
                 <span>
                   {stage === "analyzing" && cloudUploadProgress !== null
-                    ? `클라우드 업로드 ${Math.round(cloudUploadProgress * 100)}%`
+                    ? `녹음 처리 ${Math.round(cloudUploadProgress * 100)}%`
                     : stage === "analyzing"
                       ? "길이, 언어, 전사 방식을 확인하고 있습니다."
                     : recommendation
                       ? "분석 완료"
                       : cloudRecordingId
-                        ? "클라우드 업로드 완료"
+                        ? "전사 준비 완료"
                       : shareMode
-                        ? "비밀번호 확인 후 자동 업로드됩니다."
-                        : "업로드 준비 중"}
+                        ? "비밀번호 확인 후 전사 준비를 시작합니다."
+                        : "전사 준비 중"}
                 </span>
               </div>
               <button
@@ -1405,13 +1402,13 @@ export function App() {
           {cloudUploadProgress !== null && stage === "analyzing" && (
             <div className="transcription-progress" aria-live="polite">
               <div className="progress-heading">
-                <span>녹음 업로드</span>
+                <span>녹음 처리</span>
                 <strong>{Math.round(cloudUploadProgress * 100)}%</strong>
               </div>
               <div
                 className="progress-track"
                 role="progressbar"
-                aria-label="녹음 클라우드 업로드 진행률"
+                aria-label="녹음 처리 진행률"
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={Math.round(cloudUploadProgress * 100)}
@@ -1419,7 +1416,7 @@ export function App() {
                 <span style={{ width: `${Math.round(cloudUploadProgress * 100)}%` }} />
               </div>
               <div className="progress-meta">
-                <span>연결이 흔들리면 현재 조각만 다시 보내고 이어집니다.</span>
+                <span>연결이 흔들리면 현재 조각의 연결만 다시 확인하고 이어집니다.</span>
               </div>
             </div>
           )}
@@ -1440,7 +1437,7 @@ export function App() {
               onClick={retrySameRecording}
             >
               <RefreshCw size={17} />
-              같은 녹음 다시 전송
+              같은 녹음으로 다시 시도
             </button>
           )}
           {recommendation && hasSource && (
@@ -1471,7 +1468,7 @@ export function App() {
             </p>
           )}
           <p className="recording-limit-note">
-            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료·업로드 후
+            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료 후
             서버 작업 접수가 완료되면 화면을 꺼도 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의
             녹음을 보장하려면 Android 전용 앱이 필요합니다.
           </p>
@@ -1503,7 +1500,7 @@ export function App() {
                   <span>
                     <KeyRound size={16} />
                     공유 비밀번호
-                    <small>한 번 확인하면 TXT 저장까지 자동 진행됩니다.</small>
+                    <small>비밀번호를 확인한 뒤 녹음을 종료하고 전사를 시작하세요.</small>
                   </span>
                   <span className="secret-input single">
                     <input
@@ -1537,7 +1534,7 @@ export function App() {
                   ) : (
                     <ShieldCheck size={17} />
                   )}
-                  확인하고 자동 전사
+                  비밀번호 확인
                 </button>
               </form>
 
@@ -1658,18 +1655,6 @@ export function App() {
             </div>
           )}
 
-          <label className="consent-line">
-            <input
-              type="checkbox"
-              checked={cloudConsent}
-              disabled={busy}
-              onChange={(event) => setCloudConsent(event.target.checked)}
-            />
-            <span>
-              최적화된 오디오를 Google Gemini로 전송합니다.
-              <small>무료 API 콘텐츠는 Google 제품 개선에 사용될 수 있습니다.</small>
-            </span>
-          </label>
         </section>
 
         <section className="action-section">
@@ -1683,7 +1668,7 @@ export function App() {
             {primaryActionLabel(stage, Boolean(optimizedPackage))}
           </button>
           <p className="action-note">
-            {actionStatus(stage, keyReady, cloudConsent, hasSource, shareMode)}
+            {actionStatus(stage, keyReady, hasSource, shareMode)}
           </p>
           {busy && (
             <div className={wakeLockActive ? "wake-status active" : "wake-status"}>
@@ -1859,7 +1844,7 @@ export function App() {
           <div className="utility-content">
             <div>
               <strong>오디오 패키지만 만들기</strong>
-              <p>Google로 전송하지 않고 최적화된 MP3와 manifest를 만듭니다.</p>
+              <p>최적화된 MP3와 manifest를 만듭니다.</p>
             </div>
             <button
               className="secondary-button"
@@ -1893,7 +1878,7 @@ export function App() {
           <span>
             {shareMode
               ? "기본 API key는 이 PC에 암호화해 저장하며 공유 브라우저에는 전달하지 않습니다."
-              : "API key는 저장하지 않습니다. Google 전송 전까지 파일 처리는 로컬에서 진행됩니다."}
+              : "API key는 저장하지 않습니다."}
           </span>
         </footer>
       </div>
@@ -2031,7 +2016,6 @@ function workflowErrorMessage(error: string | null | undefined): string {
 function actionStatus(
   stage: WorkflowStage,
   keyReady: boolean,
-  consent: boolean,
   hasSource: boolean,
   shareMode: boolean
 ): string {
@@ -2043,8 +2027,7 @@ function actionStatus(
   if (!keyReady) {
     return shareMode ? "공유 비밀번호를 입력하세요." : "Gemini API key가 필요합니다.";
   }
-  if (!consent) return "Google 전송 동의를 확인하세요.";
-  if (shareMode) return "비밀번호 확인 후 최적화·전사·TXT 다운로드가 자동 진행됩니다.";
+  if (shareMode) return "비밀번호 확인이 완료되었습니다. 전사를 시작합니다.";
   return "준비되었습니다.";
 }
 

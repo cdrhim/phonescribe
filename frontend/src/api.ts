@@ -61,7 +61,7 @@ const MAX_CLOUD_PART_SIZE_BYTES = 6 * 1024 * 1024;
 const CLOUD_UPLOAD_RETRY_DELAYS_MS = [0, 1000, 3000, 5000, 10000, 20000];
 const CLOUD_UPLOAD_ATTEMPT_TIMEOUT_MS = 120000;
 const API_NETWORK_ERROR_MESSAGE =
-  "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요.";
+  "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다.";
 let apiAccessToken: string | null = restoreApiAccessToken();
 
 export class ApiRequestError extends Error {
@@ -290,7 +290,7 @@ function validateCloudUploadDescriptor(
   descriptor: CloudUploadDescriptor
 ): void {
   if (!descriptor.recording_id || !descriptor.bucket_id || !descriptor.parts.length) {
-    throw new Error("클라우드 업로드 정보가 올바르지 않습니다.");
+    throw new Error("녹음 처리 준비 정보를 확인하지 못했습니다.");
   }
   const parts = [...descriptor.parts].sort(
     (left, right) => left.part_number - right.part_number
@@ -307,12 +307,12 @@ function validateCloudUploadDescriptor(
       part.size_bytes > MAX_CLOUD_PART_SIZE_BYTES ||
       !part.object_path
     ) {
-      throw new Error("클라우드 업로드 조각 정보가 올바르지 않습니다.");
+      throw new Error("녹음 분할 정보를 확인하지 못했습니다.");
     }
     expectedStart = part.byte_end;
   }
   if (expectedStart !== file.size) {
-    throw new Error("클라우드 업로드 크기가 녹음 파일과 일치하지 않습니다.");
+    throw new Error("녹음 크기 확인에 실패했습니다. 원본은 이 기기에 그대로 있습니다.");
   }
 }
 
@@ -352,14 +352,14 @@ async function uploadSignedPart(
       });
       if (response.ok) return;
       lastFailure = new ApiRequestError(
-        `클라우드 업로드가 거절되었습니다. (HTTP ${response.status})`,
+        `녹음 조각 처리를 완료하지 못했습니다. (HTTP ${response.status})`,
         response.status
       );
       if (!isTransientUploadStatus(response.status)) throw lastFailure;
     } catch (error) {
       if (signal?.aborted) throw abortError();
       if (timedOut) {
-        lastFailure = new ApiNetworkError("클라우드 업로드 응답 시간이 초과되었습니다.");
+        lastFailure = new ApiNetworkError("녹음 조각 처리 응답 시간이 초과되었습니다.");
         continue;
       }
       if (isAbortException(error)) throw abortError();
@@ -372,7 +372,7 @@ async function uploadSignedPart(
   }
   throw lastFailure instanceof Error
     ? lastFailure
-    : new Error("클라우드 업로드를 완료하지 못했습니다.");
+    : new Error("녹음 처리를 완료하지 못했습니다. 원본은 이 기기에 그대로 있습니다.");
 }
 
 function isHttpsUrl(value: string): boolean {
