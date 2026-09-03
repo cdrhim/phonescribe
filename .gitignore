@@ -43,6 +43,15 @@ npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
 
+# Android
+android-recorder/.gradle/
+android-recorder/local.properties
+android-recorder/**/build/
+*.apk
+*.aab
+*.jks
+*.keystore
+
 # OS/editor
 .DS_Store
 Thumbs.db

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneScribe</string>
+    <string name="recording_channel">PhoneScribe 녹음</string>
+    <string name="processing_channel">PhoneScribe 전사</string>
+</resources>

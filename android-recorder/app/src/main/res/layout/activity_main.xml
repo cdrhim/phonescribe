@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FFFFFF"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="PHONE RECORDINGS / NATIVE"
+            android:textColor="#747474"
+            android:textSize="13sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Phone Scribe"
+            android:textColor="#111111"
+            android:textSize="38sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="화면을 잠가도 녹음하고, 정지하면 자동으로 전사합니다."
+            android:textColor="#555555"
+            android:textSize="16sp" />
+
+        <EditText
+            android:id="@+id/serverUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:hint="PhoneScribe 서버 주소"
+            android:inputType="textUri"
+            android:singleLine="true" />
+
+        <EditText
+            android:id="@+id/passcode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="공유 비밀번호"
+            android:inputType="textPassword"
+            android:singleLine="true" />
+
+        <CheckBox
+            android:id="@+id/consent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="전사를 위해 녹음이 Google Gemini로 전송되는 것에 동의합니다."
+            android:textColor="#333333" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:background="#F4F4F4"
+            android:padding="18dp"
+            android:text="준비되었습니다."
+            android:textColor="#111111"
+            android:textSize="17sp" />
+
+        <TextView
+            android:id="@+id/elapsed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:paddingTop="22dp"
+            android:paddingBottom="14dp"
+            android:text="00:00:00"
+            android:textColor="#111111"
+            android:textSize="34sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/startButton"
+            android:layout_width="match_parent"
+            android:layout_height="58dp"
+            android:text="녹음 시작"
+            android:textSize="18sp" />
+
+        <Button
+            android:id="@+id/stopButton"
+            android:layout_width="match_parent"
+            android:layout_height="58dp"
+            android:layout_marginTop="10dp"
+            android:enabled="false"
+            android:text="녹음 정지 · 자동 전사"
+            android:textSize="18sp" />
+
+        <Button
+            android:id="@+id/retryButton"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="10dp"
+            android:text="최근 녹음 다시 전송"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/webButton"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="20dp"
+            android:text="웹 전사 내역 열기" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="녹음 중에는 Android 알림이 계속 표시됩니다. 화면 잠금 후에도 알림의 정지 버튼으로 녹음을 끝낼 수 있습니다. 녹음과 TXT는 각각 Recordings/PhoneScribe와 Download/PhoneScribe에 저장됩니다."
+            android:textColor="#666666"
+            android:textSize="13sp" />
+    </LinearLayout>
+</ScrollView>

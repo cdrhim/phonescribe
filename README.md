@@ -134,10 +134,36 @@ tab until the passcode is confirmed. The page requests a Screen Wake Lock only w
 performing the initial upload/analysis.
 
 Mobile browsers cannot guarantee microphone capture after the user locks the phone or the operating
-system suspends the browser. The Wake Lock prevents automatic screen locking where supported, but a
-native Android app with a microphone foreground service is required for guaranteed recording with
-the screen off. After recording stops and the upload is accepted, processing no longer depends on
-the phone screen.
+system suspends the browser. The Wake Lock prevents automatic screen locking where supported. For
+guaranteed recording with the screen off, this repository now includes the native Android recorder
+under `android-recorder`. After recording stops and the upload is accepted, processing no longer
+depends on the phone screen.
+
+### Android locked-screen recorder
+
+The Android app uses a microphone foreground service and a partial CPU wake lock. Start recording
+while the activity is visible, then the display may be locked immediately. A persistent Android
+notification shows that the microphone is active and provides `Stop recording and auto-transcribe`.
+Stopping performs the same protected workflow as the website:
+
+1. Save an AAC/M4A copy to `Recordings/PhoneScribe`.
+2. Upload 6 MiB signed parts directly to the private Supabase bucket.
+3. Ask the existing PC API to start its durable Gemini workflow.
+4. Keep polling in a data-sync foreground service while the screen is off.
+5. Save the completed text to `Download/PhoneScribe` and show a completion notification.
+
+The app stores the server URL but never persists the passcode, bearer token, signed upload URLs, or
+transcript text in preferences or logs. A failed upload keeps only the private pending M4A so the
+user can reopen the app, enter the passcode, and select `Retry latest recording`.
+
+Build and test locally with JDK 17, Android SDK 35, and Gradle 8.11.1:
+
+```powershell
+gradle -p android-recorder testDebugUnitTest assembleDebug
+```
+
+GitHub Actions runs the same checks and publishes an installable APK artifact. Tags matching
+`android-v*` additionally create a GitHub Release containing the APK and its SHA-256 checksum.
 
 When the page is visible after completion, the TXT transcript downloads automatically once. The
 network startup script also saves a collision-safe TXT copy to the server PC's
@@ -242,8 +268,8 @@ environment variables, source control, screenshots, or chat. The Vercel site nee
 The exact screen-off boundary is the returned `workflow_id`: keep the phone page visible while it is
 recording and uploading, and until the page says the server accepted the job. From that point,
 optimization, Gemini transcription, Supabase persistence, and the PC TXT save continue without the
-phone. A hidden or locked mobile browser cannot reliably record or finish an upload; guaranteed
-locked-screen capture requires a native Android foreground-service app. The PC must remain powered,
+phone. A hidden or locked mobile browser cannot reliably record or finish an upload; use the included
+`android-recorder` foreground-service app for guaranteed locked-screen capture. The PC must remain powered,
 awake, connected, and running LocalMeetScribe until the workflow completes. If the phone is locked
 at completion, its browser downloads the TXT when the page becomes visible again; the PC copy is
 saved independently.
