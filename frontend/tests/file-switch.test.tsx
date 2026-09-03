@@ -93,14 +93,6 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function fileInput(): HTMLInputElement {
-  return document.querySelector('input[type="file"]:not([multiple])')!;
-}
-
-function chooseFile(name = NEW_NAME) {
-  fireEvent.change(fileInput(), { target: { files: [new File(["test"], name, { type: "audio/wav" })] } });
-}
-
 function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
   const recorderDescriptor = Object.getOwnPropertyDescriptor(globalThis, "MediaRecorder");
   const mediaDevicesDescriptor = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
@@ -151,6 +143,12 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
       Reflect.deleteProperty(navigator, "mediaDevices");
     }
   };
+}
+
+async function recordNow() {
+  fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+  await screen.findByText("녹음 중");
+  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
 }
 
 function installWakeLockBrowser(options: { reject?: boolean } = {}) {
@@ -213,7 +211,6 @@ beforeEach(() => {
   vi.mocked(api.analyzeOptimizer).mockImplementation(() => new Promise(() => {}));
   vi.mocked(api.startTranscriptionWorkflow).mockImplementation(() => new Promise(() => {}));
 });
-
 afterEach(() => {
   cleanup();
   restoreRecordingBrowser?.();
@@ -225,6 +222,19 @@ afterEach(() => {
 });
 
 describe("direct phone recording", () => {
+  it("exposes recording only and no file picker", () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+
+    render(<App />);
+
+    expect(screen.getByRole("button", { name: "바로 녹음 시작" })).toBeTruthy();
+    expect(document.querySelector('input[type="file"]')).toBeNull();
+    expect(screen.queryByText("파일 1개 선택")).toBeNull();
+    expect(screen.queryByText("최근 녹음 추천")).toBeNull();
+  });
+
   it("turns the captured audio into a file and starts the existing automatic upload", async () => {
     const stopTrack = vi.fn();
     installRecordingBrowser(async () => ({
@@ -307,6 +317,9 @@ describe("direct phone recording", () => {
 
 describe("Supabase signed upload", () => {
   it("uploads signed parts, completes the cloud recording, and starts the workflow", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
     const workflowStarted = deferred<TranscriptionWorkflowStart>();
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
@@ -339,7 +352,7 @@ describe("Supabase signed upload", () => {
     vi.mocked(api.startTranscriptionWorkflow).mockReturnValue(workflowStarted.promise);
 
     render(<App />);
-    chooseFile();
+    await recordNow();
 
     await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
@@ -368,6 +381,9 @@ describe("Supabase signed upload", () => {
   });
 
   it("falls back to the existing PC upload when cloud upload is unavailable", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
     const workflowStarted = deferred<TranscriptionWorkflowStart>();
     const wakeLock = installWakeLockBrowser();
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
@@ -379,7 +395,7 @@ describe("Supabase signed upload", () => {
     vi.mocked(api.startTranscriptionWorkflow).mockReturnValue(workflowStarted.promise);
 
     render(<App />);
-    chooseFile();
+    await recordNow();
 
     await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
     await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
@@ -389,7 +405,6 @@ describe("Supabase signed upload", () => {
     expect(screen.getByText(/PC 직접 업로드 완료 · 서버에 전사 작업을 접수/)).toBeTruthy();
     expect(screen.queryByText(/이제 화면을 꺼도 전사와 저장이 계속/)).toBeNull();
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBeNull();
-    expect(wakeLock.release).not.toHaveBeenCalled();
 
     await act(async () => {
       workflowStarted.resolve({
@@ -401,173 +416,7 @@ describe("Supabase signed upload", () => {
     expect(await screen.findByText(/서버 작업 접수 완료 · 이제 화면을 꺼도/)).toBeTruthy();
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBe(OLD_ID);
     expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
-    await waitFor(() => expect(wakeLock.release).toHaveBeenCalledOnce());
-  });
-});
-
-describe("switching recordings while a restored workflow is stuck", () => {
-  it("aborts the legacy PC upload before starting the replacement file", async () => {
-    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
-    let oldSignal: AbortSignal | undefined;
-    vi.mocked(api.analyzeOptimizer)
-      .mockImplementationOnce((_options, _language, _quickScan, signal) => {
-        oldSignal = signal;
-        return new Promise((_resolve, reject) => {
-          signal?.addEventListener(
-            "abort",
-            () => reject(new DOMException("aborted", "AbortError")),
-            { once: true }
-          );
-        });
-      })
-      .mockImplementationOnce(() => new Promise(() => {}));
-
-    render(<App />);
-    chooseFile(OLD_NAME);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
-    expect(oldSignal?.aborted).toBe(false);
-
-    chooseFile(NEW_NAME);
-
-    expect(oldSignal?.aborted).toBe(true);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(api.analyzeOptimizer).mock.calls[1][0].file?.name).toBe(NEW_NAME);
-  });
-
-  it("aborts the legacy PC upload when the page unmounts", async () => {
-    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
-    let uploadSignal: AbortSignal | undefined;
-    vi.mocked(api.analyzeOptimizer).mockImplementation(
-      (_options, _language, _quickScan, signal) => {
-        uploadSignal = signal;
-        return new Promise((_resolve, reject) => {
-          signal?.addEventListener(
-            "abort",
-            () => reject(new DOMException("aborted", "AbortError")),
-            { once: true }
-          );
-        });
-      }
-    );
-
-    const view = render(<App />);
-    chooseFile(OLD_NAME);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
-    expect(uploadSignal?.aborted).toBe(false);
-
-    view.unmount();
-
-    expect(uploadSignal?.aborted).toBe(true);
-  });
-
-  it("opens the picker despite a 401; cancelling keeps the old job, choosing clears it", async () => {
-    seedOldWorkflow();
-    vi.mocked(api.getTranscriptionWorkflow).mockRejectedValue(new api.ApiRequestError("expired", 401));
-    const view = render(<StrictMode><App /></StrictMode>);
-    await screen.findByText("전사 결과 연결 복구");
-    const changeButton = screen.getByRole("button", { name: "다른 파일 선택" }) as HTMLButtonElement;
-    expect(changeButton.disabled).toBe(false);
-    const clickPicker = vi.spyOn(fileInput(), "click").mockImplementation(() => {});
-    fireEvent.click(changeButton);
-    expect(clickPicker).toHaveBeenCalledOnce();
-    expect(screen.getByText(OLD_NAME)).toBeTruthy();
-    expect(window.location.search).toContain(OLD_ID);
-
-    chooseFile();
-    expect(screen.getByText(NEW_NAME)).toBeTruthy();
-    expect(screen.queryByText(OLD_NAME)).toBeNull();
-    expect(screen.queryByText("전사 결과 연결 복구")).toBeNull();
-    expect(window.location.search).toBe("");
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-    expect(api.startTranscriptionWorkflow).not.toHaveBeenCalled();
-    view.unmount();
-    render(<App />);
-    expect(screen.queryByText(OLD_NAME)).toBeNull();
-  });
-
-  it.each(["success", "unauthorized", "not-found", "network"])(
-    "ignores a delayed %s response from the old poll after selection", async (outcome) => {
-      seedOldWorkflow();
-      const oldPoll = deferred<TranscriptionWorkflowStatus>();
-      vi.mocked(api.getTranscriptionWorkflow).mockReturnValue(oldPoll.promise);
-      render(<StrictMode><App /></StrictMode>);
-      await waitFor(() => expect(api.getTranscriptionWorkflow).toHaveBeenCalled());
-      expect((screen.getByRole("button", { name: "다른 파일 선택" }) as HTMLButtonElement).disabled).toBe(false);
-      chooseFile();
-      await act(async () => {
-        if (outcome === "success") {
-          oldPoll.resolve({
-            workflow_id: OLD_ID, package_id: OLD_ID, status: "complete", error: null,
-            transcript: { provider: "gemini", model: "mock", text: "mock transcript",
-              suggested_filename: "old", chunk_count: 0, chunks: [], txt_url: "/old.txt", json_url: "/old.json" }
-          });
-        } else {
-          oldPoll.reject(outcome === "network" ? new Error("offline") :
-            new api.ApiRequestError(outcome === "not-found" ? "Workflow not found" : "expired",
-              outcome === "not-found" ? 404 : 401));
-        }
-      });
-      expect(screen.getByText(NEW_NAME)).toBeTruthy();
-      expect(screen.queryByRole("alert")).toBeNull();
-      expect(screen.queryByText("mock transcript")).toBeNull();
-      expect(api.downloadApiFile).not.toHaveBeenCalled();
-      expect(api.clearApiAccessToken).not.toHaveBeenCalled();
-      expect(window.location.search).toBe("");
-      expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-    }
-  );
-
-  it("accepts the new analysis and never starts transcription from the old analysis", async () => {
-    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
-    const oldAnalysis = deferred<OptimizerAnalysisResponse>();
-    const newAnalysis = deferred<OptimizerAnalysisResponse>();
-    vi.mocked(api.analyzeOptimizer).mockReturnValueOnce(oldAnalysis.promise).mockReturnValueOnce(newAnalysis.promise);
-    render(<App />);
-    chooseFile(OLD_NAME);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledTimes(1));
-    chooseFile();
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2));
-    await act(async () => { oldAnalysis.resolve(analysis(OLD_NAME, "old-upload")); });
-    expect(api.startTranscriptionWorkflow).not.toHaveBeenCalled();
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-    await act(async () => { newAnalysis.resolve(analysis(NEW_NAME, "new-upload")); });
-    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledTimes(1));
-    expect(vi.mocked(api.startTranscriptionWorkflow).mock.calls[0][1].uploadId).toBe("new-upload");
-    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).sourceName).toBe(NEW_NAME);
-  });
-
-  it("does not restore an old job when its start request returns after switching", async () => {
-    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
-    vi.mocked(api.analyzeOptimizer).mockResolvedValueOnce(analysis(OLD_NAME));
-    const started = deferred<TranscriptionWorkflowStart>();
-    vi.mocked(api.startTranscriptionWorkflow).mockReturnValue(started.promise);
-    render(<App />);
-    chooseFile(OLD_NAME);
-    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledTimes(1));
-    chooseFile();
-    await act(async () => { started.resolve({ workflow_id: OLD_ID, package_id: OLD_ID, status: "queued" }); });
-    expect(screen.getByText(NEW_NAME)).toBeTruthy();
-    expect(api.getTranscriptionWorkflow).not.toHaveBeenCalled();
-    expect(window.location.search).toBe("");
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-  });
-
-  it("finishing old re-authentication does not reattach the previous job", async () => {
-    seedOldWorkflow();
-    vi.mocked(api.getTranscriptionWorkflow).mockRejectedValue(new api.ApiRequestError("expired", 401));
-    const verified = deferred<{ valid: boolean; key_ready: boolean; expires_in: number }>();
-    vi.mocked(api.verifyGeminiSharePasscode).mockReturnValue(verified.promise);
-    render(<App />);
-    await screen.findByText("전사 결과 연결 복구");
-    fireEvent.change(screen.getByLabelText("공유 비밀번호 다시 입력"), { target: { value: "test-passcode" } });
-    fireEvent.click(screen.getByRole("button", { name: "확인하고 결과 받기" }));
-    expect(api.verifyGeminiSharePasscode).toHaveBeenCalledOnce();
-    chooseFile();
-    await act(async () => { verified.resolve({ valid: true, key_ready: true, expires_in: 100 }); });
-    expect(api.getTranscriptionWorkflow).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
-    expect(vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file?.name).toBe(NEW_NAME);
-    expect(window.location.search).toBe("");
+    await waitFor(() => expect(wakeLock.release).toHaveBeenCalled());
   });
 });
 

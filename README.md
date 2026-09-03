@@ -211,10 +211,8 @@ mobile browser restore the tab after the screen turns off without losing workflo
 server restarts or the token expires, the page keeps the workflow ID and shows an inline passcode
 form; successful re-verification resumes polling and TXT download without another upload.
 
-`다른 파일 선택` stays available even while restoring a job or waiting for authentication.
-It opens the file picker directly; cancelling keeps the current recording. Selecting a new file
-clears the old workflow's browser recovery state and ignores its pending responses, while leaving
-all accepted server jobs and transcript files untouched.
+After a completed or failed workflow, `새 녹음 시작` clears only the current browser view and starts
+the microphone again. Already accepted server jobs and transcript files remain untouched.
 
 Tailscale runs as a Windows service and the LocalMeetScribe scheduled task starts the backend at
 sign-in. The phone and PC displays may turn off after the initial upload, but the PC itself must stay
@@ -274,11 +272,9 @@ awake, connected, and running LocalMeetScribe until the workflow completes. If t
 at completion, its browser downloads the TXT when the page becomes visible again; the PC copy is
 saved independently.
 
-`Recent recording recommendation` lets a phone user select several recordings from the system
-picker without uploading them. The page ranks up to six candidates using a recording timestamp in
-the filename (for example, `Voice_260824_133000.m4a`) and falls back to the file's modified time.
-Before passcode confirmation, the user may choose a candidate manually. After confirmation, the
-top-ranked candidate enters the upload and transcription flow automatically.
+The public phone page is recording-only: it does not expose a file picker, drag-and-drop upload, or
+recent-file recommendation. Press `Start recording now`; stopping the microphone enters the same
+upload and transcription flow automatically.
 
 After transcription, choose `Original filename`, `Auto recommendation`, or enter a custom basename.
 The selected name is applied to the TXT, JSON, optimized ZIP, and a downloadable copy of the

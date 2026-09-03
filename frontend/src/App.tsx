@@ -2,7 +2,6 @@ import {
   AlertCircle,
   Check,
   CheckCircle2,
-  Clock3,
   Clipboard,
   Download,
   ExternalLink,
@@ -17,10 +16,9 @@ import {
   Play,
   ShieldCheck,
   Smartphone,
-  Square,
-  Upload
+  Square
 } from "lucide-react";
-import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   type OptimizerOptions,
   analyzeOptimizer,
@@ -84,7 +82,6 @@ export function App() {
   const [file, setFile] = useState<File | null>(null);
   const [sourceName, setSourceName] = useState("");
   const [sourceBytes, setSourceBytes] = useState(0);
-  const [recentRecordingCandidates, setRecentRecordingCandidates] = useState<File[]>([]);
   const [runtime, setRuntime] = useState<RuntimeProfile | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
   const [scan, setScan] = useState<QuickScanResult | null>(null);
@@ -121,8 +118,6 @@ export function App() {
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const recentInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -544,7 +539,6 @@ export function App() {
     const apiKey = geminiApiKey.trim();
     const passcode = sharePasscode.trim();
     if (apiKey.length < 20 || passcode.length < 4 || savingShareKey) return;
-    const selectionVersion = selectionVersionRef.current;
     setSavingShareKey(true);
     setError(null);
     try {
@@ -553,10 +547,7 @@ export function App() {
       setGeminiApiKey("");
       setShowKeySetup(false);
       setShareAccessReady(true);
-      setShareStatus("기본 키 저장 완료 · 파일을 받으면 TXT 저장까지 자동 진행합니다.");
-      if (selectionVersion === selectionVersionRef.current && !file && recentRecordingCandidates[0]) {
-        await selectFile(recentRecordingCandidates[0]);
-      }
+      setShareStatus("기본 키 저장 완료 · 바로 녹음하면 TXT 저장까지 자동 진행합니다.");
     } catch (saveError) {
       setShareAccessReady(false);
       setError(
@@ -594,7 +585,7 @@ export function App() {
       setShareAccessReady(true);
       setAccessNeedsReconnect(false);
       if (selectionVersion !== selectionVersionRef.current) {
-        setShareStatus("확인 완료 · 새로 선택한 녹음 파일로 진행합니다.");
+        setShareStatus("확인 완료 · 새로 시작한 녹음으로 진행합니다.");
         return;
       }
       if (activeWorkflowId) {
@@ -603,15 +594,10 @@ export function App() {
         beginWorkflowPolling(activeWorkflowId);
         return;
       }
-      if (!file && recentRecordingCandidates[0]) {
-        setShareStatus(
-          "확인 완료 · 최신 1순위 녹음을 전사하고 PC에 TXT로 자동 저장합니다."
-        );
-        await selectFile(recentRecordingCandidates[0]);
-      } else if (file) {
+      if (file) {
         setShareStatus("확인 완료 · 전사부터 PC TXT 저장까지 자동 진행합니다.");
       } else {
-        setShareStatus("확인 완료 · 녹음 파일을 선택하면 끝까지 자동 진행합니다.");
+        setShareStatus("확인 완료 · 바로 녹음을 시작하면 끝까지 자동 진행합니다.");
       }
     } catch (verificationError) {
       setShareAccessReady(false);
@@ -1067,7 +1053,6 @@ export function App() {
     autoStartSuppressedRef.current = false;
     analysisStartingRef.current = false;
     workflowStartingRef.current = false;
-    resetRecentCandidates();
     setAccessNeedsReconnect(false);
     setShareStatus(null);
     setFile(null);
@@ -1090,12 +1075,6 @@ export function App() {
     setAutoDownloadStatus(null);
     setServerExportStatus(null);
     setStage("idle");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  }
-
-  function resetRecentCandidates() {
-    setRecentRecordingCandidates([]);
-    if (recentInputRef.current) recentInputRef.current.value = "";
   }
 
   async function copyTranscript() {
@@ -1147,50 +1126,6 @@ export function App() {
     }
   }
 
-  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const selected = event.target.files?.[0];
-    if (selected) {
-      resetRecentCandidates();
-      void selectFile(selected);
-    }
-  }
-
-  function openFilePicker() {
-    if (!fileInputRef.current) return;
-    // Clear only the native input; cancelling the picker keeps the current job.
-    fileInputRef.current.value = "";
-    fileInputRef.current.click();
-  }
-
-  function handleRecentFilesChange(event: ChangeEvent<HTMLInputElement>) {
-    const selected = Array.from(event.target.files || []);
-    if (!selected.length) return;
-    const ranked = rankRecentRecordings(selected).slice(0, 6);
-    setRecentRecordingCandidates(ranked);
-    setError(null);
-    if (shareAccessReady) {
-      void selectFile(ranked[0]);
-    }
-  }
-
-  function handleDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const selected = Array.from(event.dataTransfer.files || []);
-    if (selected.length > 1) {
-      const ranked = rankRecentRecordings(selected).slice(0, 6);
-      setRecentRecordingCandidates(ranked);
-      setError(null);
-      if (shareAccessReady) {
-        void selectFile(ranked[0]);
-      }
-      return;
-    }
-    if (selected[0]) {
-      resetRecentCandidates();
-      void selectFile(selected[0]);
-    }
-  }
-
   return (
     <main className="app-page">
       <div className="app-shell">
@@ -1201,7 +1136,7 @@ export function App() {
           <div>
             <p className="eyebrow">KOREAN + ENGLISH / PHONE RECORDINGS</p>
             <h1>Phone Scribe</h1>
-            <p className="tagline">바로 녹음하거나 파일을 올리면 전사문을 만듭니다.</p>
+            <p className="tagline">휴대폰에서 바로 녹음하면 전사문을 만듭니다.</p>
           </div>
         </header>
 
@@ -1227,7 +1162,7 @@ export function App() {
               <span>
                 {activeWorkflowId
                   ? "PC의 작업은 그대로 있습니다. 비밀번호만 다시 확인하세요."
-                  : "선택한 파일을 유지한 채 자동으로 다시 시작합니다."}
+                  : "현재 녹음을 유지한 채 자동으로 다시 시작합니다."}
               </span>
             </div>
             <label className="secret-input single">
@@ -1263,7 +1198,7 @@ export function App() {
         )}
 
         <section className="flow-section">
-          <SectionTitle index="01" title="녹음" note="바로 녹음 · 파일 선택" />
+          <SectionTitle index="01" title="녹음" note="바로 녹음" />
           {recordingActive ? (
             <div className="recording-panel" aria-live="polite">
               <span className="recording-indicator" aria-hidden="true" />
@@ -1295,14 +1230,10 @@ export function App() {
                 녹음 종료 후 자동 전사
               </button>
             </div>
-          ) : !hasSource && recentRecordingCandidates.length === 0 ? (
-            <div
-              className="drop-zone"
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={handleDrop}
-            >
-              <Upload size={25} />
-              <strong>지금 바로 녹음하거나 파일을 선택하세요</strong>
+          ) : !hasSource ? (
+            <div className="drop-zone recording-only-zone">
+              <Mic size={28} />
+              <strong>지금 바로 녹음을 시작하세요</strong>
               <span>녹음 종료 후 업로드·전사·TXT 저장까지 자동 진행됩니다.</span>
               <button
                 className="direct-record-button"
@@ -1313,68 +1244,6 @@ export function App() {
                 <Mic size={18} />
                 {recordingSupported ? "바로 녹음 시작" : "이 브라우저는 직접 녹음 미지원"}
               </button>
-              <div className="file-choice-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={openFilePicker}
-                >
-                  <FileAudio size={17} />
-                  파일 1개 선택
-                </button>
-                <button
-                  className="secondary-button recommended-picker"
-                  type="button"
-                  onClick={() => {
-                    if (recentInputRef.current) recentInputRef.current.value = "";
-                    recentInputRef.current?.click();
-                  }}
-                >
-                  <Clock3 size={17} />
-                  최근 녹음 추천
-                </button>
-              </div>
-            </div>
-          ) : !hasSource ? (
-            <div className="recent-recordings-panel">
-              <div className="recent-recordings-heading">
-                <Clock3 size={20} />
-                <div>
-                  <strong>최근 녹음 추천</strong>
-                  <span>
-                    선택한 파일 중 녹음 날짜가 가장 최근인 순서입니다.
-                  </span>
-                </div>
-                <button
-                  className="text-link"
-                  type="button"
-                  onClick={resetRecentCandidates}
-                >
-                  닫기
-                </button>
-              </div>
-              <div className="recent-recordings-list">
-                {recentRecordingCandidates.map((candidate, index) => (
-                  <button
-                    key={`${candidate.name}-${candidate.size}-${candidate.lastModified}`}
-                    type="button"
-                    onClick={() => void selectFile(candidate)}
-                  >
-                    <span className={index === 0 ? "recent-rank recommended" : "recent-rank"}>
-                      {index === 0 ? "1순위" : `${index + 1}순위`}
-                    </span>
-                    <span className="recent-file-copy">
-                      <strong>{candidate.name}</strong>
-                      <small>
-                        {formatRecordingDate(candidate)} · {formatBytes(candidate.size)}
-                      </small>
-                    </span>
-                    <span className="recent-pick-label">
-                      {index === 0 ? "추천 전사" : "선택"}
-                    </span>
-                  </button>
-                ))}
-              </div>
             </div>
           ) : (
             <div className="selected-file">
@@ -1398,19 +1267,18 @@ export function App() {
               <button
                 className="secondary-button change-file-button"
                 type="button"
-                onClick={openFilePicker}
-                title="다른 파일 선택"
-                aria-label="다른 파일 선택"
+                disabled={!["complete", "failed"].includes(stage)}
+                onClick={() => {
+                  resetFile();
+                  void startDirectRecording();
+                }}
+                title="새 녹음 시작"
+                aria-label="새 녹음 시작"
               >
-                <Upload size={17} />
-                다른 파일 선택
+                <Mic size={17} />
+                새 녹음 시작
               </button>
             </div>
-          )}
-          {hasSource && (
-            <p className="file-switch-note">
-              연결 확인 중에도 변경할 수 있습니다. PC에 접수된 작업과 기존 결과는 삭제되지 않습니다.
-            </p>
           )}
           {cloudUploadProgress !== null && stage === "analyzing" && (
             <div className="transcription-progress" aria-live="polite">
@@ -1438,26 +1306,6 @@ export function App() {
               {cloudUploadNotice}
             </p>
           )}
-          <input
-            ref={fileInputRef}
-            className="visually-hidden"
-            type="file"
-            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,.webm,audio/*"
-            onChange={handleFileChange}
-            aria-hidden="true"
-            tabIndex={-1}
-          />
-          <input
-            ref={recentInputRef}
-            className="visually-hidden"
-            type="file"
-            accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,.webm,audio/*"
-            multiple
-            onChange={handleRecentFilesChange}
-            aria-hidden="true"
-            tabIndex={-1}
-          />
-
           {recommendation && hasSource && (
             <div className="analysis-band">
               <InfoItem
@@ -2054,7 +1902,7 @@ function actionStatus(
   if (stage === "optimizing") return "음성을 선명하게 정리하고 안전한 크기로 나눕니다.";
   if (stage === "transcribing") return "완료된 구간은 저장되므로 중단되어도 이어집니다.";
   if (stage === "complete") return "전사문을 복사하거나 TXT / JSON으로 내려받으세요.";
-  if (!hasSource) return "먼저 녹음 파일을 선택하세요.";
+  if (!hasSource) return "먼저 바로 녹음을 시작하세요.";
   if (!keyReady) {
     return shareMode ? "공유 비밀번호를 입력하세요." : "Gemini API key가 필요합니다.";
   }
@@ -2228,59 +2076,6 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
-}
-
-function rankRecentRecordings(files: File[]): File[] {
-  return [...files].sort((left, right) => {
-    const recency = recordingTimestamp(right) - recordingTimestamp(left);
-    return recency || right.size - left.size || left.name.localeCompare(right.name, "ko");
-  });
-}
-
-function formatRecordingDate(file: File): string {
-  const timestamp = recordingTimestamp(file);
-  if (!timestamp) return "날짜 정보 없음";
-  return new Intl.DateTimeFormat("ko-KR", {
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit"
-  }).format(new Date(timestamp));
-}
-
-function recordingTimestamp(file: File): number {
-  return filenameRecordingTimestamp(file.name) || file.lastModified || 0;
-}
-
-function filenameRecordingTimestamp(filename: string): number {
-  const withTime = filename.match(
-    /(?:^|\D)(20\d{2}|\d{2})(\d{2})(\d{2})[_\s-]?(\d{2})(\d{2})(\d{2})(?:\D|$)/
-  );
-  const dateOnly = withTime
-    ? null
-    : filename.match(/(?:^|\D)(20\d{2}|\d{2})(\d{2})(\d{2})(?:\D|$)/);
-  const match = withTime || dateOnly;
-  if (!match) return 0;
-
-  const year = match[1].length === 2 ? 2000 + Number(match[1]) : Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4] || 0);
-  const minute = Number(match[5] || 0);
-  const second = Number(match[6] || 0);
-  const date = new Date(year, month - 1, day, hour, minute, second);
-  if (
-    date.getFullYear() !== year ||
-    date.getMonth() !== month - 1 ||
-    date.getDate() !== day ||
-    date.getHours() !== hour ||
-    date.getMinutes() !== minute ||
-    date.getSeconds() !== second
-  ) {
-    return 0;
-  }
-  return date.getTime();
 }
 
 function formatRemainingTime(seconds: number): string {
