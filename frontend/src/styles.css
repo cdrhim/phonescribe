@@ -156,6 +156,16 @@ h1 {
   color: #ffffff;
 }
 
+.workflow-progress .complete {
+  border-color: #0b6849;
+  color: #0b6849;
+}
+
+.workflow-progress .complete span {
+  border-color: #0b6849;
+  background: #0b6849;
+}
+
 .workflow-progress .failed {
   border-color: #a52d2d;
   color: #842323;
@@ -822,6 +832,50 @@ h1 {
   text-align: center;
 }
 
+.completion-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 13px;
+  padding: 18px 20px;
+  border: 1px solid #0b6849;
+  border-radius: 8px;
+  background: #f1f8f5;
+  color: #084f39;
+}
+
+.completion-icon {
+  flex: 0 0 auto;
+}
+
+.completion-card h2 {
+  margin: 0;
+  font-size: 21px;
+  line-height: 1.2;
+}
+
+.completion-card p {
+  margin: 3px 0 0;
+  color: #47685c;
+  font-size: 11px;
+}
+
+.completion-download-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 16px;
+  border: 1px solid #0b6849;
+  border-radius: 6px;
+  background: #0b6849;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .wake-status {
   display: flex;
   align-items: center;
@@ -942,16 +996,6 @@ h1 {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-}
-
-.result-kicker {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin-bottom: 5px;
-  color: #0b6849;
-  font-size: 11px;
-  font-weight: 800;
 }
 
 .result-header h2 {
@@ -1268,6 +1312,16 @@ h1 {
 
   .result-header {
     display: grid;
+  }
+
+  .completion-card {
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: 16px;
+  }
+
+  .completion-download-button {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 
   .result-actions {

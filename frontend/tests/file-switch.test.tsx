@@ -28,6 +28,8 @@ vi.mock("../src/api", async (importOriginal) => ({
 }));
 
 const STORAGE_KEY = "local-meetscribe.active-workflow.v1";
+const LAST_AUTO_DOWNLOADED_WORKFLOW_KEY =
+  "local-meetscribe.last-auto-downloaded-workflow.v1";
 const OLD_ID = "a".repeat(32);
 const OLD_NAME = "old-recording.m4a";
 const NEW_NAME = "new-recording.wav";
@@ -698,6 +700,28 @@ describe("Supabase signed upload", () => {
 });
 
 describe("automatic TXT download", () => {
+  it("shows one clear completion card with a direct TXT download action", async () => {
+    seedOldWorkflow();
+    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
+    vi.mocked(api.downloadApiFile).mockResolvedValue();
+
+    render(<App />);
+
+    const heading = await screen.findByRole("heading", { name: "전사 완료" });
+    const completionCard = heading.closest('[role="status"]');
+    expect(completionCard).not.toBeNull();
+    expect(completionCard?.textContent).toContain("전사문이 준비되었습니다.");
+    expect(screen.queryByRole("button", { name: "전사 다시 실행" })).toBeNull();
+    expect(screen.getByText("완료").closest("div")?.className).toContain("complete");
+
+    fireEvent.click(screen.getByRole("button", { name: "TXT 다운로드" }));
+    await waitFor(() =>
+      expect(api.downloadApiFile).toHaveBeenCalledWith("/old.txt", "old-recording.txt")
+    );
+  });
+
   it("retries transient failures with bounded backoff until the download succeeds", async () => {
     vi.useFakeTimers();
     seedOldWorkflow();

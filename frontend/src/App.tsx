@@ -1658,18 +1658,45 @@ export function App() {
         </section>
 
         <section className="action-section">
-          <button
-            className="primary-action"
-            type="button"
-            disabled={!canStart}
-            onClick={() => void startTranscription()}
-          >
-            {busy ? <Loader2 className="spin" size={20} /> : <Play size={20} />}
-            {primaryActionLabel(stage, Boolean(optimizedPackage))}
-          </button>
-          <p className="action-note">
-            {actionStatus(stage, keyReady, hasSource, shareMode)}
-          </p>
+          {stage === "complete" && transcript ? (
+            <div
+              className="completion-card"
+              role="status"
+              aria-live="polite"
+              aria-labelledby="completion-title"
+            >
+              <CheckCircle2 className="completion-icon" size={32} aria-hidden="true" />
+              <div>
+                <h2 id="completion-title">전사 완료</h2>
+                <p>전사문이 준비되었습니다.</p>
+              </div>
+              <button
+                className="completion-download-button"
+                type="button"
+                onClick={() =>
+                  void downloadResult(transcript.txt_url, `${safeSaveBaseName}.txt`)
+                }
+              >
+                <Download size={17} />
+                TXT 다운로드
+              </button>
+            </div>
+          ) : (
+            <>
+              <button
+                className="primary-action"
+                type="button"
+                disabled={!canStart}
+                onClick={() => void startTranscription()}
+              >
+                {busy ? <Loader2 className="spin" size={20} /> : <Play size={20} />}
+                {primaryActionLabel(stage, Boolean(optimizedPackage))}
+              </button>
+              <p className="action-note">
+                {actionStatus(stage, keyReady, hasSource, shareMode)}
+              </p>
+            </>
+          )}
           {busy && (
             <div className={wakeLockActive ? "wake-status active" : "wake-status"}>
               <MonitorSmartphone size={16} />
@@ -1715,10 +1742,6 @@ export function App() {
           <section className="result-section">
             <div className="result-header">
               <div>
-                <p className="result-kicker">
-                  <CheckCircle2 size={17} />
-                  전사 완료
-                </p>
                 <h2>{safeSaveBaseName}</h2>
                 {autoDownloadStatus && (
                   <p className="auto-download-status">{autoDownloadStatus}</p>
@@ -1733,16 +1756,6 @@ export function App() {
                   aria-label="전사문 복사"
                 >
                   {copied ? <Check size={18} /> : <Clipboard size={18} />}
-                </button>
-                <button
-                  className="download-button"
-                  type="button"
-                  onClick={() =>
-                    void downloadResult(transcript.txt_url, `${safeSaveBaseName}.txt`)
-                  }
-                >
-                  <Download size={16} />
-                  TXT
                 </button>
                 <button
                   className="download-button"
@@ -1968,8 +1981,11 @@ function WorkflowProgress({
   return (
     <div className="workflow-progress" aria-live="polite">
       {workflowSteps.map((step, index) => {
+        const isCompleteStep = stage === "complete" && index === activeIndex;
         const className =
-          stage === "failed" && index === activeIndex
+          isCompleteStep
+            ? "done complete"
+            : stage === "failed" && index === activeIndex
             ? "failed"
             : index < activeIndex
               ? "done"
@@ -1978,7 +1994,7 @@ function WorkflowProgress({
                 : "";
         return (
           <div className={className} key={step}>
-            <span>{index + 1}</span>
+            <span>{isCompleteStep ? <Check size={14} strokeWidth={3} /> : index + 1}</span>
             <small>{step}</small>
           </div>
         );
