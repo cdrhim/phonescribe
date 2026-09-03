@@ -2016,7 +2016,6 @@ function primaryActionLabel(stage: WorkflowStage, hasPackage: boolean): string {
   if (stage === "optimizing") return "오디오 최적화 중";
   if (stage === "transcribing") return "Gemini 전사 중";
   if (stage === "failed" && hasPackage) return "전사 이어하기";
-  if (stage === "complete") return "전사 다시 실행";
   return "전사 시작";
 }
 
