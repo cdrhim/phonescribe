@@ -256,6 +256,69 @@ describe("direct phone recording", () => {
     expect(stopTrack).toHaveBeenCalledOnce();
   });
 
+  it("keeps a restored workflow until replacement recording actually starts", async () => {
+    const microphone = deferred<MediaStream>();
+    installRecordingBrowser(() => microphone.promise);
+    seedOldWorkflow();
+
+    render(<App />);
+    const newRecording = await screen.findByRole("button", { name: "새 녹음 시작" });
+    expect((newRecording as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(newRecording);
+
+    expect(await screen.findByText("마이크 연결 중")).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBe(OLD_ID);
+    expect(window.location.search).toContain(OLD_ID);
+
+    await act(async () => {
+      microphone.resolve({
+        getTracks: () => [{ stop: vi.fn() }]
+      } as unknown as MediaStream);
+    });
+
+    expect(await screen.findByText("녹음 중")).toBeTruthy();
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(window.location.search).toBe("");
+  });
+
+  it("preserves a restored workflow when replacement microphone permission is denied", async () => {
+    installRecordingBrowser(async () => {
+      throw new DOMException("denied", "NotAllowedError");
+    });
+    seedOldWorkflow();
+
+    render(<App />);
+    const newRecording = await screen.findByRole("button", { name: "새 녹음 시작" });
+    expect((newRecording as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(newRecording);
+
+    expect(
+      await screen.findByText(
+        "마이크 권한이 필요합니다. 주소창의 권한 설정에서 마이크를 허용해 주세요."
+      )
+    ).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBe(OLD_ID);
+    expect(window.location.search).toContain(OLD_ID);
+    expect(screen.getByText(OLD_NAME)).toBeTruthy();
+  });
+
+  it("starts a new recording from a URL-only restored workflow", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    window.history.replaceState(null, "", `/?workflow=${OLD_ID}`);
+
+    render(<App />);
+    await waitFor(() => expect(api.getTranscriptionWorkflow).toHaveBeenCalledWith(OLD_ID));
+    const startRecording = screen.getByRole("button", { name: "바로 녹음 시작" });
+    expect((startRecording as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(startRecording);
+
+    expect(await screen.findByText("녹음 중")).toBeTruthy();
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(window.location.search).toBe("");
+  });
+
   it("shows a useful message when microphone permission is denied", async () => {
     installRecordingBrowser(async () => {
       throw new DOMException("denied", "NotAllowedError");

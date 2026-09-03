@@ -619,8 +619,8 @@ export function App() {
     setSaveBaseName(baseNameFromFile(selected.name));
   }
 
-  async function startDirectRecording() {
-    if (!recordingSupported || recordingActive || busy) return;
+  async function startDirectRecording(replaceCurrent = false) {
+    if (!recordingSupported || recordingActive || (busy && !replaceCurrent)) return;
     setRecordingState("starting");
     setRecordingElapsedSec(0);
     setError(null);
@@ -656,6 +656,7 @@ export function App() {
         finishDirectRecording(recording);
       };
       recorder.start(1000);
+      if (replaceCurrent) resetFile();
       setRecordingState("recording");
     } catch (recordingError) {
       stopRecordingStream();
@@ -1239,7 +1240,7 @@ export function App() {
                 className="direct-record-button"
                 type="button"
                 disabled={!recordingSupported}
-                onClick={() => void startDirectRecording()}
+                onClick={() => void startDirectRecording(Boolean(activeWorkflowId))}
               >
                 <Mic size={18} />
                 {recordingSupported ? "바로 녹음 시작" : "이 브라우저는 직접 녹음 미지원"}
@@ -1267,11 +1268,8 @@ export function App() {
               <button
                 className="secondary-button change-file-button"
                 type="button"
-                disabled={!["complete", "failed"].includes(stage)}
-                onClick={() => {
-                  resetFile();
-                  void startDirectRecording();
-                }}
+                disabled={!recordingSupported}
+                onClick={() => void startDirectRecording(true)}
                 title="새 녹음 시작"
                 aria-label="새 녹음 시작"
               >
