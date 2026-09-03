@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { uploadCloudRecording } from "../src/api";
+import {
+  ApiNetworkError,
+  isApiTransientError,
+  uploadCloudRecording
+} from "../src/api";
 import type { CloudUploadDescriptor } from "../src/types";
 
 function descriptor(): CloudUploadDescriptor {
@@ -48,6 +52,18 @@ afterEach(() => {
 });
 
 describe("cloud signed PUT uploader", () => {
+  it("classifies branded and legacy tunnel network errors as transient", () => {
+    expect(isApiTransientError(new ApiNetworkError())).toBe(true);
+    expect(
+      isApiTransientError(
+        new Error(
+          "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요."
+        )
+      )
+    ).toBe(true);
+    expect(isApiTransientError(new Error("unrelated failure"))).toBe(false);
+  });
+
   it("uploads ordered parts to independent HTTPS origins with aggregate progress", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 200 }));
     const file = new File(["123456789012345"], "meeting.webm", {
@@ -88,6 +104,31 @@ describe("cloud signed PUT uploader", () => {
     await uploaded;
 
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports signed-part retry backoff to the UI callback", async () => {
+    vi.useFakeTimers();
+    const onePart = descriptor();
+    onePart.parts = [onePart.parts[0]];
+    const file = new File(["1234567890"], "meeting.webm");
+    const retries: Array<[number, number, number]> = [];
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+    const uploaded = uploadCloudRecording(
+      file,
+      onePart,
+      undefined,
+      undefined,
+      (partNumber, attempt, delayMs) => {
+        retries.push([partNumber, attempt, delayMs]);
+      }
+    );
+    await vi.runAllTimersAsync();
+    await uploaded;
+
+    expect(retries).toEqual([[0, 2, 1000]]);
   });
 
   it("aborts during retry backoff without sending another request", async () => {

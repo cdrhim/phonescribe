@@ -14,6 +14,7 @@ import {
   Mic,
   MonitorSmartphone,
   Play,
+  RefreshCw,
   ShieldCheck,
   Smartphone,
   Square
@@ -65,6 +66,7 @@ const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
 const LAST_AUTO_DOWNLOADED_WORKFLOW_KEY =
   "local-meetscribe.last-auto-downloaded-workflow.v1";
 const AUTO_DOWNLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
+const RECORDING_UPLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 
 interface PersistedWorkflow {
   version: 1;
@@ -91,6 +93,10 @@ export function App() {
   const [cloudRecordingId, setCloudRecordingId] = useState<string | null>(null);
   const [cloudUploadProgress, setCloudUploadProgress] = useState<number | null>(null);
   const [cloudUploadNotice, setCloudUploadNotice] = useState<string | null>(null);
+  const [recordingRetryNotice, setRecordingRetryNotice] = useState<string | null>(null);
+  const [recordingRetryScheduled, setRecordingRetryScheduled] = useState(false);
+  const [sameRecordingRetryAvailable, setSameRecordingRetryAvailable] =
+    useState(false);
   const [optimizedPackage, setOptimizedPackage] =
     useState<OptimizedPackageResult | null>(null);
   const [transcript, setTranscript] = useState<GeminiTranscriptResult | null>(null);
@@ -127,6 +133,8 @@ export function App() {
   const workflowStartingRef = useRef(false);
   const analysisStartingRef = useRef(false);
   const uploadAbortRef = useRef<AbortController | null>(null);
+  const recordingRetryTimerRef = useRef<number | null>(null);
+  const recordingRetryAttemptRef = useRef(0);
   const autoStartSuppressedRef = useRef(false);
   // Switching recordings detaches the UI, never cancels a server-side workflow.
   const selectionVersionRef = useRef(0);
@@ -154,6 +162,10 @@ export function App() {
     () => () => {
       selectionVersionRef.current += 1;
       uploadAbortRef.current?.abort();
+      if (recordingRetryTimerRef.current !== null) {
+        window.clearTimeout(recordingRetryTimerRef.current);
+        recordingRetryTimerRef.current = null;
+      }
       stopProgressPolling();
       void wakeLockRef.current?.release();
       const recorder = mediaRecorderRef.current;
@@ -201,7 +213,8 @@ export function App() {
   const busy =
     stage === "analyzing" || stage === "optimizing" || stage === "transcribing";
   const recordingActive = recordingState !== "idle";
-  const keepScreenAwake = stage === "analyzing" || recordingActive;
+  const keepScreenAwake =
+    stage === "analyzing" || recordingRetryScheduled || recordingActive;
   const wakeLockActive = wakeLockStatus === "active";
   const recordingSupported = Boolean(
     typeof MediaRecorder !== "undefined" && navigator.mediaDevices?.getUserMedia
@@ -701,12 +714,80 @@ export function App() {
     recordingStreamRef.current = null;
   }
 
-  async function analyzeSelectedFile(selected: File) {
+  function clearRecordingRetryTimer() {
+    if (recordingRetryTimerRef.current !== null) {
+      window.clearTimeout(recordingRetryTimerRef.current);
+      recordingRetryTimerRef.current = null;
+    }
+  }
+
+  function clearRecordingRetryState() {
+    clearRecordingRetryTimer();
+    recordingRetryAttemptRef.current = 0;
+    setRecordingRetryScheduled(false);
+    setRecordingRetryNotice(null);
+    setSameRecordingRetryAvailable(false);
+  }
+
+  function scheduleRecordingRetry(selected: File, selectionVersion: number) {
+    if (selectionVersion !== selectionVersionRef.current) return;
+    clearRecordingRetryTimer();
+    setStage("failed");
+    setError(null);
+    setCloudUploadProgress(null);
+    setSameRecordingRetryAvailable(true);
+
+    const retryIndex = recordingRetryAttemptRef.current;
+    if (retryIndex >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length) {
+      setRecordingRetryScheduled(false);
+      setRecordingRetryNotice(
+        "자동 재시도를 마쳤습니다. 녹음은 이 기기에 그대로 있습니다. 같은 녹음 다시 전송을 눌러 주세요."
+      );
+      return;
+    }
+
+    const delayMs = RECORDING_UPLOAD_RETRY_DELAYS_MS[retryIndex];
+    recordingRetryAttemptRef.current = retryIndex + 1;
+    setRecordingRetryScheduled(true);
+    setRecordingRetryNotice(
+      `연결이 잠시 끊겼습니다. 녹음은 이 기기에 그대로 있습니다. ${Math.ceil(
+        delayMs / 1000
+      )}초 후 같은 녹음을 자동으로 다시 전송합니다. (${retryIndex + 1}/${
+        RECORDING_UPLOAD_RETRY_DELAYS_MS.length
+      })`
+    );
+    recordingRetryTimerRef.current = window.setTimeout(() => {
+      recordingRetryTimerRef.current = null;
+      if (selectionVersion !== selectionVersionRef.current) return;
+      setRecordingRetryScheduled(false);
+      setRecordingRetryNotice("같은 녹음을 다시 전송하고 있습니다.");
+      void analyzeSelectedFile(selected, true);
+    }, delayMs);
+  }
+
+  function retrySameRecording() {
+    if (!file || analysisStartingRef.current || !sameRecordingRetryAvailable) return;
+    clearRecordingRetryTimer();
+    recordingRetryAttemptRef.current = 0;
+    setRecordingRetryScheduled(false);
+    setRecordingRetryNotice("같은 녹음을 지금 다시 전송하고 있습니다.");
+    void analyzeSelectedFile(file, true);
+  }
+
+  async function analyzeSelectedFile(selected: File, retrying = false) {
     if (analysisStartingRef.current) return;
     const selectionVersion = selectionVersionRef.current;
     const transferController = new AbortController();
+    let remoteUploadAccepted = false;
     analysisStartingRef.current = true;
     uploadAbortRef.current = transferController;
+    if (retrying) {
+      clearRecordingRetryTimer();
+      setRecordingRetryScheduled(false);
+      setRecordingRetryNotice("같은 녹음을 다시 전송하고 있습니다.");
+    } else {
+      clearRecordingRetryState();
+    }
     setStage("analyzing");
     setError(null);
     setCloudUploadNotice(null);
@@ -716,6 +797,8 @@ export function App() {
         try {
           const descriptor = await createCloudUploadDescriptor(selected);
           if (selectionVersion !== selectionVersionRef.current) return;
+          remoteUploadAccepted = true;
+          clearRecordingRetryState();
           await uploadCloudRecording(
             selected,
             descriptor,
@@ -724,7 +807,15 @@ export function App() {
               const progress = totalBytes > 0 ? uploadedBytes / totalBytes : 0;
               setCloudUploadProgress(Math.min(1, Math.max(0, progress)));
             },
-            transferController.signal
+            transferController.signal,
+            (partNumber, attempt, delayMs) => {
+              if (selectionVersion !== selectionVersionRef.current) return;
+              setCloudUploadNotice(
+                `연결을 다시 확인하고 있습니다. ${Math.ceil(
+                  delayMs / 1000
+                )}초 후 ${partNumber + 1}번 조각을 자동 재전송합니다. (${attempt}번째 전송)`
+              );
+            }
           );
           if (selectionVersion !== selectionVersionRef.current) return;
           const completed = await completeCloudRecordingUpload(descriptor.recording_id);
@@ -809,6 +900,25 @@ export function App() {
             requireAccessReconnect();
             return;
           }
+          if (isApiTransientError(cloudUploadError)) {
+            if (!remoteUploadAccepted) {
+              scheduleRecordingRetry(selected, selectionVersion);
+            } else {
+              setStage("failed");
+              setCloudUploadProgress(null);
+              setSameRecordingRetryAvailable(false);
+              setRecordingRetryScheduled(false);
+              setRecordingRetryNotice(
+                "같은 업로드 조각을 자동 재시도했지만 연결을 복구하지 못했습니다. 새 녹음 전까지 원본은 이 기기에 남아 있습니다."
+              );
+              setError(
+                cloudUploadError instanceof Error
+                  ? cloudUploadError.message
+                  : "클라우드 업로드 연결을 복구하지 못했습니다."
+              );
+            }
+            return;
+          }
           setCloudUploadProgress(null);
           setCloudUploadNotice(
             "클라우드 업로드를 사용할 수 없어 PC 직접 업로드로 자동 전환했습니다."
@@ -823,6 +933,8 @@ export function App() {
         transferController.signal
       );
       if (selectionVersion !== selectionVersionRef.current) return;
+      remoteUploadAccepted = true;
+      clearRecordingRetryState();
       const analyzedRecommendation: OptimizerRecommendationResponse = {
         source: analysis.source,
         original_bytes: analysis.original_bytes,
@@ -910,7 +1022,18 @@ export function App() {
         requireAccessReconnect();
         return;
       }
+      if (isApiTransientError(analysisError) && !remoteUploadAccepted) {
+        scheduleRecordingRetry(selected, selectionVersion);
+        return;
+      }
       setStage("failed");
+      setRecordingRetryScheduled(false);
+      setSameRecordingRetryAvailable(!remoteUploadAccepted);
+      setRecordingRetryNotice(
+        remoteUploadAccepted
+          ? null
+          : "녹음은 이 기기에 그대로 있습니다. 같은 녹음 다시 전송을 눌러 즉시 다시 시도할 수 있습니다."
+      );
       setError(
         analysisError instanceof Error
           ? analysisError.message
@@ -1048,6 +1171,7 @@ export function App() {
     selectionVersionRef.current += 1;
     uploadAbortRef.current?.abort();
     uploadAbortRef.current = null;
+    clearRecordingRetryState();
     stopProgressPolling();
     clearPersistedWorkflow();
     setWorkflowUrl(null);
@@ -1303,6 +1427,21 @@ export function App() {
             <p className="cloud-upload-notice" role="status">
               {cloudUploadNotice}
             </p>
+          )}
+          {recordingRetryNotice && (
+            <p className="recording-retry-notice" role="status">
+              {recordingRetryNotice}
+            </p>
+          )}
+          {stage === "failed" && file && sameRecordingRetryAvailable && (
+            <button
+              className="secondary-button same-recording-retry-button"
+              type="button"
+              onClick={retrySameRecording}
+            >
+              <RefreshCw size={17} />
+              같은 녹음 다시 전송
+            </button>
           )}
           {recommendation && hasSource && (
             <div className="analysis-band">

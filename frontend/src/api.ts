@@ -60,6 +60,8 @@ const API_ACCESS_TOKEN_STORAGE_KEY = "local-meetscribe.remote-session.v1";
 const MAX_CLOUD_PART_SIZE_BYTES = 6 * 1024 * 1024;
 const CLOUD_UPLOAD_RETRY_DELAYS_MS = [0, 1000, 3000, 5000, 10000, 20000];
 const CLOUD_UPLOAD_ATTEMPT_TIMEOUT_MS = 120000;
+const API_NETWORK_ERROR_MESSAGE =
+  "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요.";
 let apiAccessToken: string | null = restoreApiAccessToken();
 
 export class ApiRequestError extends Error {
@@ -69,6 +71,13 @@ export class ApiRequestError extends Error {
   ) {
     super(message);
     this.name = "ApiRequestError";
+  }
+}
+
+export class ApiNetworkError extends Error {
+  constructor(message = API_NETWORK_ERROR_MESSAGE) {
+    super(message);
+    this.name = "ApiNetworkError";
   }
 }
 
@@ -83,6 +92,8 @@ export function isApiAuthenticationError(error: unknown): boolean {
 export function isApiTransientError(error: unknown): boolean {
   return (
     error instanceof TypeError ||
+    error instanceof ApiNetworkError ||
+    (error instanceof Error && error.message === API_NETWORK_ERROR_MESSAGE) ||
     (error instanceof ApiRequestError && isTransientUploadStatus(error.status))
   );
 }
@@ -106,9 +117,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     response = await fetch(apiUrl(url), { ...init, headers });
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error(
-        "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요."
-      );
+      throw new ApiNetworkError();
     }
     throw error;
   }
@@ -192,7 +201,8 @@ export async function uploadCloudRecording(
   file: File,
   descriptor: CloudUploadDescriptor,
   onProgress?: (uploadedBytes: number, totalBytes: number) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onRetry?: (partNumber: number, attempt: number, delayMs: number) => void
 ): Promise<void> {
   validateCloudUploadDescriptor(file, descriptor);
   const parts = [...descriptor.parts].sort(
@@ -204,7 +214,9 @@ export async function uploadCloudRecording(
   for (const part of parts) {
     if (signal?.aborted) throw abortError();
     const payload = file.slice(part.byte_start, part.byte_end, file.type);
-    await uploadSignedPart(payload, descriptor.content_type, part, signal);
+    await uploadSignedPart(payload, descriptor.content_type, part, signal, (attempt, delayMs) => {
+      onRetry?.(part.part_number, attempt, delayMs);
+    });
     completedBytes += part.size_bytes;
     onProgress?.(Math.min(file.size, completedBytes), file.size);
   }
@@ -308,11 +320,15 @@ async function uploadSignedPart(
   payload: Blob,
   contentType: string,
   part: CloudUploadDescriptor["parts"][number],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onRetry?: (attempt: number, delayMs: number) => void
 ): Promise<void> {
   let lastFailure: unknown = null;
-  for (const delayMs of CLOUD_UPLOAD_RETRY_DELAYS_MS) {
-    if (delayMs > 0) await abortableDelay(delayMs, signal);
+  for (const [attemptIndex, delayMs] of CLOUD_UPLOAD_RETRY_DELAYS_MS.entries()) {
+    if (delayMs > 0) {
+      onRetry?.(attemptIndex + 1, delayMs);
+      await abortableDelay(delayMs, signal);
+    }
     if (signal?.aborted) throw abortError();
     const attemptController = new AbortController();
     let timedOut = false;
@@ -335,12 +351,15 @@ async function uploadSignedPart(
         signal: attemptController.signal
       });
       if (response.ok) return;
-      lastFailure = new Error(`클라우드 업로드가 거절되었습니다. (HTTP ${response.status})`);
+      lastFailure = new ApiRequestError(
+        `클라우드 업로드가 거절되었습니다. (HTTP ${response.status})`,
+        response.status
+      );
       if (!isTransientUploadStatus(response.status)) throw lastFailure;
     } catch (error) {
       if (signal?.aborted) throw abortError();
       if (timedOut) {
-        lastFailure = new Error("클라우드 업로드 응답 시간이 초과되었습니다.");
+        lastFailure = new ApiNetworkError("클라우드 업로드 응답 시간이 초과되었습니다.");
         continue;
       }
       if (isAbortException(error)) throw abortError();

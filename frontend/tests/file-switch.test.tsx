@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import * as api from "../src/api";
 import type {
+  CloudUploadDescriptor,
   OptimizerAnalysisResponse,
   RuntimeProfile,
   TranscriptionWorkflowStart,
@@ -55,6 +56,28 @@ function analysis(filename: string, upload_id = "test-upload"): OptimizerAnalysi
       glossary: [], preview_text: "", detected_language: "unknown", scan_seconds: 0,
       warning: null
     }
+  };
+}
+
+function cloudUploadDescriptor(): CloudUploadDescriptor {
+  return {
+    recording_id: "cloud-recording-id",
+    bucket_id: "recordings",
+    object_path: "owner/cloud-recording-id/source.webm",
+    content_type: "audio/webm",
+    parts: [{
+      part_number: 0,
+      byte_start: 0,
+      byte_end: 14,
+      size_bytes: 14,
+      object_path: "owner/cloud-recording-id/parts/000000.part",
+      upload: {
+        protocol: "signed-put",
+        url: "https://storage.test/signed/part",
+        headers: { "x-upsert": "true" }
+      }
+    }],
+    expires_in: 3600
   };
 }
 
@@ -149,6 +172,19 @@ async function recordNow() {
   fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
   await screen.findByText("녹음 중");
   fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+}
+
+async function recordNowWithFakeTimers() {
+  fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(screen.getByText("녹음 중")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "녹음 종료 후 자동 전사" }));
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 function installWakeLockBrowser(options: { reject?: boolean } = {}) {
@@ -375,6 +411,179 @@ describe("direct phone recording", () => {
     expect(
       await screen.findByText(/화면 자동 잠금 방지를 사용할 수 없습니다/)
     ).toBeTruthy();
+  });
+});
+
+describe("recording transfer retry", () => {
+  it("automatically retries the same in-memory recording before cloud acceptance", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor)
+      .mockRejectedValueOnce(
+        new Error(
+          "서버 연결이 잠시 끊겼습니다. 파일은 Google로 전송되지 않았습니다. 잠시 후 다시 시도하세요."
+        )
+      )
+      .mockResolvedValueOnce(cloudUploadDescriptor());
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    vi.mocked(api.completeCloudRecordingUpload).mockResolvedValue({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    });
+    vi.mocked(api.startTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "queued"
+    });
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
+    const originalRecording = vi.mocked(api.createCloudUploadDescriptor).mock.calls[0][0];
+    expect(screen.getByText(/1초 후 같은 녹음을 자동으로 다시 전송/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "같은 녹음 다시 전송" })).toBeTruthy();
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2);
+
+    expect(vi.mocked(api.createCloudUploadDescriptor).mock.calls[1][0]).toBe(
+      originalRecording
+    );
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+    expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+  });
+
+  it("lets the user retry the same in-memory recording immediately", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.analyzeOptimizer)
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockResolvedValueOnce(analysis("recorded.webm"));
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+    const originalRecording = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
+    const retryButton = await screen.findByRole("button", {
+      name: "같은 녹음 다시 전송"
+    });
+
+    fireEvent.click(retryButton);
+    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(api.analyzeOptimizer).mock.calls[1][0].file).toBe(
+      originalRecording
+    );
+    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+  });
+
+  it("cancels an automatic retry when a new recording resets the selection", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.analyzeOptimizer).mockRejectedValue(new api.ApiNetworkError());
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "새 녹음 시작" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText("녹음 중")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+  });
+
+  it("cancels an automatic retry when the page unmounts", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.analyzeOptimizer).mockRejectedValue(new api.ApiNetworkError());
+
+    const view = render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+    view.unmount();
+
+    await vi.runAllTimersAsync();
+
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+  });
+
+  it("does not restart or fall back after a cloud descriptor was accepted", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor).mockResolvedValue(
+      cloudUploadDescriptor()
+    );
+    vi.mocked(api.uploadCloudRecording).mockRejectedValue(new api.ApiNetworkError());
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.uploadCloudRecording).toHaveBeenCalledOnce();
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+    expect(screen.getByText(/같은 업로드 조각을 자동 재시도했지만/)).toBeTruthy();
+  });
+
+  it("does not automatically re-post workflow handoff after remote acceptance", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor).mockResolvedValue(
+      cloudUploadDescriptor()
+    );
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    vi.mocked(api.completeCloudRecordingUpload).mockResolvedValue({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    });
+    vi.mocked(api.startTranscriptionWorkflow).mockRejectedValue(
+      new api.ApiNetworkError()
+    );
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
+    expect(api.uploadCloudRecording).toHaveBeenCalledOnce();
+    expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "같은 녹음 다시 전송" })).toBeNull();
+    expect(screen.getByText(/녹음 업로드 완료 · 전사 작업을 다시 접수/)).toBeTruthy();
   });
 });
 
