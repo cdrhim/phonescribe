@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import * as api from "../src/api";
+import * as pendingRecording from "../src/pendingRecording";
 import type {
   CloudUploadDescriptor,
   OptimizerAnalysisResponse,
@@ -28,6 +29,13 @@ vi.mock("../src/api", async (importOriginal) => ({
   fetchApiFileBlob: vi.fn(),
   requestBlobDownload: vi.fn(),
   verifyGeminiSharePasscode: vi.fn()
+}));
+
+vi.mock("../src/pendingRecording", () => ({
+  clearPendingRecording: vi.fn(),
+  loadPendingRecording: vi.fn(),
+  savePendingRecording: vi.fn(),
+  updatePendingRecordingRetryAttempts: vi.fn()
 }));
 
 const STORAGE_KEY = "local-meetscribe.active-workflow.v1";
@@ -154,6 +162,21 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
     fail() {
       this.state = "inactive";
       this.onerror?.(new Event("error"));
+      this.onstop?.(new Event("stop"));
+    }
+
+    empty() {
+      this.state = "inactive";
+      this.onstop?.(new Event("stop"));
+    }
+
+    failWithAudio() {
+      this.state = "inactive";
+      this.onerror?.(new Event("error"));
+      this.ondataavailable?.({
+        data: new Blob(["recorded audio after error"], { type: this.mimeType })
+      } as BlobEvent);
+      this.onstop?.(new Event("stop"));
     }
   }
 
@@ -188,6 +211,12 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
   return {
     fail() {
       recorder?.fail();
+    },
+    empty() {
+      recorder?.empty();
+    },
+    failWithAudio() {
+      recorder?.failWithAudio();
     }
   };
 }
@@ -336,6 +365,10 @@ beforeEach(() => {
   vi.mocked(api.fetchApiFileBlob).mockResolvedValue(
     new Blob(["mock transcript"], { type: "text/plain" })
   );
+  vi.mocked(pendingRecording.clearPendingRecording).mockResolvedValue();
+  vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue(null);
+  vi.mocked(pendingRecording.savePendingRecording).mockResolvedValue();
+  vi.mocked(pendingRecording.updatePendingRecordingRetryAttempts).mockResolvedValue();
 });
 afterEach(() => {
   cleanup();
@@ -744,6 +777,318 @@ describe("direct phone recording", () => {
   });
 });
 
+describe("pending recording persistence", () => {
+  it("persists the finished recording before analysis starts", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    const persisted = deferred<void>();
+    vi.mocked(pendingRecording.savePendingRecording).mockReturnValueOnce(persisted.promise);
+
+    render(<App />);
+    await recordNow();
+
+    await waitFor(() => expect(pendingRecording.savePendingRecording).toHaveBeenCalledOnce());
+    const savedFile = vi.mocked(pendingRecording.savePendingRecording).mock.calls[0][0];
+    expect(savedFile).toBeInstanceOf(File);
+    expect(vi.mocked(pendingRecording.savePendingRecording).mock.calls[0][2]).toBe(0);
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+
+    await act(async () => persisted.resolve());
+
+    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file).toBe(savedFile);
+  });
+
+  it("restores the persisted recording and resumes preparation after reload", async () => {
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm",
+      lastModified: 123
+    });
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 2
+    });
+    vi.mocked(api.analyzeOptimizer).mockRejectedValueOnce(new api.ApiNetworkError());
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>
+    );
+
+    expect(await screen.findByText("PhoneScribe_restored.webm")).toBeTruthy();
+    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file).toBe(restoredFile);
+    expect(pendingRecording.savePendingRecording).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(pendingRecording.updatePendingRecordingRetryAttempts).toHaveBeenCalledWith(
+        "restored-recording-id",
+        3
+      )
+    );
+  });
+
+  it("keeps an exhausted retry budget bounded across reloads", async () => {
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm"
+    });
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 4
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("자동 연결 확인을 마쳤습니다. 녹음은 이 기기에 그대로 있습니다.")
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeTruthy();
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+  });
+
+  it("keeps the previous persisted recording when a new microphone start is denied", async () => {
+    installRecordingBrowser(async () => {
+      throw new DOMException("denied", "NotAllowedError");
+    });
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm"
+    });
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 4
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "새 녹음 시작" }));
+
+    expect(
+      await screen.findByText(
+        "마이크 권한이 필요합니다. 주소창의 권한 설정에서 마이크를 허용해 주세요."
+      )
+    ).toBeTruthy();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
+  });
+
+  it("keeps the previous persisted recording until a non-empty replacement is saved", async () => {
+    const recording = installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm"
+    });
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 4
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "새 녹음 시작" }));
+    expect(
+      await within(screen.getByRole("dialog", { name: "녹음 중 화면" })).findByText(
+        "녹음 중"
+      )
+    ).toBeTruthy();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
+
+    act(() => recording.empty());
+
+    expect(await screen.findByText("녹음된 음성이 없습니다. 다시 녹음해 주세요.")).toBeTruthy();
+    expect(pendingRecording.savePendingRecording).not.toHaveBeenCalled();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
+  });
+
+  it("persists usable chunks delivered after a recorder error instead of discarding them", async () => {
+    const recording = installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm"
+    });
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 4
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "새 녹음 시작" }));
+    await within(screen.getByRole("dialog", { name: "녹음 중 화면" })).findByText("녹음 중");
+
+    act(() => recording.failWithAudio());
+
+    await waitFor(() => expect(pendingRecording.savePendingRecording).toHaveBeenCalledOnce());
+    const savedFile = vi.mocked(pendingRecording.savePendingRecording).mock.calls[0][0];
+    expect(savedFile.size).toBeGreaterThan(0);
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
+  });
+
+  it("does not freeze preparation when browser persistence stays blocked", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    vi.mocked(pendingRecording.savePendingRecording).mockImplementation(() => new Promise(() => {}));
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_999);
+    });
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+  });
+
+  it("allows a later recording to persist and clear after an earlier save stays hung", async () => {
+    vi.useFakeTimers();
+    const recording = installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    vi.mocked(pendingRecording.savePendingRecording)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce();
+    vi.mocked(api.analyzeOptimizer)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce(analysis("second-recording.webm", "second-upload"));
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "새 녹음 시작" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      within(screen.getByRole("dialog", { name: "녹음 중 화면" })).getByText("녹음 중")
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(pendingRecording.savePendingRecording).toHaveBeenCalledTimes(2);
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2);
+    const secondRecordingId = vi.mocked(pendingRecording.savePendingRecording).mock.calls[1][1];
+    expect(pendingRecording.clearPendingRecording).toHaveBeenCalledWith(secondRecordingId);
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalledWith(null);
+  });
+
+  it("keeps the persisted recording until the cloud upload is completed", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor).mockResolvedValue(cloudUploadDescriptor());
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    const completed = deferred<{ recording_id: string; status: "ready" }>();
+    vi.mocked(api.completeCloudRecordingUpload).mockReturnValueOnce(completed.promise);
+
+    render(<App />);
+    await recordNow();
+
+    await waitFor(() => expect(api.completeCloudRecordingUpload).toHaveBeenCalledOnce());
+    expect(pendingRecording.savePendingRecording).toHaveBeenCalledOnce();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
+    const pendingRecordingId =
+      vi.mocked(pendingRecording.savePendingRecording).mock.calls[0][1];
+
+    await act(async () => completed.resolve({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    }));
+
+    await waitFor(() =>
+      expect(pendingRecording.clearPendingRecording).toHaveBeenCalledOnce()
+    );
+    expect(pendingRecording.clearPendingRecording).toHaveBeenCalledWith(
+      pendingRecordingId
+    );
+  });
+
+  it("uses online and visibility return to consume scheduled retries without duplicates", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: false });
+    const thirdAttempt = deferred<OptimizerAnalysisResponse>();
+    vi.mocked(api.analyzeOptimizer)
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockReturnValueOnce(thirdAttempt.promise);
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(3);
+    expect(pendingRecording.updatePendingRecordingRetryAttempts).toHaveBeenNthCalledWith(
+      1,
+      expect.any(String),
+      1
+    );
+    expect(pendingRecording.updatePendingRecordingRetryAttempts).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      2
+    );
+
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe("recording transfer retry", () => {
   it("cancels the recording retry schedule as soon as a retry receives 401", async () => {
     vi.useFakeTimers();
@@ -912,7 +1257,9 @@ describe("recording transfer retry", () => {
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.createCloudUploadDescriptor).mock.calls[0][0];
     expect(
-      screen.getByText("녹음 완료 · 전사 준비 중입니다. 연결되는 즉시 자동으로 계속합니다.")
+      screen.getByText(
+        "녹음 완료 · 연결을 확인하고 있습니다. 최대 4회 확인 후 같은 녹음 재시도 버튼을 표시합니다."
+      )
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
@@ -964,7 +1311,11 @@ describe("recording transfer retry", () => {
       screen.getByText("자동 연결 확인을 마쳤습니다. 녹음은 이 기기에 그대로 있습니다.")
     ).toBeTruthy();
     const retryButton = screen.getByRole("button", { name: "같은 녹음으로 다시 시도" });
-    fireEvent.click(retryButton);
+    await act(async () => {
+      fireEvent.click(retryButton);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(api.analyzeOptimizer).toHaveBeenCalledTimes(6);
     expect(vi.mocked(api.analyzeOptimizer).mock.calls[5][0].file).toBe(originalRecording);
   });
@@ -1034,6 +1385,7 @@ describe("recording transfer retry", () => {
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
     expect(screen.getByText(/현재 녹음 조각의 연결을 여러 번 확인했지만/)).toBeTruthy();
+    expect(pendingRecording.clearPendingRecording).not.toHaveBeenCalled();
   });
 
   it("does not automatically re-post workflow handoff after remote acceptance", async () => {

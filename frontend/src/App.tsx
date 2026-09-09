@@ -43,6 +43,13 @@ import {
   uploadCloudRecording,
   verifyGeminiSharePasscode
 } from "./api";
+import {
+  clearPendingRecording,
+  loadPendingRecording,
+  savePendingRecording,
+  updatePendingRecordingRetryAttempts,
+  type PendingRecording
+} from "./pendingRecording";
 import type {
   GeminiTranscriptionProgress,
   GeminiTranscriptResult,
@@ -76,6 +83,8 @@ const LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY =
   "local-meetscribe.last-auto-download-requested-workflow.v1";
 const AUTO_DOWNLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 const RECORDING_UPLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
+const PENDING_RECORDING_STORAGE_WAIT_MS = 2000;
+const RECORDER_ERROR_FINALIZE_DELAY_MS = 1000;
 
 interface PersistedWorkflow {
   version: 1;
@@ -92,6 +101,12 @@ interface PersistedWorkflow {
 interface PreparedTxtDownload {
   downloadName: string;
   objectUrl: string;
+}
+
+interface RecordingRetryContext {
+  file: File;
+  selectionVersion: number;
+  delayMs: number;
 }
 
 export function App() {
@@ -164,12 +179,24 @@ export function App() {
   const uploadAbortRef = useRef<AbortController | null>(null);
   const recordingRetryTimerRef = useRef<number | null>(null);
   const recordingRetryAttemptRef = useRef(0);
+  const recordingRetryContextRef = useRef<RecordingRetryContext | null>(null);
+  const pendingRecordingRestorePromiseRef = useRef<Promise<PendingRecording | null> | null>(
+    null
+  );
+  const pendingRecordingGenerationRef = useRef(0);
+  const pendingRecordingIdRef = useRef<string | null>(null);
+  const ownedPendingRecordingIdsRef = useRef<Set<string>>(new Set());
+  const preserveRetryBudgetForNextAnalysisRef = useRef(false);
   const autoStartSuppressedRef = useRef(false);
   const pendingRecordingAccessRef = useRef<number | null>(null);
   // Switching recordings detaches the UI, never cancels a server-side workflow.
   const selectionVersionRef = useRef(0);
   const pollingVersionRef = useRef(0);
   const pollingInFlightRef = useRef<number | null>(null);
+  const analyzeSelectedFileRef = useRef<
+    ((selected: File, retrying: boolean) => Promise<void>) | null
+  >(null);
+  analyzeSelectedFileRef.current = analyzeSelectedFile;
 
   useEffect(() => {
     void getRuntime()
@@ -250,6 +277,12 @@ export function App() {
   useEffect(() => {
     const saved = loadPersistedWorkflow();
     const resumableWorkflowId = saved?.workflowId || workflowIdFromUrl();
+    const serverAcceptedRecording = Boolean(
+      resumableWorkflowId ||
+        saved?.stagedUploadId ||
+        saved?.cloudRecordingId ||
+        saved?.optimizedPackage
+    );
     if (saved) {
       setSourceName(saved.sourceName);
       setSourceBytes(saved.sourceBytes);
@@ -266,6 +299,62 @@ export function App() {
     } else if (saved) {
       setStage("ready");
     }
+
+    if (serverAcceptedRecording) {
+      return;
+    }
+
+    let active = true;
+    const restoreGeneration = pendingRecordingGenerationRef.current;
+    const restorePromise =
+      pendingRecordingRestorePromiseRef.current ??
+      loadPendingRecording().catch(() => null);
+    pendingRecordingRestorePromiseRef.current = restorePromise;
+    void restorePromise.then((pending) => {
+      if (
+        !active ||
+        !pending ||
+        restoreGeneration !== pendingRecordingGenerationRef.current
+      ) {
+        return;
+      }
+      clearPersistedWorkflow();
+      setWorkflowUrl(null);
+      pendingRecordingIdRef.current = pending.id;
+      ownedPendingRecordingIdsRef.current.add(pending.id);
+      const restoredRetryAttempts = Math.min(
+        pending.retryAttempts,
+        RECORDING_UPLOAD_RETRY_DELAYS_MS.length
+      );
+      const retryBudgetExhausted =
+        restoredRetryAttempts >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length;
+      recordingRetryAttemptRef.current = restoredRetryAttempts;
+      preserveRetryBudgetForNextAnalysisRef.current = !retryBudgetExhausted;
+      setFile(pending.file);
+      setSourceName(pending.file.name);
+      setSourceBytes(pending.file.size);
+      setScan(null);
+      setRecommendation(null);
+      setStagedUploadId(null);
+      setCloudRecordingId(null);
+      setOptimizedPackage(null);
+      setSaveBaseName(baseNameFromFile(pending.file.name));
+      setSameRecordingRetryAvailable(retryBudgetExhausted);
+      setRecordingRetryNotice(
+        retryBudgetExhausted
+          ? "자동 연결 확인을 마쳤습니다. 녹음은 이 기기에 그대로 있습니다."
+          : "녹음 완료 · 저장된 녹음으로 전사 준비를 계속하고 있습니다."
+      );
+      setError(
+        retryBudgetExhausted
+          ? "서버 연결 후 아래 버튼을 한 번 누르면 같은 녹음으로 계속합니다."
+          : null
+      );
+      setStage(retryBudgetExhausted ? "failed" : "idle");
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const shareMode = Boolean(runtime?.gemini_share_enabled);
@@ -323,7 +412,9 @@ export function App() {
     ) {
       return;
     }
-    void analyzeSelectedFile(file);
+    const preserveRetryBudget = preserveRetryBudgetForNextAnalysisRef.current;
+    preserveRetryBudgetForNextAnalysisRef.current = false;
+    void analyzeSelectedFile(file, preserveRetryBudget);
   }, [
     file,
     keyReady,
@@ -346,6 +437,27 @@ export function App() {
     const timer = window.setTimeout(() => void startTranscription(), 0);
     return () => window.clearTimeout(timer);
   }, [canStart, stage]);
+
+  useEffect(() => {
+    const handleOnline = () => runScheduledRecordingRetryIfReady();
+    const handleOffline = () => clearRecordingRetryTimer();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        runScheduledRecordingRetryIfReady();
+      } else {
+        clearRecordingRetryTimer();
+      }
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
 
   useEffect(() => {
     if (stage !== "complete" || !transcript || !activeWorkflowId) return;
@@ -742,6 +854,18 @@ export function App() {
 
   async function selectFile(selected: File) {
     resetFile();
+    const recordingGeneration = pendingRecordingGenerationRef.current;
+    const recordingId = createPendingRecordingId();
+    ownedPendingRecordingIdsRef.current.add(recordingId);
+    recordingRetryAttemptRef.current = 0;
+    const persisted = await preservePendingRecording(selected, recordingId);
+    if (recordingGeneration !== pendingRecordingGenerationRef.current) return;
+    pendingRecordingIdRef.current = recordingId;
+    if (persisted) {
+      // The single IndexedDB slot now contains this recording, so older owned IDs
+      // cannot be the stored value anymore.
+      ownedPendingRecordingIdsRef.current = new Set([recordingId]);
+    }
     setFile(selected);
     setSourceName(selected.name);
     setSourceBytes(selected.size);
@@ -809,6 +933,23 @@ export function App() {
       const recorder = mimeType
         ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 64000 })
         : new MediaRecorder(stream);
+      let finalized = false;
+      let recordingErrorMessage: string | undefined;
+      let errorFinalizeTimer: number | null = null;
+      const recordingFromAvailableChunks = () => {
+        const chunks = recordingChunksRef.current;
+        const recordedType = recorder.mimeType || mimeType || chunks[0]?.type || "audio/webm";
+        return chunks.length ? new Blob(chunks, { type: recordedType }) : null;
+      };
+      const finalizeRecording = (recording: Blob | null, message?: string) => {
+        if (finalized) return;
+        finalized = true;
+        if (errorFinalizeTimer !== null) {
+          window.clearTimeout(errorFinalizeTimer);
+          errorFinalizeTimer = null;
+        }
+        void finishDirectRecording(recording, message);
+      };
       mediaRecorderRef.current = recorder;
       recordingChunksRef.current = [];
       recordingStartedAtRef.current = Date.now();
@@ -817,18 +958,36 @@ export function App() {
         if (event.data.size > 0) recordingChunksRef.current.push(event.data);
       };
       recorder.onerror = () => {
-        finishDirectRecording(
-          null,
-          "녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요."
-        );
+        recordingErrorMessage =
+          "녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요.";
+        endRecordingFocusMode();
+        setRecordingState("stopping");
+        if (errorFinalizeTimer === null) {
+          errorFinalizeTimer = window.setTimeout(
+            () => finalizeRecording(recordingFromAvailableChunks(), recordingErrorMessage),
+            RECORDER_ERROR_FINALIZE_DELAY_MS
+          );
+        }
+        try {
+          recorder.requestData();
+        } catch {
+          // A stopped recorder may still deliver its final dataavailable event.
+        }
+        if (recorder.state !== "inactive") {
+          try {
+            recorder.stop();
+          } catch {
+            // The bounded fallback above preserves any chunks already delivered.
+          }
+        }
       };
       recorder.onstop = () => {
-        const chunks = recordingChunksRef.current;
-        const recordedType = recorder.mimeType || mimeType || chunks[0]?.type || "audio/webm";
-        const recording = chunks.length ? new Blob(chunks, { type: recordedType }) : null;
-        finishDirectRecording(recording);
+        finalizeRecording(recordingFromAvailableChunks(), recordingErrorMessage);
       };
       recorder.start(1000);
+      pendingRecordingGenerationRef.current += 1;
+      recordingRetryAttemptRef.current = 0;
+      preserveRetryBudgetForNextAnalysisRef.current = false;
       if (replaceCurrent) resetFile();
       setRecordingState("recording");
     } catch (recordingError) {
@@ -852,7 +1011,7 @@ export function App() {
     recorder.stop();
   }
 
-  function finishDirectRecording(
+  async function finishDirectRecording(
     recording: Blob | null,
     emptyRecordingError = "녹음된 음성이 없습니다. 다시 녹음해 주세요."
   ) {
@@ -861,8 +1020,9 @@ export function App() {
     recordingStartedAtRef.current = null;
     recordingChunksRef.current = [];
     stopRecordingStream();
-    setRecordingState("idle");
+    setRecordingState("stopping");
     if (!recording || recording.size === 0) {
+      setRecordingState("idle");
       setError(emptyRecordingError);
       return;
     }
@@ -872,7 +1032,8 @@ export function App() {
       `PhoneScribe_${recordingTimestampForName(new Date())}.${extension}`,
       { type: recording.type, lastModified: Date.now() }
     );
-    void selectFile(recordedFile);
+    await selectFile(recordedFile);
+    setRecordingState("idle");
   }
 
   function stopRecordingStream() {
@@ -889,13 +1050,14 @@ export function App() {
 
   function clearRecordingRetryState() {
     clearRecordingRetryTimer();
+    recordingRetryContextRef.current = null;
     recordingRetryAttemptRef.current = 0;
     setRecordingRetryScheduled(false);
     setRecordingRetryNotice(null);
     setSameRecordingRetryAvailable(false);
   }
 
-  function scheduleRecordingRetry(selected: File, selectionVersion: number) {
+  async function scheduleRecordingRetry(selected: File, selectionVersion: number) {
     if (selectionVersion !== selectionVersionRef.current) return;
     clearRecordingRetryTimer();
     setStage("analyzing");
@@ -905,6 +1067,7 @@ export function App() {
 
     const retryIndex = recordingRetryAttemptRef.current;
     if (retryIndex >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length) {
+      recordingRetryContextRef.current = null;
       setStage("failed");
       setRecordingRetryScheduled(false);
       setSameRecordingRetryAvailable(true);
@@ -917,26 +1080,66 @@ export function App() {
     const delayMs =
       RECORDING_UPLOAD_RETRY_DELAYS_MS[retryIndex];
     recordingRetryAttemptRef.current = retryIndex + 1;
+    await persistPendingRecordingRetryAttempts(retryIndex + 1);
+    if (selectionVersion !== selectionVersionRef.current) return;
     setRecordingRetryScheduled(true);
     setRecordingRetryNotice(
-      "녹음 완료 · 전사 준비 중입니다. 연결되는 즉시 자동으로 계속합니다."
+      "녹음 완료 · 연결을 확인하고 있습니다. 최대 4회 확인 후 같은 녹음 재시도 버튼을 표시합니다."
     );
-    recordingRetryTimerRef.current = window.setTimeout(() => {
-      recordingRetryTimerRef.current = null;
-      if (selectionVersion !== selectionVersionRef.current) return;
-      setRecordingRetryScheduled(false);
-      setRecordingRetryNotice("녹음 완료 · 전사 준비를 계속하고 있습니다.");
-      void analyzeSelectedFile(selected, true);
-    }, delayMs);
+    recordingRetryContextRef.current = { file: selected, selectionVersion, delayMs };
+    armRecordingRetryTimer();
   }
 
-  function retrySameRecording() {
-    if (!file || analysisStartingRef.current || !sameRecordingRetryAvailable) return;
+  function armRecordingRetryTimer() {
+    const retry = recordingRetryContextRef.current;
+    if (
+      !retry ||
+      recordingRetryTimerRef.current !== null ||
+      navigator.onLine === false ||
+      document.visibilityState !== "visible"
+    ) {
+      return;
+    }
+    recordingRetryTimerRef.current = window.setTimeout(
+      runScheduledRecordingRetryIfReady,
+      retry.delayMs
+    );
+  }
+
+  function runScheduledRecordingRetryIfReady() {
+    const retry = recordingRetryContextRef.current;
+    if (
+      !retry ||
+      analysisStartingRef.current ||
+      navigator.onLine === false ||
+      document.visibilityState !== "visible"
+    ) {
+      return;
+    }
     clearRecordingRetryTimer();
+    recordingRetryContextRef.current = null;
+    if (retry.selectionVersion !== selectionVersionRef.current) {
+      setRecordingRetryScheduled(false);
+      return;
+    }
+    setRecordingRetryScheduled(false);
+    setRecordingRetryNotice("녹음 완료 · 전사 준비를 계속하고 있습니다.");
+    void analyzeSelectedFileRef.current?.(retry.file, true);
+  }
+
+  async function retrySameRecording() {
+    if (!file || analysisStartingRef.current || !sameRecordingRetryAvailable) return;
+    const selectionVersion = selectionVersionRef.current;
+    const selected = file;
+    clearRecordingRetryTimer();
+    recordingRetryContextRef.current = null;
     recordingRetryAttemptRef.current = 0;
     setRecordingRetryScheduled(false);
+    setSameRecordingRetryAvailable(false);
     setRecordingRetryNotice("같은 녹음으로 지금 다시 시도하고 있습니다.");
-    void analyzeSelectedFile(file, true);
+    await persistPendingRecordingRetryAttempts(0);
+    if (selectionVersion !== selectionVersionRef.current) return;
+    void analyzeSelectedFile(selected, true);
   }
 
   async function analyzeSelectedFile(selected: File, retrying = false) {
@@ -1001,6 +1204,7 @@ export function App() {
             optimizedPackage: null,
             saveBaseName: baseNameFromFile(selected.name)
           });
+          releasePendingRecordingBackupsAfterAcceptance();
 
           workflowStartingRef.current = true;
           try {
@@ -1068,7 +1272,7 @@ export function App() {
           }
           if (isApiTransientError(cloudUploadError)) {
             if (!remoteUploadAccepted) {
-              scheduleRecordingRetry(selected, selectionVersion);
+              await scheduleRecordingRetry(selected, selectionVersion);
             } else {
               setStage("failed");
               setCloudUploadProgress(null);
@@ -1120,6 +1324,7 @@ export function App() {
         optimizedPackage: null,
         saveBaseName: baseNameFromFile(selected.name)
       });
+      releasePendingRecordingBackupsAfterAcceptance();
 
       if (shareMode && keyReady && !autoStartSuppressedRef.current) {
         setCloudUploadNotice(
@@ -1190,7 +1395,7 @@ export function App() {
         return;
       }
       if (isApiTransientError(analysisError) && !remoteUploadAccepted) {
-        scheduleRecordingRetry(selected, selectionVersion);
+        await scheduleRecordingRetry(selected, selectionVersion);
         return;
       }
       setStage("failed");
@@ -1379,6 +1584,47 @@ export function App() {
     setAutoDownloadStatus(null);
     setServerExportStatus(null);
     setStage("idle");
+  }
+
+  async function preservePendingRecording(selected: File, recordingId: string): Promise<boolean> {
+    try {
+      return await waitForPendingRecordingStorage(
+        savePendingRecording(selected, recordingId, 0)
+      );
+    } catch {
+      // The in-memory recording remains usable when browser persistence is unavailable.
+      return false;
+    }
+  }
+
+  async function persistPendingRecordingRetryAttempts(retryAttempts: number): Promise<void> {
+    const recordingId = pendingRecordingIdRef.current;
+    if (!recordingId) return;
+    try {
+      await waitForPendingRecordingStorage(
+        updatePendingRecordingRetryAttempts(recordingId, retryAttempts)
+      );
+    } catch {
+      // The in-memory retry budget remains authoritative for the current page.
+    }
+  }
+
+  function releasePendingRecordingBackupsAfterAcceptance(): void {
+    const recordingIds = new Set(ownedPendingRecordingIdsRef.current);
+    if (pendingRecordingIdRef.current) recordingIds.add(pendingRecordingIdRef.current);
+    ownedPendingRecordingIdsRef.current.clear();
+    pendingRecordingIdRef.current = null;
+    for (const recordingId of recordingIds) {
+      void clearPendingRecordingBackup(recordingId);
+    }
+  }
+
+  async function clearPendingRecordingBackup(recordingId: string): Promise<void> {
+    try {
+      await clearPendingRecording(recordingId);
+    } catch {
+      // Cleanup failure is safe: the exact-ID backup stays available for recovery.
+    }
   }
 
   async function copyTranscript() {
@@ -2462,6 +2708,31 @@ function geminiOptimizerOptions(file?: File): OptimizerOptions {
     speechFilter: true,
     denoise: false
   };
+}
+
+function createPendingRecordingId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function waitForPendingRecordingStorage(operation: Promise<void>): Promise<boolean> {
+  let timeoutId: number | null = null;
+  const timeout = new Promise<boolean>((resolve) => {
+    timeoutId = window.setTimeout(() => resolve(false), PENDING_RECORDING_STORAGE_WAIT_MS);
+  });
+  try {
+    return await Promise.race([
+      operation.then(
+        () => true,
+        () => false
+      ),
+      timeout
+    ]);
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
 }
 
 function savePersistedWorkflow(workflow: PersistedWorkflow): void {
