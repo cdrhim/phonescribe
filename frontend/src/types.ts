@@ -136,6 +136,15 @@ export interface GeminiTranscriptChunk {
   mime_type: string;
 }
 
+export type TranscriptArtifactKind = "organized" | "summary";
+
+export interface TranscriptArtifact {
+  kind: TranscriptArtifactKind;
+  text: string;
+  txt_url: string;
+  source_sha256: string;
+}
+
 export interface GeminiTranscriptResult {
   provider: "gemini";
   model: string;
@@ -145,6 +154,7 @@ export interface GeminiTranscriptResult {
   chunks: GeminiTranscriptChunk[];
   txt_url: string;
   json_url: string;
+  artifacts?: Partial<Record<TranscriptArtifactKind, TranscriptArtifact>>;
 }
 
 export interface GeminiTranscriptionProgress {

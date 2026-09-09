@@ -40,6 +40,12 @@ from local_meetscribe.cloud.supabase import (
 from local_meetscribe.config import Settings, ensure_runtime_dirs, get_settings
 from local_meetscribe.db import JobStore
 from local_meetscribe.pipeline.asr import has_cuda_runtime
+from local_meetscribe.pipeline.derivatives import (
+    ARTIFACT_FILENAMES,
+    TranscriptArtifactResult,
+    create_transcript_artifact,
+    read_stored_transcript_artifacts,
+)
 from local_meetscribe.pipeline.export import write_exports
 from local_meetscribe.pipeline.gemini import (
     GeminiTranscriptionProgress,
@@ -1349,6 +1355,21 @@ def create_app(
             )
         return response
 
+    @app.post("/api/optimizer/packages/{package_id}/transcript-artifacts/{kind}")
+    def prepare_transcript_artifact(package_id: str, kind: str) -> dict[str, object]:
+        if not re.fullmatch(r"[a-f0-9]{32}", package_id):
+            raise HTTPException(status_code=404, detail="Transcript not found.")
+        if kind not in ARTIFACT_FILENAMES:
+            raise HTTPException(status_code=404, detail="Transcript result type not found.")
+        package_dir = active_settings.data_dir / "optimized" / package_id
+        if not (package_dir / "gemini_transcript.txt").exists():
+            raise HTTPException(status_code=409, detail="The transcript is not ready yet.")
+        try:
+            result = create_transcript_artifact(package_dir, kind)
+        except LocalMeetScribeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _transcript_artifact_payload(result, package_id)
+
     @app.get("/api/optimizer/packages/{package_id}/{filename}")
     def download_optimizer_package_file(
         package_id: str,
@@ -1359,7 +1380,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Optimized package file not found.")
         allowed = re.fullmatch(
             r"(chunk_\d{3}\.(mp3|m4a|ogg)|manifest\.json|optimized_package\.zip|"
-            r"gemini_transcript\.(json|txt))",
+            r"gemini_transcript\.(json|txt)|meeting_(organized|summary)\.txt)",
             filename,
         )
         if not allowed:
@@ -2150,6 +2171,10 @@ def _stored_gemini_transcript_payload(
         for item in chunks
         if isinstance(item, dict)
     ]
+    artifacts = {
+        kind: _transcript_artifact_payload(result, package_id)
+        for kind, result in read_stored_transcript_artifacts(package_dir).items()
+    }
     return {
         "provider": "gemini",
         "model": payload.get("model"),
@@ -2159,6 +2184,19 @@ def _stored_gemini_transcript_payload(
         "chunks": public_chunks,
         "txt_url": f"/api/optimizer/packages/{package_id}/gemini_transcript.txt",
         "json_url": f"/api/optimizer/packages/{package_id}/gemini_transcript.json",
+        "artifacts": artifacts,
+    }
+
+
+def _transcript_artifact_payload(
+    result: TranscriptArtifactResult,
+    package_id: str,
+) -> dict[str, object]:
+    return {
+        "kind": result.kind,
+        "text": result.text,
+        "source_sha256": result.source_sha256,
+        "txt_url": f"/api/optimizer/packages/{package_id}/{result.txt_path.name}",
     }
 
 

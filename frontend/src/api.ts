@@ -4,6 +4,8 @@ import type {
   ExportKind,
   GeminiTranscriptionProgress,
   GeminiTranscriptResult,
+  TranscriptArtifact,
+  TranscriptArtifactKind,
   JobRecord,
   Language,
   Mode,
@@ -61,7 +63,7 @@ const MAX_CLOUD_PART_SIZE_BYTES = 6 * 1024 * 1024;
 const CLOUD_UPLOAD_RETRY_DELAYS_MS = [0, 1000, 3000, 5000, 10000, 20000];
 const CLOUD_UPLOAD_ATTEMPT_TIMEOUT_MS = 120000;
 const API_NETWORK_ERROR_MESSAGE =
-  "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다.";
+  "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 자동으로 다시 시도합니다.";
 let apiAccessToken: string | null = restoreApiAccessToken();
 
 export class ApiRequestError extends Error {
@@ -418,6 +420,16 @@ export function getTranscriptionWorkflow(
   return request<TranscriptionWorkflowStatus>(`/api/workflows/${workflowId}`, {
     cache: "no-store"
   });
+}
+
+export function createTranscriptArtifact(
+  packageId: string,
+  kind: TranscriptArtifactKind
+): Promise<TranscriptArtifact> {
+  return request<TranscriptArtifact>(
+    `/api/optimizer/packages/${packageId}/transcript-artifacts/${kind}`,
+    { method: "POST" }
+  );
 }
 
 export function verifyGeminiSharePasscode(

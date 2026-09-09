@@ -57,7 +57,7 @@ describe("cloud signed PUT uploader", () => {
     expect(
       isApiTransientError(
         new Error(
-          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다."
+          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 자동으로 다시 시도합니다."
         )
       )
     ).toBe(true);

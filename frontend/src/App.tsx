@@ -1,4 +1,5 @@
 import {
+  AlignLeft,
   AlertCircle,
   Check,
   CheckCircle2,
@@ -17,6 +18,7 @@ import {
   RefreshCw,
   ShieldCheck,
   Smartphone,
+  Sparkles,
   Square
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -28,6 +30,7 @@ import {
   configureGeminiShareKey,
   createCloudUploadDescriptor,
   createOptimizerPackage,
+  createTranscriptArtifact,
   downloadApiFile,
   getTranscriptionWorkflow,
   getRuntime,
@@ -45,6 +48,8 @@ import type {
   OptimizerRecommendationResponse,
   QuickScanResult,
   RuntimeProfile,
+  TranscriptArtifact,
+  TranscriptArtifactKind,
   TranscriptionWorkflowStatus
 } from "./types";
 
@@ -60,6 +65,7 @@ type WorkflowStage =
 type NamingMode = "original" | "recommended" | "custom";
 type RecordingState = "idle" | "starting" | "recording" | "stopping";
 type WakeLockStatus = "idle" | "requesting" | "active" | "unavailable" | "released";
+type TranscriptView = "raw" | TranscriptArtifactKind;
 
 const workflowSteps = ["분석", "최적화", "전사", "완료"];
 const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
@@ -100,6 +106,11 @@ export function App() {
   const [optimizedPackage, setOptimizedPackage] =
     useState<OptimizedPackageResult | null>(null);
   const [transcript, setTranscript] = useState<GeminiTranscriptResult | null>(null);
+  const [transcriptArtifacts, setTranscriptArtifacts] = useState<
+    Partial<Record<TranscriptArtifactKind, TranscriptArtifact>>
+  >({});
+  const [transcriptView, setTranscriptView] = useState<TranscriptView>("raw");
+  const [artifactLoading, setArtifactLoading] = useState<TranscriptArtifactKind | null>(null);
   const [geminiApiKey, setGeminiApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [sharePasscode, setSharePasscode] = useState("");
@@ -119,6 +130,7 @@ export function App() {
     useState<GeminiTranscriptionProgress | null>(null);
   const [wakeLockStatus, setWakeLockStatus] = useState<WakeLockStatus>("idle");
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
+  const [activePackageId, setActivePackageId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
@@ -231,6 +243,10 @@ export function App() {
   const safeSaveBaseName =
     sanitizeDownloadBaseName(saveBaseName) ||
     baseNameFromFile(displaySourceName || "transcript");
+  const activeTranscriptArtifact =
+    transcriptView === "raw" ? null : transcriptArtifacts[transcriptView] || null;
+  const activeTranscriptText = activeTranscriptArtifact?.text || transcript?.text || "";
+  const transcriptPreview = previewTranscriptText(activeTranscriptText);
 
   useEffect(() => {
     if (
@@ -258,7 +274,6 @@ export function App() {
 
   useEffect(() => {
     if (
-      !shareMode ||
       stage !== "ready" ||
       !canStart ||
       autoStartSuppressedRef.current
@@ -267,7 +282,7 @@ export function App() {
     }
     const timer = window.setTimeout(() => void startTranscription(), 0);
     return () => window.clearTimeout(timer);
-  }, [canStart, shareMode, stage]);
+  }, [canStart, stage]);
 
   useEffect(() => {
     if (stage !== "complete" || !transcript || !activeWorkflowId) return;
@@ -497,6 +512,7 @@ export function App() {
 
   function applyWorkflowStatus(workflow: TranscriptionWorkflowStatus) {
     setActiveWorkflowId(workflow.workflow_id);
+    setActivePackageId(workflow.package_id);
     if (workflow.package) {
       setOptimizedPackage(workflow.package);
       setStagedUploadId(null);
@@ -537,6 +553,8 @@ export function App() {
           : workflow.auto_export_error || null
       );
       setTranscript(workflow.transcript);
+      setTranscriptArtifacts(workflow.transcript.artifacts || {});
+      setTranscriptView("raw");
       if (namingMode === "recommended") {
         setSaveBaseName(workflow.transcript.suggested_filename);
       }
@@ -557,7 +575,7 @@ export function App() {
       setGeminiApiKey("");
       setShowKeySetup(false);
       setShareAccessReady(true);
-      setShareStatus("기본 키 저장 완료 · 녹음을 종료하고 전사를 시작하면 TXT 저장까지 이어집니다.");
+      setShareStatus("기본 키 저장 완료 · 녹음을 종료하면 전사와 TXT 저장이 자동 진행됩니다.");
     } catch (saveError) {
       setShareAccessReady(false);
       setError(
@@ -846,6 +864,7 @@ export function App() {
             );
             if (selectionVersion !== selectionVersionRef.current) return;
             setActiveWorkflowId(workflow.workflow_id);
+            setActivePackageId(workflow.package_id);
             setWorkflowUrl(workflow.workflow_id);
             savePersistedWorkflow({
               version: 1,
@@ -872,7 +891,7 @@ export function App() {
             }
             setStage("failed");
             setCloudUploadNotice(
-              "녹음 준비 완료 · 전사 작업을 다시 시작할 수 있습니다."
+              "녹음 준비 완료 · 전사 작업을 다시 처리할 수 있습니다."
             );
             setError(
               workflowError instanceof Error
@@ -967,6 +986,7 @@ export function App() {
           );
           if (selectionVersion !== selectionVersionRef.current) return;
           setActiveWorkflowId(workflow.workflow_id);
+          setActivePackageId(workflow.package_id);
           setWorkflowUrl(workflow.workflow_id);
           savePersistedWorkflow({
             version: 1,
@@ -1029,7 +1049,7 @@ export function App() {
       setRecordingRetryNotice(
         remoteUploadAccepted
           ? null
-          : "녹음은 이 기기에 그대로 있습니다. 같은 녹음으로 다시 시도를 눌러 즉시 이어갈 수 있습니다."
+          : "녹음은 이 기기에 그대로 있습니다. 같은 녹음으로 다시 시도할 수 있습니다."
       );
       setError(
         analysisError instanceof Error
@@ -1054,6 +1074,9 @@ export function App() {
     stopProgressPolling();
     setError(null);
     setTranscript(null);
+    setTranscriptArtifacts({});
+    setTranscriptView("raw");
+    setArtifactLoading(null);
     setCopied(false);
     setTranscriptionProgress(null);
     setAutoDownloadStatus(null);
@@ -1081,6 +1104,7 @@ export function App() {
       );
       if (selectionVersion !== selectionVersionRef.current) return;
       setActiveWorkflowId(workflow.workflow_id);
+      setActivePackageId(workflow.package_id);
       setWorkflowUrl(workflow.workflow_id);
       savePersistedWorkflow({
         version: 1,
@@ -1188,22 +1212,60 @@ export function App() {
     setCloudUploadNotice(null);
     setOptimizedPackage(null);
     setTranscript(null);
+    setTranscriptArtifacts({});
+    setTranscriptView("raw");
+    setArtifactLoading(null);
     setError(null);
     setCopied(false);
     setNamingMode("original");
     setSaveBaseName("");
     setTranscriptionProgress(null);
     setActiveWorkflowId(null);
+    setActivePackageId(null);
     setAutoDownloadStatus(null);
     setServerExportStatus(null);
     setStage("idle");
   }
 
   async function copyTranscript() {
-    if (!transcript) return;
-    await navigator.clipboard.writeText(transcript.text);
+    if (!activeTranscriptText) return;
+    await navigator.clipboard.writeText(activeTranscriptText);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1800);
+  }
+
+  async function prepareTranscriptVersion(kind: TranscriptArtifactKind) {
+    if (!transcript || !activePackageId || artifactLoading) return;
+    const existing = transcriptArtifacts[kind];
+    if (existing) {
+      setTranscriptView(kind);
+      setCopied(false);
+      return;
+    }
+
+    const selectionVersion = selectionVersionRef.current;
+    setArtifactLoading(kind);
+    setError(null);
+    try {
+      const artifact = await createTranscriptArtifact(activePackageId, kind);
+      if (selectionVersion !== selectionVersionRef.current) return;
+      setTranscriptArtifacts((current) => ({ ...current, [kind]: artifact }));
+      setTranscriptView(kind);
+      setCopied(false);
+    } catch (artifactError) {
+      if (selectionVersion !== selectionVersionRef.current) return;
+      if (isApiAuthenticationError(artifactError)) {
+        requireAccessReconnect();
+        return;
+      }
+      setError(
+        artifactError instanceof Error
+          ? artifactError.message
+          : "선택한 미팅록을 만들지 못했습니다."
+      );
+    } finally {
+      if (selectionVersion === selectionVersionRef.current) setArtifactLoading(null);
+    }
   }
 
   async function downloadResult(url: string, downloadName: string) {
@@ -1233,7 +1295,7 @@ export function App() {
     setError(
       activeWorkflowId
         ? "PC 작업은 보존되어 있습니다. 비밀번호를 다시 확인하면 결과를 바로 가져옵니다."
-        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 이어서 진행됩니다."
+        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 자동으로 진행됩니다."
     );
     stopProgressPolling();
   }
@@ -1284,7 +1346,7 @@ export function App() {
               <span>
                 {activeWorkflowId
                   ? "PC의 작업은 그대로 있습니다. 비밀번호만 다시 확인하세요."
-                  : "현재 녹음을 유지한 채 이어서 진행합니다."}
+                  : "현재 녹음을 유지한 채 자동으로 진행합니다."}
               </span>
             </div>
             <label className="secret-input single">
@@ -1314,7 +1376,7 @@ export function App() {
               ) : (
                 <ShieldCheck size={17} />
               )}
-              {activeWorkflowId ? "확인하고 결과 받기" : "확인하고 이어서 진행"}
+              {activeWorkflowId ? "확인하고 결과 받기" : "비밀번호 확인"}
             </button>
           </form>
         )}
@@ -1334,8 +1396,8 @@ export function App() {
                 </strong>
                 <span>{formatClock(recordingElapsedSec)}</span>
                 <small>
-                  {recordingWakeLockMessage(wakeLockStatus)} 녹음 종료 및 전사 시작을 누르면
-                  전사와 TXT 저장까지 이어집니다.
+                  {recordingWakeLockMessage(wakeLockStatus)} 녹음을 종료하면 전사와 TXT 저장이
+                  자동으로 진행됩니다.
                 </small>
               </div>
               <button
@@ -1356,7 +1418,7 @@ export function App() {
             <div className="drop-zone recording-only-zone">
               <Mic size={28} />
               <strong>지금 바로 녹음을 시작하세요</strong>
-              <span>녹음 종료 및 전사 시작을 누르면 전사와 TXT 저장까지 이어집니다.</span>
+              <span>한 번 녹음하면 전사, 미팅록 확인, TXT 저장까지 자동으로 진행됩니다.</span>
               <button
                 className="direct-record-button"
                 type="button"
@@ -1416,7 +1478,7 @@ export function App() {
                 <span style={{ width: `${Math.round(cloudUploadProgress * 100)}%` }} />
               </div>
               <div className="progress-meta">
-                <span>연결이 흔들리면 현재 조각의 연결만 다시 확인하고 이어집니다.</span>
+                <span>연결이 흔들리면 현재 조각부터 자동으로 다시 확인합니다.</span>
               </div>
             </div>
           )}
@@ -1668,7 +1730,7 @@ export function App() {
               <CheckCircle2 className="completion-icon" size={32} aria-hidden="true" />
               <div>
                 <h2 id="completion-title">전사 완료</h2>
-                <p>전사문이 준비되었습니다.</p>
+                <p>미팅록을 화면에서 확인하고 TXT로 받을 수 있습니다.</p>
               </div>
               <button
                 className="completion-download-button"
@@ -1678,7 +1740,7 @@ export function App() {
                 }
               >
                 <Download size={17} />
-                TXT 다운로드
+                원문 TXT 다운로드
               </button>
             </div>
           ) : (
@@ -1690,7 +1752,7 @@ export function App() {
                 onClick={() => void startTranscription()}
               >
                 {busy ? <Loader2 className="spin" size={20} /> : <Play size={20} />}
-                {primaryActionLabel(stage, Boolean(optimizedPackage))}
+                {primaryActionLabel(stage)}
               </button>
               <p className="action-note">
                 {actionStatus(stage, keyReady, hasSource, shareMode)}
@@ -1718,31 +1780,12 @@ export function App() {
           )}
         </section>
 
-        {optimizedPackage && !transcript && (
-          <div className="resume-line">
-            <CheckCircle2 size={17} />
-            <span>
-              오디오 최적화 완료 · {optimizedPackage.chunks.length}개 파일
-            </span>
-            <button
-              type="button"
-              onClick={() =>
-                void downloadResult(
-                  optimizedPackage.package_url,
-                  `${safeSaveBaseName}_audio.zip`
-                )
-              }
-            >
-              ZIP
-            </button>
-          </div>
-        )}
-
         {transcript && (
           <section className="result-section">
             <div className="result-header">
               <div>
-                <h2>{safeSaveBaseName}</h2>
+                <p className="result-kicker">미팅록 미리보기</p>
+                <h2>{transcriptViewLabel(transcriptView)}</h2>
                 {autoDownloadStatus && (
                   <p className="auto-download-status">{autoDownloadStatus}</p>
                 )}
@@ -1757,98 +1800,164 @@ export function App() {
                 >
                   {copied ? <Check size={18} /> : <Clipboard size={18} />}
                 </button>
-                <button
-                  className="download-button"
-                  type="button"
-                  onClick={() =>
-                    void downloadResult(transcript.json_url, `${safeSaveBaseName}.json`)
-                  }
-                >
-                  <Download size={16} />
-                  JSON
-                </button>
               </div>
             </div>
 
-            <div className="naming-panel">
-              <div className="naming-heading">
-                <FilePenLine size={17} />
-                <div>
-                  <strong>저장 파일명</strong>
-                  <span>전사문, 음원 사본, ZIP에 같은 이름을 사용합니다.</span>
-                </div>
-              </div>
-              <div className="naming-modes" aria-label="파일명 방식">
-                <button
-                  type="button"
-                  className={namingMode === "original" ? "selected" : ""}
-                  onClick={() => chooseNamingMode("original")}
-                >
-                  원본 파일명
-                </button>
-                <button
-                  type="button"
-                  className={namingMode === "recommended" ? "selected" : ""}
-                  onClick={() => chooseNamingMode("recommended")}
-                >
-                  자동 추천
-                </button>
-                <button
-                  type="button"
-                  className={namingMode === "custom" ? "selected" : ""}
-                  onClick={() => chooseNamingMode("custom")}
-                >
-                  직접 입력
-                </button>
-              </div>
-              <input
-                className="filename-input"
-                value={saveBaseName}
-                onChange={(event) => {
-                  setNamingMode("custom");
-                  setSaveBaseName(event.target.value);
+            <div className="transcript-view-tabs" aria-label="미팅록 종류">
+              <button
+                type="button"
+                className={transcriptView === "raw" ? "selected" : ""}
+                aria-pressed={transcriptView === "raw"}
+                onClick={() => {
+                  setTranscriptView("raw");
+                  setCopied(false);
                 }}
-                aria-label="저장 파일명"
-              />
-              <p>
-                추천: <button type="button" onClick={() => chooseNamingMode("recommended")}>
-                  {transcript.suggested_filename}
-                </button>
-              </p>
+              >
+                <FileAudio size={16} />
+                전사 원문
+              </button>
+              <button
+                type="button"
+                className={transcriptView === "organized" ? "selected" : ""}
+                aria-pressed={transcriptView === "organized"}
+                disabled={artifactLoading !== null}
+                onClick={() => void prepareTranscriptVersion("organized")}
+              >
+                {artifactLoading === "organized" ? (
+                  <Loader2 className="spin" size={16} />
+                ) : (
+                  <AlignLeft size={16} />
+                )}
+                {transcriptArtifacts.organized ? "정리본" : "정리본 만들기"}
+              </button>
+              <button
+                type="button"
+                className={transcriptView === "summary" ? "selected" : ""}
+                aria-pressed={transcriptView === "summary"}
+                disabled={artifactLoading !== null}
+                onClick={() => void prepareTranscriptVersion("summary")}
+              >
+                {artifactLoading === "summary" ? (
+                  <Loader2 className="spin" size={16} />
+                ) : (
+                  <Sparkles size={16} />
+                )}
+                {transcriptArtifacts.summary ? "요약본" : "요약본 만들기"}
+              </button>
             </div>
 
-            <div className="save-actions">
-              {originalAudioUrl && file && (
-                <a
-                  className="download-button"
-                  href={originalAudioUrl}
-                  download={`${safeSaveBaseName}${fileExtension(file.name)}`}
-                >
-                  <FileAudio size={16} />
-                  원본 음원 새 이름으로 저장
-                </a>
-              )}
-              {optimizedPackage && (
+            <pre className="transcript-preview">{transcriptPreview.text}</pre>
+            {transcriptPreview.truncated && (
+              <p className="preview-note">화면에는 일부만 표시됩니다. TXT에는 전체 내용이 들어 있습니다.</p>
+            )}
+
+            {activeTranscriptArtifact && (
+              <div className="artifact-download-row">
                 <button
-                  className="download-button"
+                  className="completion-download-button"
                   type="button"
                   onClick={() =>
                     void downloadResult(
-                      optimizedPackage.package_url,
-                      `${safeSaveBaseName}_audio.zip`
+                      activeTranscriptArtifact.txt_url,
+                      transcriptDownloadName(safeSaveBaseName, transcriptView)
                     )
                   }
                 >
                   <Download size={16} />
-                  최적화 ZIP
+                  {transcriptViewLabel(transcriptView)} TXT 다운로드
                 </button>
-              )}
-            </div>
-            <p className="rename-note">
-              브라우저 보안상 기존 음원 파일은 직접 변경하지 않고 새 이름의 사본을
-              저장합니다.
-            </p>
-            <pre className="transcript-preview">{transcript.text}</pre>
+              </div>
+            )}
+
+            <details className="result-tools-details">
+              <summary>파일명 및 기타 저장</summary>
+              <div className="result-tools-content">
+                <div className="naming-panel">
+                  <div className="naming-heading">
+                    <FilePenLine size={17} />
+                    <div>
+                      <strong>저장 파일명</strong>
+                      <span>다운로드할 파일에 같은 기본 이름을 사용합니다.</span>
+                    </div>
+                  </div>
+                  <div className="naming-modes" aria-label="파일명 방식">
+                    <button
+                      type="button"
+                      className={namingMode === "original" ? "selected" : ""}
+                      onClick={() => chooseNamingMode("original")}
+                    >
+                      원본 파일명
+                    </button>
+                    <button
+                      type="button"
+                      className={namingMode === "recommended" ? "selected" : ""}
+                      onClick={() => chooseNamingMode("recommended")}
+                    >
+                      자동 추천
+                    </button>
+                    <button
+                      type="button"
+                      className={namingMode === "custom" ? "selected" : ""}
+                      onClick={() => chooseNamingMode("custom")}
+                    >
+                      직접 입력
+                    </button>
+                  </div>
+                  <input
+                    className="filename-input"
+                    value={saveBaseName}
+                    onChange={(event) => {
+                      setNamingMode("custom");
+                      setSaveBaseName(event.target.value);
+                    }}
+                    aria-label="저장 파일명"
+                  />
+                  <p>
+                    추천: <button type="button" onClick={() => chooseNamingMode("recommended")}>
+                      {transcript.suggested_filename}
+                    </button>
+                  </p>
+                </div>
+
+                <div className="save-actions">
+                  <button
+                    className="download-button"
+                    type="button"
+                    onClick={() =>
+                      void downloadResult(transcript.json_url, `${safeSaveBaseName}.json`)
+                    }
+                  >
+                    <Download size={16} />
+                    JSON
+                  </button>
+                  {originalAudioUrl && file && (
+                    <a
+                      className="download-button"
+                      href={originalAudioUrl}
+                      download={`${safeSaveBaseName}${fileExtension(file.name)}`}
+                    >
+                      <FileAudio size={16} />
+                      원본 음원 사본
+                    </a>
+                  )}
+                  {optimizedPackage && (
+                    <button
+                      className="download-button"
+                      type="button"
+                      onClick={() =>
+                        void downloadResult(
+                          optimizedPackage.package_url,
+                          `${safeSaveBaseName}_audio.zip`
+                        )
+                      }
+                    >
+                      <Download size={16} />
+                      최적화 ZIP
+                    </button>
+                  )}
+                </div>
+              </div>
+            </details>
           </section>
         )}
 
@@ -2011,11 +2120,36 @@ function workflowIndex(stage: WorkflowStage, hasPackage: boolean): number {
   return 0;
 }
 
-function primaryActionLabel(stage: WorkflowStage, hasPackage: boolean): string {
+function transcriptViewLabel(view: TranscriptView): string {
+  if (view === "organized") return "정리본";
+  if (view === "summary") return "요약본";
+  return "전사 원문";
+}
+
+function transcriptDownloadName(baseName: string, view: TranscriptView): string {
+  if (view === "organized") return `${baseName}_정리본.txt`;
+  if (view === "summary") return `${baseName}_요약본.txt`;
+  return `${baseName}.txt`;
+}
+
+function previewTranscriptText(value: string, maxCharacters = 1600): {
+  text: string;
+  truncated: boolean;
+} {
+  const text = value.trim();
+  if (text.length <= maxCharacters) return { text, truncated: false };
+  const newlineBoundary = text.lastIndexOf("\n", maxCharacters);
+  const wordBoundary = text.lastIndexOf(" ", maxCharacters);
+  const preferredBoundary = Math.max(newlineBoundary, wordBoundary);
+  const boundary = preferredBoundary >= maxCharacters * 0.65 ? preferredBoundary : maxCharacters;
+  return { text: `${text.slice(0, boundary).trimEnd()}\n…`, truncated: true };
+}
+
+function primaryActionLabel(stage: WorkflowStage): string {
   if (stage === "analyzing") return "파일 분석 중";
   if (stage === "optimizing") return "오디오 최적화 중";
   if (stage === "transcribing") return "Gemini 전사 중";
-  if (stage === "failed" && hasPackage) return "전사 이어하기";
+  if (stage === "failed") return "다시 처리";
   return "전사 시작";
 }
 
@@ -2023,7 +2157,7 @@ function workflowErrorMessage(error: string | null | undefined): string {
   const detail = error?.trim();
   if (!detail) return "PC 서버 작업을 완료하지 못했습니다.";
   if (/Internal error encountered|temporarily unavailable/i.test(detail)) {
-    return "Gemini 서버가 일시적으로 응답하지 않았습니다. 최적화 음원은 저장되어 있으므로 '전사 이어하기'를 누르면 중단 지점부터 다시 시도합니다.";
+    return "Gemini 서버가 일시적으로 응답하지 않았습니다. 저장된 음원으로 다시 처리할 수 있습니다.";
   }
   return detail;
 }
@@ -2036,8 +2170,8 @@ function actionStatus(
 ): string {
   if (stage === "analyzing") return "녹음 길이와 언어를 빠르게 확인하고 있습니다.";
   if (stage === "optimizing") return "음성을 선명하게 정리하고 안전한 크기로 나눕니다.";
-  if (stage === "transcribing") return "완료된 구간은 저장되므로 중단되어도 이어집니다.";
-  if (stage === "complete") return "전사문을 복사하거나 TXT / JSON으로 내려받으세요.";
+  if (stage === "transcribing") return "완료된 구간을 안전하게 저장하며 계속 처리합니다.";
+  if (stage === "complete") return "미팅록을 확인하거나 TXT로 내려받으세요.";
   if (!hasSource) return "먼저 바로 녹음을 시작하세요.";
   if (!keyReady) {
     return shareMode ? "공유 비밀번호를 입력하세요." : "Gemini API key가 필요합니다.";

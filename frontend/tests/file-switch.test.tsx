@@ -23,6 +23,7 @@ vi.mock("../src/api", async (importOriginal) => ({
   startTranscriptionWorkflow: vi.fn(),
   uploadCloudRecording: vi.fn(),
   createOptimizerPackage: vi.fn(),
+  createTranscriptArtifact: vi.fn(),
   downloadApiFile: vi.fn(),
   verifyGeminiSharePasscode: vi.fn()
 }));
@@ -299,6 +300,40 @@ describe("direct phone recording", () => {
     expect(stopTrack).toHaveBeenCalledOnce();
   });
 
+  it("automatically starts the workflow after analysis with the configured server key", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.getRuntime).mockResolvedValue({
+      ...runtime,
+      gemini_share_enabled: false,
+      gemini_share_ready: false,
+      gemini_transcription_enabled: true,
+      gemini_api_key_configured: true,
+      cloud_upload_enabled: false
+    });
+    vi.mocked(api.analyzeOptimizer).mockResolvedValue(analysis("recorded.webm"));
+    vi.mocked(api.startTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "queued"
+    });
+
+    render(<App />);
+    await recordNow();
+
+    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
+    expect(api.startTranscriptionWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ file: expect.any(File) }),
+      expect.objectContaining({ uploadId: "test-upload" })
+    );
+    const workflowInput = vi.mocked(api.startTranscriptionWorkflow).mock.calls[0][1];
+    expect(workflowInput.apiKey).toBeUndefined();
+    expect(workflowInput.sharePasscode).toBeUndefined();
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBe(OLD_ID);
+    expect(screen.getByText(/서버 작업 접수 완료/)).toBeTruthy();
+  });
+
   it("keeps a restored workflow until replacement recording actually starts", async () => {
     const microphone = deferred<MediaStream>();
     installRecordingBrowser(() => microphone.promise);
@@ -432,7 +467,7 @@ describe("recording transfer retry", () => {
     vi.mocked(api.createCloudUploadDescriptor)
       .mockRejectedValueOnce(
         new Error(
-          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 다시 이어집니다."
+          "서버 연결이 잠시 불안정합니다. 녹음은 이 기기에 그대로 있으며 잠시 후 자동으로 다시 시도합니다."
         )
       )
       .mockResolvedValueOnce(cloudUploadDescriptor());
@@ -590,7 +625,7 @@ describe("recording transfer retry", () => {
     expect(api.uploadCloudRecording).toHaveBeenCalledOnce();
     expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
-    expect(screen.getByText(/녹음 준비 완료 · 전사 작업을 다시 시작/)).toBeTruthy();
+    expect(screen.getByText(/녹음 준비 완료 · 전사 작업을 다시 처리/)).toBeTruthy();
   });
 });
 
@@ -712,14 +747,112 @@ describe("automatic TXT download", () => {
     const heading = await screen.findByRole("heading", { name: "전사 완료" });
     const completionCard = heading.closest('[role="status"]');
     expect(completionCard).not.toBeNull();
-    expect(completionCard?.textContent).toContain("전사문이 준비되었습니다.");
+    expect(completionCard?.textContent).toContain(
+      "미팅록을 화면에서 확인하고 TXT로 받을 수 있습니다."
+    );
     expect(screen.queryByRole("button", { name: "전사 다시 실행" })).toBeNull();
     expect(screen.getByText("완료").closest("div")?.className).toContain("complete");
+    expect(screen.getByText("미팅록 미리보기")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "전사 원문" })).toBeTruthy();
+    expect(screen.getByText("mock transcript")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "정리본 만들기" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "요약본 만들기" })).toBeTruthy();
+    expect(document.body.textContent).not.toContain("이어하기");
 
-    fireEvent.click(screen.getByRole("button", { name: "TXT 다운로드" }));
+    fireEvent.click(screen.getByRole("button", { name: "원문 TXT 다운로드" }));
     await waitFor(() =>
       expect(api.downloadApiFile).toHaveBeenCalledWith("/old.txt", "old-recording.txt")
     );
+  });
+
+  it("creates and downloads an optional organized transcript without replacing the raw text", async () => {
+    seedOldWorkflow();
+    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
+    vi.mocked(api.createTranscriptArtifact).mockResolvedValue({
+      kind: "organized",
+      text: "미팅 정리본\n\n[00:00] 참석자: 첫 번째 발언",
+      source_sha256: "b".repeat(64),
+      txt_url: "/organized.txt"
+    });
+    vi.mocked(api.downloadApiFile).mockResolvedValue();
+
+    render(<App />);
+
+    expect(await screen.findByText("mock transcript")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "정리본 만들기" }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".transcript-preview")?.textContent).toBe(
+        "미팅 정리본\n\n[00:00] 참석자: 첫 번째 발언"
+      )
+    );
+    expect(api.createTranscriptArtifact).toHaveBeenCalledWith(OLD_ID, "organized");
+    expect(screen.getByRole("heading", { name: "정리본" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "정리본 TXT 다운로드" }));
+    await waitFor(() =>
+      expect(api.downloadApiFile).toHaveBeenCalledWith(
+        "/organized.txt",
+        "old-recording_정리본.txt"
+      )
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "전사 원문" }));
+    expect(screen.getByText("mock transcript")).toBeTruthy();
+  });
+
+  it("creates and downloads an optional summary transcript", async () => {
+    seedOldWorkflow();
+    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
+    vi.mocked(api.createTranscriptArtifact).mockResolvedValue({
+      kind: "summary",
+      text: "미팅 요약본\n\n- 핵심 합의 사항",
+      source_sha256: "c".repeat(64),
+      txt_url: "/summary.txt"
+    });
+    vi.mocked(api.downloadApiFile).mockResolvedValue();
+
+    render(<App />);
+
+    expect(await screen.findByText("mock transcript")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "요약본 만들기" }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".transcript-preview")?.textContent).toBe(
+        "미팅 요약본\n\n- 핵심 합의 사항"
+      )
+    );
+    expect(api.createTranscriptArtifact).toHaveBeenCalledWith(OLD_ID, "summary");
+    fireEvent.click(screen.getByRole("button", { name: "요약본 TXT 다운로드" }));
+    await waitFor(() =>
+      expect(api.downloadApiFile).toHaveBeenCalledWith(
+        "/summary.txt",
+        "old-recording_요약본.txt"
+      )
+    );
+  });
+
+  it("shows only a shortened on-screen preview while keeping the full TXT action", async () => {
+    seedOldWorkflow();
+    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    const workflow = completedWorkflow();
+    workflow.transcript!.text = "긴 전사 내용 ".repeat(220);
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(workflow);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("화면에는 일부만 표시됩니다. TXT에는 전체 내용이 들어 있습니다.")
+    ).toBeTruthy();
+    const preview = document.querySelector(".transcript-preview");
+    expect(preview?.textContent?.endsWith("…")).toBe(true);
+    expect(preview?.textContent?.length).toBeLessThan(workflow.transcript!.text.length);
+    expect(screen.getByRole("button", { name: "원문 TXT 다운로드" })).toBeTruthy();
   });
 
   it("retries transient failures with bounded backoff until the download succeeds", async () => {

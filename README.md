@@ -107,9 +107,10 @@ its products, so use local ASR or a paid Gemini project for confidential meeting
 
 Meetings longer than 45 minutes are split near silence into roughly 30-minute chunks. Completed
 Gemini chunks are checkpointed locally, temporary quota/server failures retry automatically, and
-pressing `Transcribe with Gemini` again resumes unfinished packages. While transcription is
-running, the page shows completed chunks, the active chunk, percentage, and an ETA calculated
-after the first chunk completes.
+the server recovers unfinished work from its checkpoints. The recording still appears as one
+continuous workflow to the user; there is no separate resume-transcription step. While
+transcription is running, the page shows completed chunks, the active chunk, percentage, and an ETA
+calculated after the first chunk completes.
 
 Gemini calls use the Interactions API. Retryable service failures fall back from the configured
 model to the stable audio-capable `gemini-3.5-flash` and `gemini-3.5-flash-lite` models. Optimized
@@ -117,10 +118,11 @@ audio and completed chunks remain on disk, so a retry does not require another u
 successful chunks.
 
 With the shared passcode flow, enter the passcode, start recording, and press
-`Stop recording and start transcription`. Shared mode skips the optional local language scan so the
-phone only needs to stay awake until the server accepts the job. As soon as progress moves to
-optimization, the PC owns the workflow. The phone screen may turn off or the browser may close;
-reopening the same workflow URL restores progress and results.
+`Stop recording and start transcription`. From that point, upload, optimization, transcription, the
+completion view, and raw TXT preparation run as one flow without another action from the user.
+Shared mode skips the optional local language scan so the phone only needs to stay awake until the
+server accepts the job. As soon as progress moves to optimization, the PC owns the workflow.
+Reopening the same workflow URL restores progress and results.
 
 The phone page offers `Start recording now`. It records from the browser microphone, chooses a
 supported Opus WebM or MP4 audio container, and begins transcription preparation when the user
@@ -160,9 +162,12 @@ gradle -p android-recorder testDebugUnitTest assembleDebug
 GitHub Actions runs the same checks and publishes an installable APK artifact. Tags matching
 `android-v*` additionally create a GitHub Release containing the APK and its SHA-256 checksum.
 
-When the page is visible after completion, the TXT transcript downloads automatically once. The
-network startup script also saves a collision-safe TXT copy to the server PC's
-`Downloads\PhoneScribe` folder, independently of the phone screen state. The
+At completion, the page clearly marks the workflow as finished and shows a short preview of the
+meeting transcript. The full raw transcript remains available through `원문 TXT 다운로드`, and the
+page downloads that TXT automatically once when it is visible. `정리본 만들기` and `요약본 만들기`
+are optional post-completion actions. They create separate TXT files and never overwrite or edit the
+raw transcript. The network startup script also saves a collision-safe raw TXT copy to the server
+PC's `Downloads\PhoneScribe` folder, independently of the phone screen state. The
 page requests a Screen Wake Lock when the browser exposes that API. Standard Wake Lock
 requires HTTPS, so it works with a Tailscale Serve URL but may be unavailable on a plain Wi-Fi
 `http://` address.
@@ -269,7 +274,10 @@ saved independently.
 
 The public phone page is recording-only: it does not expose a file picker, drag-and-drop upload, or
 recent-file recommendation. Press `Start recording now`; stopping the microphone enters the same
-upload and transcription flow automatically.
+upload and transcription flow automatically. Completion shows only a short transcript preview so
+the result is easy to scan; the downloaded raw TXT contains the full transcript. Optional organized
+and summary TXT files are generated separately on request, while the raw transcript remains
+immutable.
 
 After transcription, choose `Original filename`, `Auto recommendation`, or enter a custom basename.
 The selected name is applied to the TXT, JSON, optimized ZIP, and a downloadable copy of the
