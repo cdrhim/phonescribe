@@ -81,6 +81,7 @@ STAGED_UPLOAD_TTL_SEC = 24 * 60 * 60
 CLOUD_CLEANUP_BATCH_SIZE = 25
 CLOUD_CLEANUP_INTERVAL_SEC = 15 * 60
 CLOUD_MAINTENANCE_INTERVAL_SEC = 30
+CLOUD_OUTBOX_BATCH_SIZE = 1
 RECOVERABLE_WORKFLOW_STATUSES = frozenset({"queued", "optimizing", "transcribing"})
 IDEMPOTENT_WORKFLOW_STATUSES = RECOVERABLE_WORKFLOW_STATUSES | {"complete"}
 GEMINI_WORKFLOW_RETRY_BASE_SEC = 30.0
@@ -143,9 +144,15 @@ def create_app(
     gemini_not_before = 0.0
     cloud_outbox_lock = threading.Lock()
     cloud_cleanup_lock = threading.Lock()
+    cloud_outbox_run_gate = threading.BoundedSemaphore(1)
+    cloud_cleanup_run_gate = threading.BoundedSemaphore(1)
+    cloud_outbox_rerun = threading.Event()
+    cloud_cleanup_rerun = threading.Event()
     cloud_cleanup_last_started = float("-inf")
     maintenance_stop = threading.Event()
     maintenance_wake = threading.Event()
+    maintenance_workers: set[threading.Thread] = set()
+    maintenance_workers_lock = threading.Lock()
 
     def current_supabase_client() -> SupabaseCloudClient | None:
         if supabase_client is not None:
@@ -212,7 +219,14 @@ def create_app(
         if client is None:
             return False
         try:
-            payload = _read_json_object(path)
+            with cloud_outbox_lock:
+                payload = _read_json_object(path)
+            delivery_version = (
+                str(payload.get("delivery_id") or ""),
+                str(payload.get("updated_at") or ""),
+                str(payload.get("status") or ""),
+                bool(payload.get("include_transcript")),
+            )
             workflow_id = str(payload.get("workflow_id") or "")
             recording_id = str(payload.get("recording_id") or "")
             package_id = str(payload.get("package_id") or "")
@@ -257,16 +271,35 @@ def create_app(
                     ],
                     suggested_filename=str(transcript.get("suggested_filename") or "transcript"),
                 )
-            _update_json_object(
-                _workflow_state_path(active_settings, workflow_id),
-                {
-                    "cloud_sync_complete": True,
-                    "cloud_synced_at": time.time(),
-                },
-            )
-            path.unlink(missing_ok=True)
+            # A workflow can advance while the network request is in flight. Only
+            # acknowledge the exact snapshot we delivered; a newer state stays in
+            # the durable outbox for the next maintenance pass.
+            with cloud_outbox_lock:
+                if not path.exists():
+                    return True
+                current = _read_json_object(path)
+                current_version = (
+                    str(current.get("delivery_id") or ""),
+                    str(current.get("updated_at") or ""),
+                    str(current.get("status") or ""),
+                    bool(current.get("include_transcript")),
+                )
+                if current_version != delivery_version:
+                    return True
+                _update_json_object(
+                    _workflow_state_path(active_settings, workflow_id),
+                    {
+                        "cloud_sync_complete": True,
+                        "cloud_synced_at": time.time(),
+                    },
+                )
+                path.unlink(missing_ok=True)
             return True
         except Exception as exc:  # noqa: BLE001 - a durable outbox must survive all failures.
+            # Move a failed entry behind older pending entries so one unreachable
+            # workflow cannot starve the rest of the bounded queue.
+            with cloud_outbox_lock, suppress(OSError):
+                path.touch(exist_ok=True)
             LOGGER.warning(
                 "Cloud outbox delivery failed for %s (%s)",
                 path.stem,
@@ -323,11 +356,15 @@ def create_app(
                         "error_message": error,
                         "include_transcript": status == "complete",
                         "updated_at": time.time(),
+                        "delivery_id": uuid.uuid4().hex,
                     },
                 )
-                if attempt_cloud_delivery:
-                    try_flush_cloud_outbox_file(outbox_path, cloud_client)
+                # Network delivery is always performed by a dedicated maintenance
+                # worker. Request and transcription threads only persist the
+                # durable snapshot, so a slow Supabase call cannot hold them.
             maintenance_wake.set()
+            if attempt_cloud_delivery:
+                start_cloud_maintenance()
             return
         _write_workflow_state(
             state_path,
@@ -958,19 +995,81 @@ def create_app(
                     type(exc).__name__,
                 )
 
+    def run_cloud_outbox_batch() -> None:
+        client = current_supabase_client()
+        if client is None or maintenance_stop.is_set():
+            return
+        outbox_dir = active_settings.tmp_dir / "cloud-outbox"
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+
+        def oldest_first(path: Path) -> tuple[float, str]:
+            with suppress(OSError):
+                return path.stat().st_mtime, path.name
+            return float("inf"), path.name
+
+        pending = sorted(outbox_dir.glob("*.json"), key=oldest_first)
+        for outbox_path in pending[:CLOUD_OUTBOX_BATCH_SIZE]:
+            if maintenance_stop.is_set():
+                break
+            try_flush_cloud_outbox_file(outbox_path, client)
+
+    def run_cloud_cleanup() -> None:
+        client = current_supabase_client()
+        if client is not None and not maintenance_stop.is_set():
+            run_cloud_cleanup_if_due(client)
+
+    def launch_maintenance_worker(
+        *,
+        name: str,
+        gate: threading.BoundedSemaphore,
+        rerun_requested: threading.Event,
+        target: Callable[[], None],
+    ) -> None:
+        if maintenance_stop.is_set():
+            return
+        rerun_requested.clear()
+        if not gate.acquire(blocking=False):
+            rerun_requested.set()
+            return
+
+        def run() -> None:
+            try:
+                target()
+            finally:
+                with maintenance_workers_lock:
+                    maintenance_workers.discard(threading.current_thread())
+                gate.release()
+                if rerun_requested.is_set() and not maintenance_stop.is_set():
+                    maintenance_wake.set()
+
+        worker = threading.Thread(target=run, name=name, daemon=True)
+        with maintenance_workers_lock:
+            maintenance_workers.add(worker)
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001 - maintenance must not affect requests.
+            with maintenance_workers_lock:
+                maintenance_workers.discard(worker)
+            gate.release()
+            LOGGER.warning("Could not start cloud maintenance worker (%s)", type(exc).__name__)
+
+    def start_cloud_maintenance() -> None:
+        launch_maintenance_worker(
+            name="phonescribe-cloud-outbox",
+            gate=cloud_outbox_run_gate,
+            rerun_requested=cloud_outbox_rerun,
+            target=run_cloud_outbox_batch,
+        )
+        launch_maintenance_worker(
+            name="phonescribe-cloud-retention",
+            gate=cloud_cleanup_run_gate,
+            rerun_requested=cloud_cleanup_rerun,
+            target=run_cloud_cleanup,
+        )
+
     def maintenance_loop() -> None:
         while not maintenance_stop.is_set():
-            client = current_supabase_client()
-            if client is not None:
-                outbox_dir = active_settings.tmp_dir / "cloud-outbox"
-                outbox_dir.mkdir(parents=True, exist_ok=True)
-                for outbox_path in sorted(outbox_dir.glob("*.json")):
-                    if maintenance_stop.is_set():
-                        break
-                    with cloud_outbox_lock:
-                        try_flush_cloud_outbox_file(outbox_path, client)
-                if not maintenance_stop.is_set():
-                    run_cloud_cleanup_if_due(client)
+            start_cloud_maintenance()
             maintenance_wake.wait(CLOUD_MAINTENANCE_INTERVAL_SEC)
             maintenance_wake.clear()
 
@@ -991,6 +1090,10 @@ def create_app(
             maintenance_stop.set()
             maintenance_wake.set()
             maintenance_thread.join(timeout=2.0)
+            with maintenance_workers_lock:
+                workers = tuple(maintenance_workers)
+            for worker in workers:
+                worker.join(timeout=1.0)
 
     app = FastAPI(title="LocalMeetScribe", version="0.1.0", lifespan=lifespan)
 
@@ -1027,7 +1130,7 @@ def create_app(
     )
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/api/runtime")
@@ -2213,6 +2316,7 @@ def _cloud_outbox_payload_from_state(state: Mapping[str, object]) -> dict[str, o
         "error_message": state.get("error"),
         "include_transcript": status == "complete",
         "updated_at": time.time(),
+        "delivery_id": uuid.uuid4().hex,
     }
 
 

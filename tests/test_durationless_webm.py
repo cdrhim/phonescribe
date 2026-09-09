@@ -211,7 +211,55 @@ def test_optimizer_retries_invalid_silence_filtered_chunk_without_removing_silen
     assert sorted(path.name for path in tmp_path.iterdir()) == ["chunk_001.mp3", "source.webm"]
 
 
-def test_optimizer_preserves_existing_output_when_both_atomic_attempts_are_invalid(
+def test_optimizer_retries_encode_errors_through_safe_preservation_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.webm"
+    source.write_bytes(b"source")
+    output = tmp_path / "chunk_001.mp3"
+    recommendation = optimizer_module.recommend_optimization(
+        MediaInfo(source.name, 1.0, 48000, 1),
+        source.stat().st_size,
+        OptimizerRequest(destination="gemini"),
+    )
+    attempts: list[tuple[bool, bool]] = []
+
+    def fake_encode(**values: object) -> None:
+        attempt_output = values["output_path"]
+        attempt_overrides = values["overrides"]
+        assert isinstance(attempt_output, Path)
+        assert isinstance(attempt_overrides, OptimizerOverrides)
+        attempts.append(
+            (attempt_overrides.remove_silence, attempt_overrides.loudnorm)
+        )
+        if len(attempts) < 3:
+            raise LocalMeetScribeError("audio filter rejected the stream")
+        attempt_output.write_bytes(b"preserved-audio")
+
+    monkeypatch.setattr(optimizer_module, "_encode_ffmpeg_chunk", fake_encode)
+    monkeypatch.setattr(
+        optimizer_module,
+        "_optimized_chunk_is_valid",
+        lambda *_args: True,
+    )
+
+    optimizer_module._run_ffmpeg_chunk(  # noqa: SLF001
+        input_path=source,
+        output_path=output,
+        settings=make_test_settings(tmp_path),
+        recommendation=recommendation,
+        overrides=OptimizerOverrides(),
+        start_sec=0.0,
+        end_sec=1.0,
+    )
+
+    assert attempts == [(True, True), (False, True), (False, False)]
+    assert output.read_bytes() == b"preserved-audio"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["chunk_001.mp3", "source.webm"]
+
+
+def test_optimizer_preserves_existing_output_when_all_atomic_attempts_are_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,7 +290,10 @@ def test_optimizer_preserves_existing_output_when_both_atomic_attempts_are_inval
         lambda *_args: False,
     )
 
-    with pytest.raises(LocalMeetScribeError, match="even after preserving silence"):
+    with pytest.raises(
+        LocalMeetScribeError,
+        match="even after preserving silence",
+    ) as exc_info:
         optimizer_module._run_ffmpeg_chunk(  # noqa: SLF001
             input_path=source,
             output_path=output,
@@ -254,7 +305,9 @@ def test_optimizer_preserves_existing_output_when_both_atomic_attempts_are_inval
         )
 
     assert output.read_bytes() == b"previous-valid-output"
-    assert encode_calls == 2
+    assert encode_calls == 3
+    assert isinstance(exc_info.value.__cause__, LocalMeetScribeError)
+    assert str(exc_info.value.__cause__) == "encoder rejected empty audio"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["chunk_001.mp3", "source.webm"]
 
 
@@ -367,6 +420,53 @@ def test_quiet_durationless_webm_falls_back_to_preserved_audio(tmp_path: Path) -
 
     chunk_path = package.output_dir / package.chunks[0].filename
     assert chunk_path.stat().st_size > 225
+    assert optimizer_module._optimized_chunk_is_valid(chunk_path, settings) is True  # noqa: SLF001
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required for the generated WebM integration fixture",
+)
+def test_silent_durationless_webm_disables_loudnorm_to_preserve_audio(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "silent-browser-recording.webm"
+    generated = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=mono",
+            "-t",
+            "2",
+            "-c:a",
+            "libopus",
+            "-f",
+            "webm",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert generated.returncode == 0
+    source.write_bytes(generated.stdout)
+
+    settings = make_test_settings(tmp_path)
+    package = optimize_audio_package(
+        source,
+        settings.data_dir / "optimized",
+        settings,
+        OptimizerRequest(destination="gemini"),
+        package_id="silent-durationless-webm",
+    )
+
+    chunk_path = package.output_dir / package.chunks[0].filename
+    chunk_info = probe_media(chunk_path, settings)
+    assert chunk_path.stat().st_size > 225
+    assert chunk_info.duration_sec == pytest.approx(2.0, abs=0.1)
     assert optimizer_module._optimized_chunk_is_valid(chunk_path, settings) is True  # noqa: SLF001
 
 

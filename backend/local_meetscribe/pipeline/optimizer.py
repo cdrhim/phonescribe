@@ -455,8 +455,16 @@ def _run_ffmpeg_chunk(
     attempts = [overrides]
     if overrides.remove_silence:
         attempts.append(replace(overrides, remove_silence=False))
+    preservation_overrides = replace(
+        overrides,
+        remove_silence=False,
+        loudnorm=False,
+    )
+    if preservation_overrides not in attempts:
+        attempts.append(preservation_overrides)
 
-    for attempt_index, attempt_overrides in enumerate(attempts):
+    last_encode_error: LocalMeetScribeError | None = None
+    for attempt_overrides in attempts:
         temporary_path = output_path.with_name(
             f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix}"
         )
@@ -471,9 +479,8 @@ def _run_ffmpeg_chunk(
                     start_sec=start_sec,
                     end_sec=end_sec,
                 )
-            except LocalMeetScribeError:
-                if attempt_index == 0:
-                    raise
+            except LocalMeetScribeError as exc:
+                last_encode_error = exc
                 continue
             if _optimized_chunk_is_valid(temporary_path, settings):
                 temporary_path.replace(output_path)
@@ -481,11 +488,16 @@ def _run_ffmpeg_chunk(
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    if overrides.remove_silence:
-        raise LocalMeetScribeError(
-            "Optimizer produced no usable audio, even after preserving silence."
+    if len(attempts) > 1:
+        error = LocalMeetScribeError(
+            "Optimizer produced no usable audio, even after preserving silence and "
+            "disabling loudness normalization."
         )
-    raise LocalMeetScribeError("Optimizer produced no usable audio.")
+    else:
+        error = LocalMeetScribeError("Optimizer produced no usable audio.")
+    if last_encode_error is not None:
+        raise error from last_encode_error
+    raise error
 
 
 def _encode_ffmpeg_chunk(

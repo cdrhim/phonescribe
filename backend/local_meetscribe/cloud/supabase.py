@@ -404,7 +404,9 @@ class SupabaseCloudClient:
             "POST",
             f"{self.url}/rest/v1/transcription_jobs?{query}",
             payload=payload,
-            expected={201},
+            # PostgREST returns 201 when the upsert inserts and can return 200
+            # when the conflict path updates an existing workflow row.
+            expected={200, 201},
             prefer="resolution=merge-duplicates,return=minimal",
         )
 

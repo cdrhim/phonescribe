@@ -244,6 +244,22 @@ def test_status_and_transcript_persistence_do_not_log_or_mutate_raw_text() -> No
     assert segment_rows[0]["text_raw"] == segment_rows[0]["text_clean"]
 
 
+def test_status_sync_accepts_http_200_for_existing_workflow_upsert() -> None:
+    transport = QueueTransport([response(200)])
+    client = make_client(transport)
+
+    client.sync_workflow_status(
+        recording_id=RECORDING_ID,
+        workflow_id=WORKFLOW_ID,
+        status="transcribing",
+        stage="transcribing",
+        progress=0.5,
+    )
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["method"] == "POST"
+
+
 def test_transcript_retry_fills_segments_for_existing_transcript() -> None:
     job_id = "9028074b-14a5-46a7-bd1f-b2fdeed01e3d"
     transcript_id = "264d43e8-751a-4a2d-bd5a-d9544a1ba1a8"
@@ -682,33 +698,37 @@ def test_cloud_recording_runs_local_workflow_and_syncs_status(
 
     monkeypatch.setattr(app_module, "optimize_audio_package", fake_optimize)
     monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
-    client = TestClient(
+    monkeypatch.setattr(app_module, "CLOUD_MAINTENANCE_INTERVAL_SEC", 0.01)
+    with TestClient(
         app_module.create_app(
             settings,
             supabase_client=cloud,  # type: ignore[arg-type]
         )
-    )
+    ) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "cloud_recording_id": RECORDING_ID},
+        )
 
-    started = client.post(
-        "/api/workflows",
-        data={"destination": "gemini", "cloud_recording_id": RECORDING_ID},
-    )
+        assert started.status_code == 202, started.text
+        workflow_id = started.json()["workflow_id"]
+        state = wait_for_workflow_status(
+            settings.tmp_dir / "workflows" / f"{workflow_id}.json",
+            "complete",
+        )
+        assert state["status"] == "complete"
+        assert state["cloud_recording_id"] == RECORDING_ID
+        assert state["input_kind"] == "cloud"
+        assert state["optimizer_request"]["destination"] == "gemini"
+        assert "test-gemini-key" not in json.dumps(state)
+        deadline = time.monotonic() + 1
+        while cloud.statuses[-1:] != ["complete"] and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-    assert started.status_code == 202, started.text
-    workflow_id = started.json()["workflow_id"]
-    state = wait_for_workflow_status(
-        settings.tmp_dir / "workflows" / f"{workflow_id}.json",
-        "complete",
-    )
-    assert state["status"] == "complete"
-    assert state["cloud_recording_id"] == RECORDING_ID
-    assert state["input_kind"] == "cloud"
-    assert state["optimizer_request"]["destination"] == "gemini"
-    assert "test-gemini-key" not in json.dumps(state)
-    deadline = time.monotonic() + 1
-    while cloud.statuses[-1:] != ["complete"] and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert cloud.statuses == ["queued", "optimizing", "transcribing", "complete"]
+    # Delivery is intentionally coalesced: slow cloud status writes never hold
+    # the workflow thread, but the newest terminal state is always persisted.
+    assert cloud.statuses[-1:] == ["complete"]
+    assert set(cloud.statuses) <= {"queued", "optimizing", "transcribing", "complete"}
     assert cloud.persisted is True
 
 
@@ -1426,6 +1446,70 @@ def test_completed_cloud_workflow_outbox_retries_without_retranscribing(
     assert cloud.persist_calls >= 2
     assert not outbox_path.exists()
     assert state["cloud_sync_complete"] is True
+
+
+def test_blocked_outbox_does_not_block_health_or_overlap_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_test_settings(tmp_path)
+    package_id = "8" * 32
+    workflow_id = "9" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id, transcript=True)
+    write_recoverable_state(
+        settings,
+        workflow_id=workflow_id,
+        package_id=package_id,
+        status="complete",
+        input_kind="cloud",
+        input_id=RECORDING_ID,
+        cloud_recording_id=RECORDING_ID,
+    )
+    delivery_started = threading.Event()
+    allow_delivery = threading.Event()
+
+    class BlockingOutboxCloud(FakeWorkflowCloudClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+            self.active_deliveries = 0
+            self.max_active_deliveries = 0
+            self.delivery_calls = 0
+
+        def sync_workflow_status(self, **values: object) -> None:
+            with self.lock:
+                self.active_deliveries += 1
+                self.delivery_calls += 1
+                self.max_active_deliveries = max(
+                    self.max_active_deliveries,
+                    self.active_deliveries,
+                )
+            delivery_started.set()
+            allow_delivery.wait(timeout=2)
+            with self.lock:
+                self.active_deliveries -= 1
+            super().sync_workflow_status(**values)
+
+    cloud = BlockingOutboxCloud()
+    monkeypatch.setattr(app_module, "CLOUD_MAINTENANCE_INTERVAL_SEC", 0.01)
+
+    with TestClient(
+        app_module.create_app(settings, supabase_client=cloud)  # type: ignore[arg-type]
+    ) as client:
+        try:
+            assert delivery_started.wait(timeout=1)
+            started_at = time.monotonic()
+            response = client.get("/api/health")
+            elapsed = time.monotonic() - started_at
+
+            assert response.status_code == 200
+            assert response.json() == {"status": "ok"}
+            assert elapsed < 0.5
+            time.sleep(0.08)
+            assert cloud.delivery_calls == 1
+            assert cloud.max_active_deliveries == 1
+        finally:
+            allow_delivery.set()
 
 
 def test_startup_retention_runs_during_first_minutes_after_os_boot(

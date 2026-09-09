@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import uuid
 from pathlib import Path
 from typing import Annotated
@@ -24,6 +26,16 @@ share_app = typer.Typer(no_args_is_help=True)
 app.add_typer(models_app, name="models")
 app.add_typer(supabase_app, name="supabase")
 app.add_typer(share_app, name="share")
+
+
+def _server_loop_factory() -> asyncio.AbstractEventLoop:
+    # Uvicorn's Windows default is ProactorEventLoop. Repeated abandoned health
+    # probes have caused its accept socket to fail with WinError 64, leaving the
+    # process alive but temporarily unable to accept requests. Selector avoids
+    # that Windows-specific accept path; other platforms keep their native loop.
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop()
+    return asyncio.new_event_loop()
 
 
 @share_app.command("configure-passcode")
@@ -137,7 +149,13 @@ def serve(
     configure_logging()
     import uvicorn
 
-    uvicorn.run("local_meetscribe.api.app:app", host=host, port=port, reload=False)
+    uvicorn.run(
+        "local_meetscribe.api.app:app",
+        host=host,
+        port=port,
+        reload=False,
+        loop="local_meetscribe.cli:_server_loop_factory",
+    )
 
 
 @models_app.command("status")
