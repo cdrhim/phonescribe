@@ -530,7 +530,7 @@ export function audioUrl(jobId: string): string {
   return apiUrl(`/api/jobs/${jobId}/audio`);
 }
 
-export async function downloadApiFile(url: string, downloadName: string): Promise<void> {
+export async function fetchApiFileBlob(url: string, downloadName: string): Promise<Blob> {
   const headers = new Headers();
   if (apiAccessToken) headers.set("Authorization", `Bearer ${apiAccessToken}`);
   const response = await fetch(apiUrl(withDownloadName(url, downloadName)), {
@@ -541,7 +541,10 @@ export async function downloadApiFile(url: string, downloadName: string): Promis
     const body = await response.json().catch(() => ({ detail: response.statusText }));
     throw new ApiRequestError(String(body.detail ?? response.statusText), response.status);
   }
-  const objectUrl = URL.createObjectURL(await response.blob());
+  return response.blob();
+}
+
+export function requestBlobDownload(objectUrl: string, downloadName: string): void {
   const anchor = document.createElement("a");
   anchor.href = objectUrl;
   anchor.download = downloadName;
@@ -549,6 +552,11 @@ export async function downloadApiFile(url: string, downloadName: string): Promis
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
+}
+
+export async function downloadApiFile(url: string, downloadName: string): Promise<void> {
+  const objectUrl = URL.createObjectURL(await fetchApiFileBlob(url, downloadName));
+  requestBlobDownload(objectUrl, downloadName);
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
 

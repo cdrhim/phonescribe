@@ -32,11 +32,13 @@ import {
   createOptimizerPackage,
   createTranscriptArtifact,
   downloadApiFile,
+  fetchApiFileBlob,
   getTranscriptionWorkflow,
   getRuntime,
   hasApiAccessToken,
   isApiAuthenticationError,
   isApiTransientError,
+  requestBlobDownload,
   startTranscriptionWorkflow,
   uploadCloudRecording,
   verifyGeminiSharePasscode
@@ -70,8 +72,8 @@ type AccessRecoveryTarget = "recording" | "workflow";
 
 const workflowSteps = ["분석", "최적화", "전사", "완료"];
 const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
-const LAST_AUTO_DOWNLOADED_WORKFLOW_KEY =
-  "local-meetscribe.last-auto-downloaded-workflow.v1";
+const LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY =
+  "local-meetscribe.last-auto-download-requested-workflow.v1";
 const AUTO_DOWNLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 const RECORDING_UPLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 
@@ -85,6 +87,11 @@ interface PersistedWorkflow {
   recommendation: OptimizerRecommendationResponse | null;
   optimizedPackage: OptimizedPackageResult | null;
   saveBaseName: string;
+}
+
+interface PreparedTxtDownload {
+  downloadName: string;
+  objectUrl: string;
 }
 
 export function App() {
@@ -135,6 +142,9 @@ export function App() {
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [activePackageId, setActivePackageId] = useState<string | null>(null);
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<string | null>(null);
+  const [preparedTxtDownload, setPreparedTxtDownload] =
+    useState<PreparedTxtDownload | null>(null);
+  const [txtDownloadRequested, setTxtDownloadRequested] = useState(false);
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
@@ -340,16 +350,17 @@ export function App() {
   useEffect(() => {
     if (stage !== "complete" || !transcript || !activeWorkflowId) return;
     const statusPrefix = serverExportStatus ? `${serverExportStatus} · ` : "";
-    if (wasWorkflowAutoDownloaded(activeWorkflowId)) {
-      setAutoDownloadStatus(`${statusPrefix}이 기기의 TXT 다운로드도 준비되었습니다.`);
-      return;
-    }
+    const downloadName = `${safeSaveBaseName}.txt`;
+    const alreadyRequested = wasWorkflowAutoDownloadRequested(activeWorkflowId);
+    setPreparedTxtDownload(null);
+    setTxtDownloadRequested(alreadyRequested);
 
     let cancelled = false;
     let timer: number | null = null;
     let downloadStarting = false;
     let finished = false;
     let retryIndex = 0;
+    let objectUrl: string | null = null;
     const clearRetryTimer = () => {
       if (timer !== null) {
         window.clearTimeout(timer);
@@ -361,33 +372,51 @@ export function App() {
       clearRetryTimer();
       timer = window.setTimeout(() => {
         timer = null;
-        void downloadWhenVisible();
+        void prepareDownloadWhenVisible();
       }, delayMs);
     };
-    const downloadWhenVisible = async () => {
+    const prepareDownloadWhenVisible = async () => {
       if (cancelled || finished) return;
       if (document.visibilityState !== "visible") {
         setAutoDownloadStatus(
-          `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+          `${statusPrefix}화면을 다시 켜면 TXT 다운로드를 준비합니다.`
         );
         return;
       }
       if (downloadStarting) return;
       downloadStarting = true;
       try {
-        await downloadApiFile(transcript.txt_url, `${safeSaveBaseName}.txt`);
+        const blob = await fetchApiFileBlob(transcript.txt_url, downloadName);
         if (cancelled) return;
-        markWorkflowAutoDownloaded(activeWorkflowId);
+        objectUrl = URL.createObjectURL(blob);
+        setPreparedTxtDownload({ downloadName, objectUrl });
         finished = true;
         clearRetryTimer();
-        setAutoDownloadStatus(`${statusPrefix}이 기기에도 TXT를 자동 다운로드했습니다.`);
+        if (alreadyRequested) {
+          setAutoDownloadStatus(
+            `${statusPrefix}TXT가 준비되었습니다. 아래 링크에서 다시 다운로드하거나 내용을 확인하세요.`
+          );
+          return;
+        }
+        try {
+          requestBlobDownload(objectUrl, downloadName);
+          markWorkflowAutoDownloadRequested(activeWorkflowId);
+          setTxtDownloadRequested(true);
+          setAutoDownloadStatus(
+            `${statusPrefix}TXT 다운로드 요청 완료 · 아래 링크에서 다시 받거나 내용을 확인할 수 있습니다.`
+          );
+        } catch {
+          setAutoDownloadStatus(
+            `${statusPrefix}TXT가 준비되었습니다. 아래 링크에서 다운로드하거나 내용을 확인하세요.`
+          );
+        }
       } catch (downloadError) {
         if (!cancelled) {
           if (isApiAuthenticationError(downloadError)) {
             finished = true;
             clearRetryTimer();
             requireAccessReconnect();
-            setAutoDownloadStatus("비밀번호를 다시 확인하면 TXT를 자동 다운로드합니다.");
+            setAutoDownloadStatus("비밀번호를 다시 확인하면 TXT 다운로드를 준비합니다.");
           } else if (
             isApiTransientError(downloadError) &&
             retryIndex < AUTO_DOWNLOAD_RETRY_DELAYS_MS.length
@@ -395,14 +424,14 @@ export function App() {
             const retryDelay = AUTO_DOWNLOAD_RETRY_DELAYS_MS[retryIndex];
             retryIndex += 1;
             setAutoDownloadStatus(
-              `TXT 자동 다운로드 연결을 다시 확인합니다. ${Math.ceil(retryDelay / 1000)}초 후 재시도합니다.`
+              `TXT 다운로드 연결을 다시 확인합니다. ${Math.ceil(retryDelay / 1000)}초 후 재시도합니다.`
             );
             scheduleDownload(retryDelay);
           } else {
             finished = true;
             clearRetryTimer();
             setAutoDownloadStatus(
-              "TXT 자동 다운로드를 완료하지 못했습니다. TXT 버튼을 눌러 다시 받아 주세요."
+              "TXT 다운로드를 준비하지 못했습니다. 연결을 확인한 뒤 다시 열어 주세요."
             );
           }
         }
@@ -417,7 +446,7 @@ export function App() {
         clearRetryTimer();
         if (!finished) {
           setAutoDownloadStatus(
-            `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+            `${statusPrefix}화면을 다시 켜면 TXT 다운로드를 준비합니다.`
           );
         }
       }
@@ -428,13 +457,14 @@ export function App() {
       scheduleDownload(350);
     } else {
       setAutoDownloadStatus(
-        `${statusPrefix}화면을 다시 켜면 이 기기에도 TXT가 자동 다운로드됩니다.`
+        `${statusPrefix}화면을 다시 켜면 TXT 다운로드를 준비합니다.`
       );
     }
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       clearRetryTimer();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [activeWorkflowId, safeSaveBaseName, serverExportStatus, stage, transcript]);
 
@@ -678,6 +708,13 @@ export function App() {
       setAccessRecoveryTarget(null);
       if (selectionVersion !== selectionVersionRef.current) {
         setShareStatus("확인 완료 · 새로 시작한 녹음으로 진행합니다.");
+        return;
+      }
+      if (cloudRecordingId || stagedUploadId || optimizedPackage) {
+        autoStartSuppressedRef.current = false;
+        setError(null);
+        setStage("ready");
+        setShareStatus("연결 복구 완료 · 같은 녹음의 전사를 자동으로 계속합니다.");
         return;
       }
       if (activeWorkflowId) {
@@ -1332,6 +1369,8 @@ export function App() {
     setTranscriptionProgress(null);
     setActiveWorkflowId(null);
     setActivePackageId(null);
+    setPreparedTxtDownload(null);
+    setTxtDownloadRequested(false);
     setAutoDownloadStatus(null);
     setServerExportStatus(null);
     setStage("idle");
@@ -1395,6 +1434,15 @@ export function App() {
           : "파일을 다운로드하지 못했습니다."
       );
     }
+  }
+
+  function noteTxtDownloadRequested() {
+    if (activeWorkflowId) markWorkflowAutoDownloadRequested(activeWorkflowId);
+    setTxtDownloadRequested(true);
+    const statusPrefix = serverExportStatus ? `${serverExportStatus} · ` : "";
+    setAutoDownloadStatus(
+      `${statusPrefix}TXT 다운로드 요청 완료 · 아래 링크에서 다시 받거나 내용을 확인할 수 있습니다.`
+    );
   }
 
   function requireAccessReconnect(
@@ -1911,19 +1959,45 @@ export function App() {
             >
               <CheckCircle2 className="completion-icon" size={32} aria-hidden="true" />
               <div>
-                <h2 id="completion-title">전사 완료</h2>
-                <p>미팅록을 화면에서 확인하고 TXT로 받을 수 있습니다.</p>
+                <h2 id="completion-title">
+                  {txtDownloadRequested ? "전사 완료 · 다운로드 요청 완료" : "전사 완료"}
+                </h2>
+                <p>
+                  {preparedTxtDownload
+                    ? "TXT 링크가 준비되었습니다. 다시 받거나 내용을 바로 확인할 수 있습니다."
+                    : "미팅록 TXT를 준비하고 있습니다."}
+                </p>
+                {preparedTxtDownload && (
+                  <p className="completion-filename">{preparedTxtDownload.downloadName}</p>
+                )}
               </div>
-              <button
-                className="completion-download-button"
-                type="button"
-                onClick={() =>
-                  void downloadResult(transcript.txt_url, `${safeSaveBaseName}.txt`)
-                }
-              >
-                <Download size={17} />
-                원문 TXT 다운로드
-              </button>
+              {preparedTxtDownload ? (
+                <div className="completion-download-actions">
+                  <a
+                    className="completion-download-button"
+                    href={preparedTxtDownload.objectUrl}
+                    download={preparedTxtDownload.downloadName}
+                    onClick={noteTxtDownloadRequested}
+                  >
+                    <Download size={17} />
+                    {txtDownloadRequested ? "원문 TXT 다시 다운로드" : "원문 TXT 다운로드"}
+                  </a>
+                  <a
+                    className="completion-check-link"
+                    href={preparedTxtDownload.objectUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    TXT 내용 확인
+                    <ExternalLink size={15} />
+                  </a>
+                </div>
+              ) : (
+                <span className="completion-download-pending">
+                  <Loader2 className="spin" size={17} />
+                  TXT 준비 중
+                </span>
+              )}
             </div>
           ) : (
             <>
@@ -2556,18 +2630,20 @@ function sanitizeDownloadBaseName(value: string): string {
     .slice(0, 96);
 }
 
-function wasWorkflowAutoDownloaded(workflowId: string): boolean {
+function wasWorkflowAutoDownloadRequested(workflowId: string): boolean {
   try {
-    return window.localStorage.getItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY) === workflowId;
+    return (
+      window.localStorage.getItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY) === workflowId
+    );
   } catch {
     return false;
   }
 }
 
-function markWorkflowAutoDownloaded(workflowId: string): void {
+function markWorkflowAutoDownloadRequested(workflowId: string): void {
   try {
-    window.localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, workflowId);
+    window.localStorage.setItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY, workflowId);
   } catch {
-    // A repeated download is preferable when browser storage is unavailable.
+    // A repeated download request is preferable when browser storage is unavailable.
   }
 }

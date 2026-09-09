@@ -19,7 +19,9 @@ from local_meetscribe.pipeline.diarize import SpeakerTurn
 from local_meetscribe.pipeline.format import RuleBasedFormatterEngine
 from local_meetscribe.pipeline.gemini import (
     GeminiChunkTranscript,
+    GeminiPermanentError,
     GeminiTranscriptResult,
+    GeminiTransientError,
     can_send_gemini_inline,
     gemini_mime_type_for_path,
     get_gemini_progress,
@@ -783,8 +785,57 @@ def test_gemini_retryable_error_keeps_optimized_audio_message() -> None:
         def json() -> dict[str, object]:
             return {"error": {"message": "Internal error encountered."}}
 
-    with pytest.raises(LocalMeetScribeError, match="optimized audio is saved"):
+    with pytest.raises(GeminiTransientError, match="optimized audio is saved"):
         gemini_module._raise_for_gemini_error(Response())
+
+
+def test_gemini_bad_request_is_permanent() -> None:
+    class Response:
+        status_code = 400
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"error": {"message": "Invalid request."}}
+
+    with pytest.raises(GeminiPermanentError, match="Invalid request"):
+        gemini_module._raise_for_gemini_error(Response())
+
+
+def test_gemini_latest_candidate_parse_failure_overrides_earlier_transient_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    responses = iter(
+        (
+            Response(500, {"error": {"message": "temporary"}}),
+            Response(200, {"status": "complete"}),
+        )
+    )
+    monkeypatch.setattr(gemini_module, "_model_candidates", lambda _model: ("one", "two"))
+    monkeypatch.setattr(
+        gemini_module,
+        "_request_with_retry",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(LocalMeetScribeError, match="no transcript text") as raised:
+        gemini_module._generate_interaction(
+            object(),
+            make_test_settings(tmp_path),
+            "transcribe",
+            {"type": "audio", "mime_type": "audio/mp3", "data": "value"},
+        )
+
+    assert not isinstance(raised.value, GeminiTransientError)
 
 
 def test_transcript_filename_recommendation_uses_date_and_spoken_terms() -> None:

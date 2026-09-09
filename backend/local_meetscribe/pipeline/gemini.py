@@ -35,6 +35,14 @@ DEFAULT_TRANSCRIPTION_PROMPT = (
 )
 
 
+class GeminiTransientError(LocalMeetScribeError):
+    """A Gemini failure that can be retried without changing the recording."""
+
+
+class GeminiPermanentError(LocalMeetScribeError):
+    """A Gemini request failure that requires configuration or input changes."""
+
+
 @dataclass(frozen=True)
 class GeminiChunkTranscript:
     filename: str
@@ -259,11 +267,11 @@ def transcribe_gemini_package(
                     average_chunk_sec=average_chunk_sec,
                     started_at=started_at,
                 )
-    except Exception:
+    except Exception as exc:
         elapsed_sec = time.monotonic() - run_started
         _write_progress_safely(
             progress_path,
-            status="failed",
+            status=("transcribing" if isinstance(exc, GeminiTransientError) else "failed"),
             completed_chunks=completed_count,
             total_chunks=total_chunks,
             current_chunk=current_chunk,
@@ -622,7 +630,9 @@ def _wait_for_file_active(
         )
         _raise_for_gemini_error(response)
         file_obj = _file_obj(response.json())
-    raise LocalMeetScribeError("Gemini Files API upload is still processing. Try again shortly.")
+    raise GeminiTransientError(
+        "Gemini Files API upload is still processing. The server will continue automatically."
+    )
 
 
 def _generate_from_file(
@@ -670,6 +680,7 @@ def _generate_interaction(
                 json=payload,
             )
         except LocalMeetScribeError as exc:
+            last_response = None
             last_exception = exc
             continue
         if response.status_code < 400:
@@ -684,9 +695,11 @@ def _generate_interaction(
                     model=model,
                 )
             except LocalMeetScribeError as exc:
+                last_response = None
                 last_exception = exc
                 continue
         last_response = response
+        last_exception = None
         if response.status_code not in MODEL_FALLBACK_STATUS_CODES:
             break
 
@@ -782,7 +795,9 @@ def _wait_for_interaction_completion(
         status = str(payload.get("status") or "").casefold()
         if status != "in_progress":
             return payload
-    raise LocalMeetScribeError("Gemini interaction did not complete before the recovery timeout.")
+    raise GeminiTransientError(
+        "Gemini interaction is still processing. The server will continue automatically."
+    )
 
 
 def _raise_for_gemini_error(response: Any) -> None:
@@ -801,12 +816,14 @@ def _raise_for_gemini_error(response: Any) -> None:
             " The Gemini free-tier quota may be exhausted. Wait for it to reset or check "
             "the active limits in Google AI Studio."
         )
+        raise GeminiTransientError(detail)
     elif response.status_code in {500, 502, 503, 504}:
         detail = (
             "Gemini is temporarily unavailable after automatic retries. "
-            "The optimized audio is saved; retry transcription to continue."
+            "The optimized audio is saved and the server will continue automatically."
         )
-    raise LocalMeetScribeError(detail)
+        raise GeminiTransientError(detail)
+    raise GeminiPermanentError(detail)
 
 
 def _request_with_retry(client: Any, method: str, url: str, **kwargs: Any) -> Any:
@@ -815,7 +832,7 @@ def _request_with_retry(client: Any, method: str, url: str, **kwargs: Any) -> An
             response = client.request(method, url, **kwargs)
         except Exception as exc:
             if attempt + 1 >= MAX_REQUEST_ATTEMPTS:
-                raise LocalMeetScribeError(
+                raise GeminiTransientError(
                     "Gemini API network request failed after automatic retries."
                 ) from exc
             time.sleep(2**attempt)
@@ -826,7 +843,7 @@ def _request_with_retry(client: Any, method: str, url: str, **kwargs: Any) -> An
         ):
             return response
         time.sleep(_retry_delay(response, attempt))
-    raise LocalMeetScribeError("Gemini API request failed after automatic retries.")
+    raise GeminiTransientError("Gemini API request failed after automatic retries.")
 
 
 def _retry_delay(response: Any, attempt: int) -> float:

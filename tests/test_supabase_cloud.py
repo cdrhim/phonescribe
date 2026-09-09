@@ -23,6 +23,7 @@ from local_meetscribe.cloud.supabase import (
     SupabaseCloudError,
 )
 from local_meetscribe.config import Settings
+from local_meetscribe.pipeline.gemini import GeminiPermanentError, GeminiTransientError
 from local_meetscribe.pipeline.optimizer import OptimizerRequest
 from local_meetscribe.security import SupabaseConfigStore
 from local_meetscribe.utils.errors import LocalMeetScribeError
@@ -701,6 +702,234 @@ def test_cloud_recording_runs_local_workflow_and_syncs_status(
     assert "test-gemini-key" not in json.dumps(state)
     assert cloud.statuses == ["queued", "optimizing", "transcribing", "complete"]
     assert cloud.persisted is True
+
+
+def test_completed_upload_workflow_post_is_idempotent_after_staged_source_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    upload_id = "9" * 32
+    source_dir = settings.tmp_dir / "optimizer-uploads" / upload_id / "source"
+    source_dir.mkdir(parents=True)
+    (source_dir / "meeting.webm").write_bytes(b"audio")
+    optimize_calls = 0
+    transcribe_calls = 0
+
+    def fake_optimize(
+        _source: Path,
+        output_root: Path,
+        _settings: object,
+        _request: object,
+        *,
+        package_id: str,
+    ) -> None:
+        nonlocal optimize_calls
+        optimize_calls += 1
+        write_optimized_fixture(output_root / package_id)
+
+    def fake_transcribe(package_dir: Path, *_args: object, **_kwargs: object) -> object:
+        nonlocal transcribe_calls
+        transcribe_calls += 1
+        write_optimized_fixture(package_dir, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=package_dir / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "optimize_audio_package", fake_optimize)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    client = TestClient(app_module.create_app(settings))
+
+    first = client.post(
+        "/api/workflows",
+        data={"destination": "gemini", "upload_id": upload_id},
+    )
+    second = client.post(
+        "/api/workflows",
+        data={"destination": "gemini", "upload_id": upload_id},
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert not source_dir.parent.exists()
+    assert second.json()["workflow_id"] == first.json()["workflow_id"]
+    assert second.json()["package_id"] == first.json()["package_id"]
+    assert second.json()["status"] == "complete"
+    assert optimize_calls == 1
+    assert transcribe_calls == 1
+
+
+def test_transient_gemini_failure_stays_transcribing_and_retries_to_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "8" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    calls = 0
+    retry_states: list[dict[str, object]] = []
+    retry_started = threading.Event()
+    allow_success = threading.Event()
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise GeminiTransientError("temporary Gemini outage")
+        state_files = list((settings.tmp_dir / "workflows").glob("*.json"))
+        retry_states.append(json.loads(state_files[0].read_text(encoding="utf-8")))
+        if calls == 2:
+            raise GeminiTransientError("temporary Gemini outage again")
+        retry_started.set()
+        allow_success.wait(timeout=2)
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 0.01)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        assert retry_started.wait(timeout=1)
+        assert [value["transcription_retry_count"] for value in retry_states] == [1, 2]
+        assert all(value["status"] == "transcribing" for value in retry_states)
+        assert all(value["error"] is None for value in retry_states)
+        assert all(value["error_code"] == "gemini_transient_retry" for value in retry_states)
+        allow_success.set()
+        state = wait_for_workflow_status(state_path, "complete")
+
+    assert calls == 3
+    assert state["status"] == "complete"
+    assert state["transcription_retry_count"] == 2
+
+
+def test_transient_retry_background_task_does_not_block_graceful_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "4" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiTransientError("temporary Gemini outage")
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 60.0)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 60.0)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    started_at = time.monotonic()
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["status"] == "transcribing"
+        assert state["error"] is None
+    assert time.monotonic() - started_at < 2.0
+    assert calls == 1
+
+    workflow_input_key = f"package:{package_id}"
+    lease = None
+    deadline = time.monotonic() + 1
+    while lease is None and time.monotonic() < deadline:
+        lease = app_module._try_acquire_workflow_input_lease(  # noqa: SLF001
+            settings.tmp_dir / "workflow-locks",
+            workflow_input_key,
+        )
+        if lease is None:
+            time.sleep(0.01)
+    assert lease is not None
+    lease.release()
+
+
+def test_permanent_gemini_failure_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "7" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiPermanentError("Gemini API returned HTTP 400.")
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    client = TestClient(app_module.create_app(settings))
+
+    started = client.post(
+        "/api/workflows",
+        data={"destination": "gemini", "package_id": package_id},
+    )
+
+    assert started.status_code == 202
+    state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert calls == 1
+    assert state["status"] == "failed"
+    assert state["error_code"] == "gemini_permanent"
+
+
+def test_startup_recovers_legacy_failed_transient_gemini_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "6" * 32
+    workflow_id = "5" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    state_path = write_recoverable_state(
+        settings,
+        workflow_id=workflow_id,
+        package_id=package_id,
+        status="failed",
+        input_kind="package",
+        input_id=package_id,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["error"] = (
+        "Gemini is temporarily unavailable after automatic retries. "
+        "The optimized audio is saved; retry transcription to continue."
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    calls = 0
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)):
+        recovered = wait_for_workflow_status(state_path, "complete")
+
+    assert calls == 1
+    assert recovered["status"] == "complete"
+    assert recovered["recovered_after_restart"] is True
 
 
 def test_startup_recovers_queued_cloud_workflow_exactly_once(

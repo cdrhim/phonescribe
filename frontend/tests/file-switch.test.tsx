@@ -25,12 +25,14 @@ vi.mock("../src/api", async (importOriginal) => ({
   createOptimizerPackage: vi.fn(),
   createTranscriptArtifact: vi.fn(),
   downloadApiFile: vi.fn(),
+  fetchApiFileBlob: vi.fn(),
+  requestBlobDownload: vi.fn(),
   verifyGeminiSharePasscode: vi.fn()
 }));
 
 const STORAGE_KEY = "local-meetscribe.active-workflow.v1";
-const LAST_AUTO_DOWNLOADED_WORKFLOW_KEY =
-  "local-meetscribe.last-auto-downloaded-workflow.v1";
+const LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY =
+  "local-meetscribe.last-auto-download-requested-workflow.v1";
 const OLD_ID = "a".repeat(32);
 const OLD_NAME = "old-recording.m4a";
 const NEW_NAME = "new-recording.wav";
@@ -331,6 +333,9 @@ beforeEach(() => {
   vi.mocked(api.getTranscriptionWorkflow).mockImplementation(() => new Promise(() => {}));
   vi.mocked(api.analyzeOptimizer).mockImplementation(() => new Promise(() => {}));
   vi.mocked(api.startTranscriptionWorkflow).mockImplementation(() => new Promise(() => {}));
+  vi.mocked(api.fetchApiFileBlob).mockResolvedValue(
+    new Blob(["mock transcript"], { type: "text/plain" })
+  );
 });
 afterEach(() => {
   cleanup();
@@ -1058,6 +1063,53 @@ describe("recording transfer retry", () => {
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
     expect(screen.getByText(/녹음 준비 완료 · 전사 작업을 다시 처리/)).toBeTruthy();
   });
+
+  it("automatically resumes a failed workflow handoff after the password is confirmed", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor).mockResolvedValue(
+      cloudUploadDescriptor()
+    );
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    vi.mocked(api.completeCloudRecordingUpload).mockResolvedValue({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    });
+    vi.mocked(api.startTranscriptionWorkflow)
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockResolvedValueOnce({
+        workflow_id: OLD_ID,
+        package_id: OLD_ID,
+        status: "queued"
+      });
+    vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
+      valid: true,
+      key_ready: true,
+      expires_in: 3600
+    });
+
+    render(<App />);
+    await recordNow();
+
+    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/녹음 준비 완료 · 전사 작업을 다시 처리/)).toBeTruthy();
+
+    fireEvent.change(screen.getByPlaceholderText("4자리 이상"), {
+      target: { value: "0000" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "비밀번호 확인" }));
+
+    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("0000"));
+    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledTimes(2));
+    expect(api.startTranscriptionWorkflow).toHaveBeenLastCalledWith(
+      expect.objectContaining({ file: expect.any(File) }),
+      expect.objectContaining({ cloudRecordingId: "cloud-recording-id" })
+    );
+    expect(screen.getByText(/같은 녹음의 전사를 자동으로 계속/)).toBeTruthy();
+  });
 });
 
 describe("Supabase signed upload", () => {
@@ -1168,19 +1220,20 @@ describe("Supabase signed upload", () => {
 describe("automatic TXT download", () => {
   it("shows one clear completion card with a direct TXT download action", async () => {
     seedOldWorkflow();
-    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    localStorage.setItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY, OLD_ID);
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
     vi.mocked(api.downloadApiFile).mockResolvedValue();
 
     render(<App />);
 
-    const heading = await screen.findByRole("heading", { name: "전사 완료" });
+    const heading = await screen.findByRole("heading", { name: /^전사 완료/ });
     const completionCard = heading.closest('[role="status"]');
+    const downloadLink = await screen.findByRole("link", {
+      name: "원문 TXT 다시 다운로드"
+    });
     expect(completionCard).not.toBeNull();
-    expect(completionCard?.textContent).toContain(
-      "미팅록을 화면에서 확인하고 TXT로 받을 수 있습니다."
-    );
+    expect(completionCard?.textContent).toContain("TXT 링크가 준비되었습니다.");
     expect(screen.queryByRole("button", { name: "전사 다시 실행" })).toBeNull();
     expect(screen.getByText("완료").closest("div")?.className).toContain("complete");
     expect(screen.getByText("미팅록 미리보기")).toBeTruthy();
@@ -1190,15 +1243,21 @@ describe("automatic TXT download", () => {
     expect(screen.getByRole("button", { name: "요약본 만들기" })).toBeTruthy();
     expect(document.body.textContent).not.toContain("이어하기");
 
-    fireEvent.click(screen.getByRole("button", { name: "원문 TXT 다운로드" }));
-    await waitFor(() =>
-      expect(api.downloadApiFile).toHaveBeenCalledWith("/old.txt", "old-recording.txt")
-    );
+    expect(downloadLink.getAttribute("href")).toBe("blob:test");
+    expect(downloadLink.getAttribute("download")).toBe("old-recording.txt");
+    const checkLink = screen.getByRole("link", { name: "TXT 내용 확인" });
+    expect(checkLink.getAttribute("href")).toBe("blob:test");
+    expect(checkLink.getAttribute("target")).toBe("_blank");
+    expect(api.requestBlobDownload).not.toHaveBeenCalled();
+
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    fireEvent.click(downloadLink);
+    expect(screen.getByText(/TXT 다운로드 요청 완료/)).toBeTruthy();
   });
 
   it("creates and downloads an optional organized transcript without replacing the raw text", async () => {
     seedOldWorkflow();
-    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    localStorage.setItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY, OLD_ID);
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
     vi.mocked(api.createTranscriptArtifact).mockResolvedValue({
@@ -1236,7 +1295,7 @@ describe("automatic TXT download", () => {
 
   it("creates and downloads an optional summary transcript", async () => {
     seedOldWorkflow();
-    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    localStorage.setItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY, OLD_ID);
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
     vi.mocked(api.createTranscriptArtifact).mockResolvedValue({
@@ -1269,7 +1328,7 @@ describe("automatic TXT download", () => {
 
   it("shows only a shortened on-screen preview while keeping the full TXT action", async () => {
     seedOldWorkflow();
-    localStorage.setItem(LAST_AUTO_DOWNLOADED_WORKFLOW_KEY, OLD_ID);
+    localStorage.setItem(LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY, OLD_ID);
     const workflow = completedWorkflow();
     workflow.transcript!.text = "긴 전사 내용 ".repeat(220);
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
@@ -1283,32 +1342,56 @@ describe("automatic TXT download", () => {
     const preview = document.querySelector(".transcript-preview");
     expect(preview?.textContent?.endsWith("…")).toBe(true);
     expect(preview?.textContent?.length).toBeLessThan(workflow.transcript!.text.length);
-    expect(screen.getByRole("button", { name: "원문 TXT 다운로드" })).toBeTruthy();
+    expect(await screen.findByRole("link", { name: /원문 TXT/ })).toBeTruthy();
   });
 
-  it("retries transient failures with bounded backoff until the download succeeds", async () => {
+  it("retries transient failures while preparing a persistent TXT link", async () => {
     vi.useFakeTimers();
     seedOldWorkflow();
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
-    vi.mocked(api.downloadApiFile)
+    vi.mocked(api.fetchApiFileBlob)
       .mockRejectedValueOnce(new TypeError("offline"))
       .mockRejectedValueOnce(new api.ApiRequestError("busy", 503))
-      .mockResolvedValueOnce();
+      .mockResolvedValueOnce(new Blob(["mock transcript"], { type: "text/plain" }));
 
     render(<App />);
     await act(async () => {
       await Promise.resolve();
     });
     await vi.advanceTimersByTimeAsync(350);
-    expect(api.downloadApiFile).toHaveBeenCalledTimes(1);
+    expect(api.fetchApiFileBlob).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(api.downloadApiFile).toHaveBeenCalledTimes(2);
+    expect(api.fetchApiFileBlob).toHaveBeenCalledTimes(2);
 
     await vi.advanceTimersByTimeAsync(3_000);
-    expect(api.downloadApiFile).toHaveBeenCalledTimes(3);
-    expect(screen.getByText(/TXT를 자동 다운로드했습니다/)).toBeTruthy();
+    expect(api.fetchApiFileBlob).toHaveBeenCalledTimes(3);
+    expect(api.requestBlobDownload).toHaveBeenCalledWith("blob:test", "old-recording.txt");
+    expect(screen.getByText(/TXT 다운로드 요청 완료/)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "원문 TXT 다시 다운로드" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "TXT 내용 확인" })).toBeTruthy();
+  });
+
+  it("keeps tap-to-download links without claiming success when auto download is blocked", async () => {
+    vi.useFakeTimers();
+    seedOldWorkflow();
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
+    vi.mocked(api.requestBlobDownload).mockImplementation(() => {
+      throw new Error("automatic download blocked");
+    });
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await vi.advanceTimersByTimeAsync(350);
+
+    expect(screen.getByText(/TXT가 준비되었습니다/)).toBeTruthy();
+    expect(screen.queryByText(/TXT 다운로드 요청 완료/)).toBeNull();
+    expect(screen.getByRole("link", { name: "원문 TXT 다운로드" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "TXT 내용 확인" })).toBeTruthy();
   });
 
   it("cancels a scheduled TXT retry when the page unmounts", async () => {
@@ -1316,19 +1399,19 @@ describe("automatic TXT download", () => {
     seedOldWorkflow();
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
-    vi.mocked(api.downloadApiFile).mockRejectedValue(new TypeError("offline"));
+    vi.mocked(api.fetchApiFileBlob).mockRejectedValue(new TypeError("offline"));
 
     const view = render(<App />);
     await act(async () => {
       await Promise.resolve();
     });
     await vi.advanceTimersByTimeAsync(350);
-    expect(api.downloadApiFile).toHaveBeenCalledOnce();
+    expect(api.fetchApiFileBlob).toHaveBeenCalledOnce();
 
     view.unmount();
     await vi.runAllTimersAsync();
 
-    expect(api.downloadApiFile).toHaveBeenCalledOnce();
+    expect(api.fetchApiFileBlob).toHaveBeenCalledOnce();
   });
 
   it("stops after the bounded number of automatic TXT retries", async () => {
@@ -1336,7 +1419,7 @@ describe("automatic TXT download", () => {
     seedOldWorkflow();
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue(completedWorkflow());
-    vi.mocked(api.downloadApiFile).mockRejectedValue(
+    vi.mocked(api.fetchApiFileBlob).mockRejectedValue(
       new api.ApiRequestError("temporarily unavailable", 503)
     );
 
@@ -1346,7 +1429,7 @@ describe("automatic TXT download", () => {
     });
     await vi.runAllTimersAsync();
 
-    expect(api.downloadApiFile).toHaveBeenCalledTimes(5);
-    expect(screen.getByText(/TXT 버튼을 눌러 다시 받아 주세요/)).toBeTruthy();
+    expect(api.fetchApiFileBlob).toHaveBeenCalledTimes(5);
+    expect(screen.getByText(/TXT 다운로드를 준비하지 못했습니다/)).toBeTruthy();
   });
 });

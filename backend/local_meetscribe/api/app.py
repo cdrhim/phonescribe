@@ -47,7 +47,9 @@ from local_meetscribe.pipeline.derivatives import (
 )
 from local_meetscribe.pipeline.export import write_exports
 from local_meetscribe.pipeline.gemini import (
+    GeminiPermanentError,
     GeminiTranscriptionProgress,
+    GeminiTransientError,
     get_gemini_progress,
     transcribe_gemini_package,
 )
@@ -78,6 +80,9 @@ CLOUD_CLEANUP_BATCH_SIZE = 25
 CLOUD_CLEANUP_INTERVAL_SEC = 15 * 60
 CLOUD_MAINTENANCE_INTERVAL_SEC = 30
 RECOVERABLE_WORKFLOW_STATUSES = frozenset({"queued", "optimizing", "transcribing"})
+IDEMPOTENT_WORKFLOW_STATUSES = RECOVERABLE_WORKFLOW_STATUSES | {"complete"}
+GEMINI_WORKFLOW_RETRY_BASE_SEC = 30.0
+GEMINI_WORKFLOW_RETRY_MAX_SEC = 5 * 60.0
 
 
 class CloudUploadDescriptorRequest(BaseModel):
@@ -330,6 +335,52 @@ def create_app(
             durable_fields=durable_fields,
         )
 
+    def find_idempotent_workflow(
+        workflow_input_key: str,
+    ) -> dict[str, object] | None:
+        workflow_dir = active_settings.tmp_dir / "workflows"
+        newest: tuple[float, dict[str, object]] | None = None
+        for state_path in workflow_dir.glob("*.json"):
+            try:
+                state = _read_json_object(state_path)
+                if state.get("workflow_input_key") != workflow_input_key:
+                    continue
+                if str(state.get("status") or "") not in IDEMPOTENT_WORKFLOW_STATUSES:
+                    continue
+                workflow_id = str(state.get("workflow_id") or "")
+                package_id = str(state.get("package_id") or "")
+                if (
+                    state_path.stem != workflow_id
+                    or not re.fullmatch(r"[a-f0-9]{32}", workflow_id)
+                    or not re.fullmatch(r"[a-f0-9]{32}", package_id)
+                ):
+                    continue
+                timestamp = float(
+                    str(
+                        state.get("created_at")
+                        or state.get("updated_at")
+                        or state_path.stat().st_mtime
+                    )
+                )
+            except (LocalMeetScribeError, OSError, TypeError, ValueError):
+                continue
+            if newest is None or timestamp > newest[0]:
+                newest = (timestamp, state)
+        return newest[1] if newest is not None else None
+
+    def idempotent_workflow_response(
+        workflow_input_key: str,
+    ) -> dict[str, object] | None:
+        state = find_idempotent_workflow(workflow_input_key)
+        if state is None:
+            return None
+        return {
+            "workflow_id": str(state["workflow_id"]),
+            "package_id": str(state["package_id"]),
+            "cloud_recording_id": state.get("cloud_recording_id"),
+            "status": str(state.get("status") or "queued"),
+        }
+
     def require_share_passcode(request: Request, passcode: str | None) -> None:
         client_id = request.client.host if request.client else "unknown"
         now = time.monotonic()
@@ -376,6 +427,7 @@ def create_app(
         output_dir = output_root / package_id
         phase = "optimizing" if upload_id or cloud_recording_id else "transcribing"
         cloud_download_dir: Path | None = None
+        workflow_lease_transferred = False
 
         def persist_state(
             status: str,
@@ -383,6 +435,7 @@ def create_app(
             error: str | None = None,
             auto_exported: bool | None = None,
             auto_export_error: str | None = None,
+            durable_fields: Mapping[str, object] | None = None,
         ) -> None:
             persist_workflow_state(
                 workflow_id=workflow_id,
@@ -393,6 +446,7 @@ def create_app(
                 auto_export_error=auto_export_error,
                 cloud_recording_id=cloud_recording_id,
                 cloud_client=cloud_client,
+                durable_fields=durable_fields,
             )
 
         release_system_awake = _request_system_awake()
@@ -436,11 +490,84 @@ def create_app(
 
             phase = "transcribing"
             persist_state("transcribing")
-            transcript_result = transcribe_gemini_package(
-                output_dir,
-                active_settings,
-                api_key=api_key,
-            )
+            try:
+                transcript_result = transcribe_gemini_package(
+                    output_dir,
+                    active_settings,
+                    api_key=api_key,
+                )
+            except GeminiTransientError as exc:
+                if _gemini_outputs_complete(output_dir):
+                    auto_exported, auto_export_error = _auto_export_stored_transcript(
+                        output_dir,
+                        active_settings.auto_export_dir,
+                    )
+                    persist_state(
+                        "complete",
+                        auto_exported=auto_exported,
+                        auto_export_error=auto_export_error,
+                    )
+                    return
+                transcription_retry_count = (
+                    _workflow_transcription_retry_count(
+                        _workflow_state_path(active_settings, workflow_id)
+                    )
+                    + 1
+                )
+                retry_delay = _gemini_workflow_retry_delay(transcription_retry_count)
+                persist_state(
+                    "transcribing",
+                    durable_fields={
+                        "error_code": "gemini_transient_retry",
+                        "transcription_retry_count": transcription_retry_count,
+                        "last_transient_error_at": time.time(),
+                        "next_retry_at": time.time() + retry_delay,
+                    },
+                )
+
+                def delayed_retry_worker() -> None:
+                    release_wait_awake = _request_system_awake()
+                    try:
+                        if maintenance_stop.wait(retry_delay):
+                            LOGGER.info(
+                                "Background workflow %s paused for server shutdown",
+                                workflow_id,
+                            )
+                            workflow_lease.release()
+                            with active_workflow_lock:
+                                active_workflow_inputs.discard(workflow_input_key)
+                            return
+                    finally:
+                        with suppress(Exception):
+                            release_wait_awake()
+                    run_transcription_workflow(
+                        workflow_id,
+                        package_id,
+                        upload_id,
+                        cloud_recording_id,
+                        cloud_client,
+                        optimizer_request,
+                        api_key,
+                        workflow_input_key,
+                        workflow_lease,
+                    )
+
+                LOGGER.warning(
+                    "Background workflow %s will retry Gemini after %.0f seconds "
+                    "(attempt %d, %s)",
+                    workflow_id,
+                    retry_delay,
+                    transcription_retry_count,
+                    type(exc).__name__,
+                )
+                retry_thread = threading.Thread(
+                    target=delayed_retry_worker,
+                    name=f"phonescribe-gemini-retry-{workflow_id[:8]}",
+                    daemon=True,
+                )
+                retry_thread.start()
+                workflow_lease_transferred = True
+                return
             auto_exported, auto_export_error = _auto_export_transcript(
                 transcript_result.txt_path,
                 transcript_result.suggested_filename,
@@ -450,6 +577,11 @@ def create_app(
                 "complete",
                 auto_exported=auto_exported,
                 auto_export_error=auto_export_error,
+                durable_fields={
+                    "error_code": None,
+                    "last_transient_error_at": None,
+                    "next_retry_at": None,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - background work must persist failure state.
             if phase == "transcribing" and _gemini_outputs_complete(output_dir):
@@ -475,14 +607,25 @@ def create_app(
                 phase,
                 type(exc).__name__,
             )
-            persist_state("failed", error=_background_error_message(exc))
+            persist_state(
+                "failed",
+                error=_background_error_message(exc),
+                durable_fields={
+                    "error_code": (
+                        "gemini_permanent"
+                        if isinstance(exc, GeminiPermanentError)
+                        else "workflow_failed"
+                    )
+                },
+            )
         finally:
             if cloud_download_dir is not None:
                 shutil.rmtree(cloud_download_dir, ignore_errors=True)
             release_system_awake()
-            workflow_lease.release()
-            with active_workflow_lock:
-                active_workflow_inputs.discard(workflow_input_key)
+            if not workflow_lease_transferred:
+                workflow_lease.release()
+                with active_workflow_lock:
+                    active_workflow_inputs.discard(workflow_input_key)
 
     def try_reserve_workflow_input(
         workflow_input_key: str,
@@ -535,7 +678,13 @@ def create_app(
                                 outbox_path,
                                 _cloud_outbox_payload_from_state(state),
                             )
-                if status not in RECOVERABLE_WORKFLOW_STATUSES:
+                recoverable_transient_failure = (
+                    status == "failed" and _is_transient_gemini_workflow_failure(state)
+                )
+                if (
+                    status not in RECOVERABLE_WORKFLOW_STATUSES
+                    and not recoverable_transient_failure
+                ):
                     continue
 
                 input_kind, input_id, workflow_input_key = _recovery_input(state, package_id)
@@ -1171,6 +1320,28 @@ def create_app(
                 detail="Background transcription workflows require the Gemini destination.",
             )
 
+        resolved_api_key = (gemini_api_key or "").strip()
+        if share_store.passcode_configured:
+            if not remote_session_is_valid(request.headers.get("authorization")):
+                require_share_passcode(request, share_passcode)
+            resolved_api_key = (
+                active_settings.gemini_api_key or share_store.load_api_key() or ""
+            ).strip()
+        elif not resolved_api_key:
+            resolved_api_key = (active_settings.gemini_api_key or "").strip()
+        if not resolved_api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini API key가 필요합니다.",
+            )
+
+        input_kind = "upload" if upload_id else ("cloud" if cloud_recording_id else "package")
+        supplied_input_id = upload_id or cloud_recording_id or package_id or ""
+        workflow_input_key = f"{input_kind}:{supplied_input_id}"
+        existing_workflow = idempotent_workflow_response(workflow_input_key)
+        if existing_workflow is not None:
+            return existing_workflow
+
         workflow_cloud_client: SupabaseCloudClient | None = None
         if upload_id:
             try:
@@ -1208,38 +1379,16 @@ def create_app(
             ).exists():
                 raise HTTPException(status_code=404, detail="Optimized package not found.")
 
-        resolved_api_key = (gemini_api_key or "").strip()
-        if share_store.passcode_configured:
-            if not remote_session_is_valid(request.headers.get("authorization")):
-                require_share_passcode(request, share_passcode)
-            resolved_api_key = (
-                active_settings.gemini_api_key or share_store.load_api_key() or ""
-            ).strip()
-        elif not resolved_api_key:
-            resolved_api_key = (active_settings.gemini_api_key or "").strip()
-        if not resolved_api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="Gemini API key가 필요합니다.",
-            )
-
         workflow_id = uuid.uuid4().hex
-        workflow_input_key = (
-            f"upload:{upload_id}"
-            if upload_id
-            else (
-                f"cloud:{cloud_recording_id}"
-                if cloud_recording_id
-                else f"package:{resolved_package_id}"
-            )
-        )
         workflow_lease, _reservation_error = try_reserve_workflow_input(workflow_input_key)
         if workflow_lease is None:
+            existing_workflow = idempotent_workflow_response(workflow_input_key)
+            if existing_workflow is not None:
+                return existing_workflow
             raise HTTPException(
                 status_code=409,
                 detail="This recording already has an active transcription workflow.",
             )
-        input_kind = "upload" if upload_id else ("cloud" if cloud_recording_id else "package")
         input_id = upload_id or cloud_recording_id or resolved_package_id
         credential_mode = (
             "ephemeral"
@@ -1977,6 +2126,34 @@ def _try_acquire_workflow_input_lease(
     except OSError:
         handle.close()
         return None
+
+
+def _gemini_workflow_retry_delay(retry_count: int) -> float:
+    exponent = max(0, min(retry_count - 1, 8))
+    return min(GEMINI_WORKFLOW_RETRY_MAX_SEC, GEMINI_WORKFLOW_RETRY_BASE_SEC * (2**exponent))
+
+
+def _workflow_transcription_retry_count(state_path: Path) -> int:
+    try:
+        state = _read_json_object(state_path)
+        return max(0, int(str(state.get("transcription_retry_count") or 0)))
+    except (LocalMeetScribeError, OSError, TypeError, ValueError):
+        return 0
+
+
+def _is_transient_gemini_workflow_failure(state: Mapping[str, object]) -> bool:
+    if state.get("error_code") in {"gemini_transient", "gemini_transient_retry"}:
+        return True
+    error = str(state.get("error") or "")
+    return error.startswith(
+        (
+            "Gemini is temporarily unavailable after automatic retries.",
+            "Gemini API network request failed after automatic retries.",
+            "Gemini API request failed after automatic retries.",
+            "Gemini interaction did not complete before the recovery timeout.",
+            "Gemini Files API upload is still processing.",
+        )
+    )
 
 
 def _background_error_message(exc: Exception) -> str:

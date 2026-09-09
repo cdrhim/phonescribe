@@ -947,6 +947,12 @@ h1 {
   font-size: 11px;
 }
 
+.completion-card .completion-filename {
+  overflow-wrap: anywhere;
+  color: #084f39;
+  font-weight: 750;
+}
+
 .completion-download-button {
   display: inline-flex;
   min-height: 44px;
@@ -961,6 +967,35 @@ h1 {
   cursor: pointer;
   font-size: 12px;
   font-weight: 800;
+  text-decoration: none;
+}
+
+.completion-download-actions {
+  display: grid;
+  gap: 7px;
+  min-width: 180px;
+}
+
+.completion-check-link,
+.completion-download-pending {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid #8bb5a6;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #0b6849;
+  font-size: 11px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.completion-download-pending {
+  border-color: #a8b7b1;
+  color: #47685c;
 }
 
 .wake-status {
@@ -1458,6 +1493,11 @@ h1 {
   }
 
   .completion-download-button {
+    width: 100%;
+  }
+
+  .completion-download-actions,
+  .completion-download-pending {
     grid-column: 1 / -1;
     width: 100%;
   }
