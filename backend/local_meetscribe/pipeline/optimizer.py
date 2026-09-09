@@ -5,8 +5,9 @@ import math
 import re
 import shutil
 import subprocess
+import uuid
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -451,6 +452,52 @@ def _run_ffmpeg_chunk(
     start_sec: float,
     end_sec: float,
 ) -> None:
+    attempts = [overrides]
+    if overrides.remove_silence:
+        attempts.append(replace(overrides, remove_silence=False))
+
+    for attempt_index, attempt_overrides in enumerate(attempts):
+        temporary_path = output_path.with_name(
+            f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix}"
+        )
+        try:
+            try:
+                _encode_ffmpeg_chunk(
+                    input_path=input_path,
+                    output_path=temporary_path,
+                    settings=settings,
+                    recommendation=recommendation,
+                    overrides=attempt_overrides,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
+            except LocalMeetScribeError:
+                if attempt_index == 0:
+                    raise
+                continue
+            if _optimized_chunk_is_valid(temporary_path, settings):
+                temporary_path.replace(output_path)
+                return
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    if overrides.remove_silence:
+        raise LocalMeetScribeError(
+            "Optimizer produced no usable audio, even after preserving silence."
+        )
+    raise LocalMeetScribeError("Optimizer produced no usable audio.")
+
+
+def _encode_ffmpeg_chunk(
+    *,
+    input_path: Path,
+    output_path: Path,
+    settings: Settings,
+    recommendation: Recommendation,
+    overrides: OptimizerOverrides,
+    start_sec: float,
+    end_sec: float,
+) -> None:
     ffmpeg = _require_tool(settings.ffmpeg_binary)
     filters = _audio_filters(overrides)
     cmd = [
@@ -487,6 +534,45 @@ def _run_ffmpeg_chunk(
     )
     if completed.returncode != 0:
         raise LocalMeetScribeError(f"Optimizer ffmpeg failed: {completed.stderr.strip()}")
+
+
+def _optimized_chunk_is_valid(path: Path, settings: Settings) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        media_info = probe_media(path, settings)
+        if not math.isfinite(media_info.duration_sec) or media_info.duration_sec <= 0:
+            return False
+        ffprobe = _require_tool(settings.ffprobe_binary)
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode != 0 or not completed.stdout:
+            return False
+        payload = json.loads(completed.stdout)
+        streams = payload.get("streams")
+        if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+            return False
+        return int(str(streams[0].get("nb_read_packets") or 0)) > 0
+    except (json.JSONDecodeError, LocalMeetScribeError, OSError, TypeError, ValueError):
+        return False
 
 
 def _audio_filters(overrides: OptimizerOverrides) -> list[str]:
