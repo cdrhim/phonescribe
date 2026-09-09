@@ -2412,6 +2412,13 @@ function primaryActionLabel(stage: WorkflowStage): string {
 function workflowErrorMessage(error: string | null | undefined): string {
   const detail = error?.trim();
   if (!detail) return "PC 서버 작업을 완료하지 못했습니다.";
+  if (
+    /no usable audio|contains no usable audio|no decodable positive duration|zero-length audio/i.test(
+      detail
+    )
+  ) {
+    return "녹음은 저장됐지만 들을 수 있는 음성이 없습니다. 마이크 권한을 확인한 뒤 다시 녹음해 주세요.";
+  }
   if (/Internal error encountered|temporarily unavailable/i.test(detail)) {
     return "Gemini 서버가 일시적으로 응답하지 않았습니다. 저장된 음원으로 다시 처리할 수 있습니다.";
   }

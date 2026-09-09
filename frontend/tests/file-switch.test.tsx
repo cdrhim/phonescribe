@@ -1217,6 +1217,31 @@ describe("Supabase signed upload", () => {
   });
 });
 
+describe("workflow errors", () => {
+  it.each([
+    "The recording contains no usable audio, so it cannot be transcribed.",
+    "The audio stream is present but has no decodable positive duration.",
+    "Optimizer produced a zero-length audio chunk."
+  ])("explains unusable recording audio in Korean: %s", async (error) => {
+    seedOldWorkflow();
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "failed",
+      error
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText(
+        "녹음은 저장됐지만 들을 수 있는 음성이 없습니다. 마이크 권한을 확인한 뒤 다시 녹음해 주세요."
+      )
+    ).toBeTruthy();
+  });
+});
+
 describe("automatic TXT download", () => {
   it("shows one clear completion card with a direct TXT download action", async () => {
     seedOldWorkflow();

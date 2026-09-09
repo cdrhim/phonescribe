@@ -188,11 +188,17 @@ def optimize_audio_package(
     output_dir = output_root / package_id
     output_dir.mkdir(parents=True, exist_ok=True)
     source_info = probe_media(input_path, settings)
+    if not math.isfinite(source_info.duration_sec) or source_info.duration_sec <= 0:
+        raise LocalMeetScribeError(
+            "The recording has no decodable positive duration, so it cannot be optimized."
+        )
     recommendation = recommend_optimization(source_info, input_path.stat().st_size, request)
     split_points = _split_points(input_path, settings, source_info, recommendation)
 
     chunks: list[OptimizedChunk] = []
     for index, (start, end) in enumerate(split_points, start=1):
+        if not all(math.isfinite(value) for value in (start, end)) or end <= start:
+            raise LocalMeetScribeError("Optimizer produced an invalid zero-length audio range.")
         filename = f"chunk_{index:03d}.{recommendation.codec}"
         output_path = output_dir / filename
         _run_ffmpeg_chunk(
@@ -204,6 +210,10 @@ def optimize_audio_package(
             start_sec=start,
             end_sec=end,
         )
+        optimized_info = probe_media(output_path, settings)
+        if optimized_info.duration_sec <= 0:
+            output_path.unlink(missing_ok=True)
+            raise LocalMeetScribeError("Optimizer produced a zero-length audio chunk.")
         chunks.append(
             OptimizedChunk(
                 filename=filename,

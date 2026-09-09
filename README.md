@@ -97,7 +97,7 @@ For a shared deployment, configure the key on the server instead:
 ```powershell
 $env:LOCAL_MEETSCRIBE_ENABLE_GEMINI_TRANSCRIPTION = "true"
 $env:GEMINI_API_KEY = "your_google_ai_studio_key"
-$env:LOCAL_MEETSCRIBE_GEMINI_MODEL = "gemini-3.5-flash"
+$env:LOCAL_MEETSCRIBE_GEMINI_MODEL = "gemini-3.8-flash"
 local-meetscribe serve --host 127.0.0.1 --port 8765
 ```
 
@@ -112,10 +112,13 @@ continuous workflow to the user; there is no separate resume-transcription step.
 transcription is running, the page shows completed chunks, the active chunk, percentage, and an ETA
 calculated after the first chunk completes.
 
-Gemini calls use the Interactions API. Retryable service failures fall back from the configured
-model to the stable audio-capable `gemini-3.5-flash` and `gemini-3.5-flash-lite` models. Optimized
-audio and completed chunks remain on disk, so a retry does not require another upload or repeat
-successful chunks.
+Gemini calls use the Interactions API. The default is the GA, audio-capable
+`gemini-3.8-flash`; retryable service failures fall back once to the stable audio-capable
+`gemini-2.5-flash`. Optimized audio and completed chunks remain on disk, so a retry does not
+require another upload or repeat successful chunks. Gemini requests are serialized on the server
+so restart recovery cannot send several recordings to Gemini at once and amplify rate limits.
+Zero-duration recording artifacts are rejected locally before any Gemini request and are reported
+as a recording failure instead of being retried as a provider outage.
 
 With the shared passcode flow, enter the passcode, start recording, and press
 `Stop recording and start transcription`. From that point, upload, optimization, transcription, the

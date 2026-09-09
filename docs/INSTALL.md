@@ -49,7 +49,7 @@ Gemini dispatch is intentionally separate from the local default pipeline:
 uv pip install -e .[llm]
 set LOCAL_MEETSCRIBE_ENABLE_GEMINI_TRANSCRIPTION=true
 set GEMINI_API_KEY=your_google_ai_studio_key
-set LOCAL_MEETSCRIBE_GEMINI_MODEL=gemini-3.6-flash
+set LOCAL_MEETSCRIBE_GEMINI_MODEL=gemini-3.8-flash
 ```
 
 Restart the server after changing these values. Phone `.m4a` recordings are accepted as input;

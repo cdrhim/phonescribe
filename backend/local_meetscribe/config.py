@@ -28,7 +28,7 @@ class Settings:
     hf_token: str | None
     enable_gemini_transcription: bool = False
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     gemini_api_base: str = "https://generativelanguage.googleapis.com/v1beta"
     faster_whisper_cpu_model: str = "small"
     faster_whisper_cuda_model: str = "turbo"
@@ -91,7 +91,7 @@ def get_settings() -> Settings:
             "LOCAL_MEETSCRIBE_ENABLE_GEMINI_TRANSCRIPTION", False
         ),
         gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
-        gemini_model=os.getenv("LOCAL_MEETSCRIBE_GEMINI_MODEL", "gemini-3.5-flash"),
+        gemini_model=os.getenv("LOCAL_MEETSCRIBE_GEMINI_MODEL", "gemini-3.8-flash"),
         gemini_api_base=os.getenv(
             "LOCAL_MEETSCRIBE_GEMINI_API_BASE",
             "https://generativelanguage.googleapis.com/v1beta",

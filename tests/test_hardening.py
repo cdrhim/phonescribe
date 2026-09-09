@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from local_meetscribe.pipeline.diarize import SpeakerTurn
 from local_meetscribe.pipeline.format import RuleBasedFormatterEngine
 from local_meetscribe.pipeline.gemini import (
     GeminiChunkTranscript,
+    GeminiEmptyAudioError,
     GeminiPermanentError,
     GeminiTranscriptResult,
     GeminiTransientError,
@@ -250,7 +252,11 @@ def test_background_workflow_survives_client_request_and_keeps_text_out_of_state
     assert start_response.status_code == 202
     workflow_id = start_response.json()["workflow_id"]
 
+    deadline = time.monotonic() + 2
     status_response = client.get(f"/api/workflows/{workflow_id}")
+    while status_response.json().get("status") != "complete" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status_response = client.get(f"/api/workflows/{workflow_id}")
     assert status_response.status_code == 200
     status = status_response.json()
     assert status["status"] == "complete"
@@ -456,6 +462,44 @@ def test_gemini_request_key_is_explicit_opt_in(tmp_path: Path) -> None:
         )
 
 
+def test_gemini_rejects_empty_audio_before_loading_http_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_dir = tmp_path / "optimized" / "pkg"
+    package_dir.mkdir(parents=True)
+    (package_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source": {"filename": "empty.webm", "duration_sec": 0.0},
+                "chunks": [
+                    {
+                        "filename": "chunk_001.mp3",
+                        "start_sec": 0.0,
+                        "end_sec": 0.0,
+                        "duration_sec": 0.0,
+                        "bytes": 225,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package_dir / "chunk_001.mp3").write_bytes(b"empty mp3 header")
+    monkeypatch.setattr(
+        gemini_module,
+        "_load_httpx",
+        lambda: pytest.fail("empty audio must not call Gemini"),
+    )
+
+    with pytest.raises(GeminiEmptyAudioError, match="no usable audio"):
+        transcribe_gemini_package(
+            package_dir,
+            make_test_settings(tmp_path),
+            api_key="request-only-key",
+        )
+
+
 def test_gemini_transcription_resumes_completed_chunks(tmp_path: Path) -> None:
     package_dir = tmp_path / "optimized" / "pkg"
     package_dir.mkdir(parents=True)
@@ -594,6 +638,16 @@ def test_gemini_progress_recovers_completed_partial_chunks(tmp_path: Path) -> No
     assert progress.eta_sec is None
 
 
+def test_gemini_default_model_has_one_stable_audio_fallback(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path)
+
+    assert settings.gemini_model == "gemini-3.8-flash"
+    assert gemini_module._model_candidates(settings.gemini_model) == (  # noqa: SLF001
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+    )
+
+
 def test_gemini_interactions_falls_back_to_stable_audio_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -619,7 +673,7 @@ def test_gemini_interactions_falls_back_to_stable_audio_model(
             model = str(payload["model"])
             self.models.append(model)
             self.urls.append(url)
-            if model == "gemini-3.6-flash":
+            if model == "gemini-3.8-flash":
                 return Response(500, {"error": {"message": "Internal error encountered."}})
             return Response(
                 200,
@@ -640,15 +694,15 @@ def test_gemini_interactions_falls_back_to_stable_audio_model(
 
     generation = gemini_module._generate_inline(
         client,
-        replace(make_test_settings(tmp_path), gemini_model="gemini-3.6-flash"),
+        replace(make_test_settings(tmp_path), gemini_model="gemini-3.8-flash"),
         audio_path,
         "audio/mp3",
         "Transcribe faithfully.",
     )
 
-    assert generation.model == "gemini-3.5-flash"
+    assert generation.model == "gemini-2.5-flash"
     assert generation.text == "[00:00] test speech"
-    assert client.models == ["gemini-3.6-flash"] * 3 + ["gemini-3.5-flash"]
+    assert client.models == ["gemini-3.8-flash"] * 3 + ["gemini-2.5-flash"]
     assert all(url.endswith("/v1beta/interactions") for url in client.urls)
 
 
@@ -675,7 +729,7 @@ def test_gemini_interactions_falls_back_when_http_200_has_no_transcript(
             assert isinstance(payload, dict)
             model = str(payload["model"])
             self.models.append(model)
-            if model == "gemini-3.6-flash":
+            if model == "gemini-3.8-flash":
                 return Response({"id": "interaction-without-output", "status": "completed"})
             return Response(
                 {
@@ -695,15 +749,15 @@ def test_gemini_interactions_falls_back_when_http_200_has_no_transcript(
 
     generation = gemini_module._generate_inline(
         client,
-        replace(make_test_settings(tmp_path), gemini_model="gemini-3.6-flash"),
+        replace(make_test_settings(tmp_path), gemini_model="gemini-3.8-flash"),
         audio_path,
         "audio/mp3",
         "Transcribe faithfully.",
     )
 
-    assert generation.model == "gemini-3.5-flash"
+    assert generation.model == "gemini-2.5-flash"
     assert generation.text == "[00:00] recovered"
-    assert client.models == ["gemini-3.6-flash", "gemini-3.5-flash"]
+    assert client.models == ["gemini-3.8-flash", "gemini-2.5-flash"]
 
 
 def test_failed_workflow_recovers_when_completed_artifacts_exist(tmp_path: Path) -> None:

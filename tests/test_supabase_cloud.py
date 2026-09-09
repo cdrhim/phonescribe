@@ -23,7 +23,11 @@ from local_meetscribe.cloud.supabase import (
     SupabaseCloudError,
 )
 from local_meetscribe.config import Settings
-from local_meetscribe.pipeline.gemini import GeminiPermanentError, GeminiTransientError
+from local_meetscribe.pipeline.gemini import (
+    GeminiEmptyAudioError,
+    GeminiPermanentError,
+    GeminiTransientError,
+)
 from local_meetscribe.pipeline.optimizer import OptimizerRequest
 from local_meetscribe.security import SupabaseConfigStore
 from local_meetscribe.utils.errors import LocalMeetScribeError
@@ -692,14 +696,18 @@ def test_cloud_recording_runs_local_workflow_and_syncs_status(
 
     assert started.status_code == 202, started.text
     workflow_id = started.json()["workflow_id"]
-    state = json.loads(
-        (settings.tmp_dir / "workflows" / f"{workflow_id}.json").read_text(encoding="utf-8")
+    state = wait_for_workflow_status(
+        settings.tmp_dir / "workflows" / f"{workflow_id}.json",
+        "complete",
     )
     assert state["status"] == "complete"
     assert state["cloud_recording_id"] == RECORDING_ID
     assert state["input_kind"] == "cloud"
     assert state["optimizer_request"]["destination"] == "gemini"
     assert "test-gemini-key" not in json.dumps(state)
+    deadline = time.monotonic() + 1
+    while cloud.statuses[-1:] != ["complete"] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert cloud.statuses == ["queued", "optimizing", "transcribing", "complete"]
     assert cloud.persisted is True
 
@@ -745,6 +753,10 @@ def test_completed_upload_workflow_post_is_idempotent_after_staged_source_delete
         "/api/workflows",
         data={"destination": "gemini", "upload_id": upload_id},
     )
+    first_state_path = (
+        settings.tmp_dir / "workflows" / f"{first.json()['workflow_id']}.json"
+    )
+    first_state = wait_for_workflow_status(first_state_path, "complete")
     second = client.post(
         "/api/workflows",
         data={"destination": "gemini", "upload_id": upload_id},
@@ -752,6 +764,7 @@ def test_completed_upload_workflow_post_is_idempotent_after_staged_source_delete
 
     assert first.status_code == 202
     assert second.status_code == 202
+    assert first_state["status"] == "complete"
     assert not source_dir.parent.exists()
     assert second.json()["workflow_id"] == first.json()["workflow_id"]
     assert second.json()["package_id"] == first.json()["package_id"]
@@ -822,10 +835,12 @@ def test_transient_retry_background_task_does_not_block_graceful_shutdown(
     package_id = "4" * 32
     write_optimized_fixture(settings.data_dir / "optimized" / package_id)
     calls = 0
+    first_attempt_finished = threading.Event()
 
     def fake_transcribe(*_args: object, **_kwargs: object) -> object:
         nonlocal calls
         calls += 1
+        first_attempt_finished.set()
         raise GeminiTransientError("temporary Gemini outage")
 
     monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 60.0)
@@ -839,7 +854,14 @@ def test_transient_retry_background_task_does_not_block_graceful_shutdown(
         )
         assert started.status_code == 202
         state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert first_attempt_finished.wait(timeout=1)
+        deadline = time.monotonic() + 1
+        state: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if state.get("error_code") == "gemini_transient_retry":
+                break
+            time.sleep(0.01)
         assert state["status"] == "transcribing"
         assert state["error"] is None
     assert time.monotonic() - started_at < 2.0
@@ -857,6 +879,106 @@ def test_transient_retry_background_task_does_not_block_graceful_shutdown(
             time.sleep(0.01)
     assert lease is not None
     lease.release()
+
+
+def test_initial_workflow_background_task_only_launches_daemon_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "3" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    transcribe_started = threading.Event()
+    allow_transcribe = threading.Event()
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        transcribe_started.set()
+        allow_transcribe.wait(timeout=2)
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started_at = time.monotonic()
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        response_elapsed = time.monotonic() - started_at
+
+        assert started.status_code == 202
+        assert response_elapsed < 1.0
+        assert transcribe_started.wait(timeout=1)
+        allow_transcribe.set()
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = wait_for_workflow_status(state_path, "complete")
+
+    assert state["status"] == "complete"
+
+
+def test_transient_failure_applies_shared_cooldown_before_next_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_ids = ("1" * 32, "2" * 32)
+    for package_id in package_ids:
+        write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+
+    call_lock = threading.Lock()
+    call_times: list[float] = []
+    first_failed = threading.Event()
+    second_started = threading.Event()
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        with call_lock:
+            call_times.append(time.monotonic())
+            call_number = len(call_times)
+        if call_number == 1:
+            first_failed.set()
+            raise GeminiTransientError("temporary Gemini outage")
+        second_started.set()
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 0.2)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 0.2)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        first = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_ids[0]},
+        )
+        assert first.status_code == 202
+        assert first_failed.wait(timeout=1)
+        second = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_ids[1]},
+        )
+        assert second.status_code == 202
+        assert second_started.wait(timeout=1)
+        with call_lock:
+            first_call_at, second_call_at = call_times[:2]
+        assert second_call_at - first_call_at >= 0.15
+
+        first_state_path = (
+            settings.tmp_dir / "workflows" / f"{first.json()['workflow_id']}.json"
+        )
+        second_state_path = (
+            settings.tmp_dir / "workflows" / f"{second.json()['workflow_id']}.json"
+        )
+        first_state = wait_for_workflow_status(first_state_path, "complete")
+        second_state = wait_for_workflow_status(second_state_path, "complete")
+
+    assert first_state["status"] == "complete"
+    assert second_state["status"] == "complete"
 
 
 def test_permanent_gemini_failure_is_not_retried(
@@ -883,10 +1005,41 @@ def test_permanent_gemini_failure_is_not_retried(
 
     assert started.status_code == 202
     state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = wait_for_workflow_status(state_path, "failed")
     assert calls == 1
     assert state["status"] == "failed"
     assert state["error_code"] == "gemini_permanent"
+
+
+def test_empty_audio_failure_is_permanent_and_actionable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "9" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiEmptyAudioError("The recording contains no usable audio.")
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    client = TestClient(app_module.create_app(settings))
+
+    started = client.post(
+        "/api/workflows",
+        data={"destination": "gemini", "package_id": package_id},
+    )
+
+    assert started.status_code == 202
+    state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+    state = wait_for_workflow_status(state_path, "failed")
+    assert calls == 1
+    assert state["status"] == "failed"
+    assert state["error_code"] == "empty_audio"
+    assert "no usable audio" in str(state["error"])
 
 
 def test_startup_recovers_legacy_failed_transient_gemini_workflow(
@@ -930,6 +1083,69 @@ def test_startup_recovers_legacy_failed_transient_gemini_workflow(
     assert calls == 1
     assert recovered["status"] == "complete"
     assert recovered["recovered_after_restart"] is True
+
+
+def test_startup_serializes_recovered_gemini_workflows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    state_paths: list[Path] = []
+    for package_digit, workflow_digit in (("a", "b"), ("c", "d")):
+        package_id = package_digit * 32
+        workflow_id = workflow_digit * 32
+        write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+        state_paths.append(
+            write_recoverable_state(
+                settings,
+                workflow_id=workflow_id,
+                package_id=package_id,
+                status="transcribing",
+                input_kind="package",
+                input_id=package_id,
+            )
+        )
+
+    state_lock = threading.Lock()
+    first_started = threading.Event()
+    allow_first_to_finish = threading.Event()
+    calls = 0
+    active_calls = 0
+    max_active_calls = 0
+
+    def fake_transcribe(package_dir: Path, *_args: object, **_kwargs: object) -> object:
+        nonlocal active_calls, calls, max_active_calls
+        with state_lock:
+            calls += 1
+            call_number = calls
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+        try:
+            if call_number == 1:
+                first_started.set()
+                allow_first_to_finish.wait(timeout=2)
+            write_optimized_fixture(package_dir, transcript=True)
+            return SimpleNamespace(
+                suggested_filename="meeting",
+                txt_path=package_dir / "gemini_transcript.txt",
+            )
+        finally:
+            with state_lock:
+                active_calls -= 1
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)):
+        assert first_started.wait(timeout=1)
+        time.sleep(0.05)
+        with state_lock:
+            assert calls == 1
+            assert max_active_calls == 1
+        allow_first_to_finish.set()
+        states = [wait_for_workflow_status(path, "complete") for path in state_paths]
+
+    assert all(state["status"] == "complete" for state in states)
+    assert calls == 2
+    assert max_active_calls == 1
 
 
 def test_startup_recovers_queued_cloud_workflow_exactly_once(

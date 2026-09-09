@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -47,6 +48,7 @@ from local_meetscribe.pipeline.derivatives import (
 )
 from local_meetscribe.pipeline.export import write_exports
 from local_meetscribe.pipeline.gemini import (
+    GeminiEmptyAudioError,
     GeminiPermanentError,
     GeminiTranscriptionProgress,
     GeminiTransientError,
@@ -136,6 +138,9 @@ def create_app(
     remote_session_store = RemoteSessionStore(active_settings.data_dir)
     active_workflow_inputs: set[str] = set()
     active_workflow_lock = threading.Lock()
+    gemini_workflow_gate = threading.BoundedSemaphore(1)
+    gemini_cooldown_lock = threading.Lock()
+    gemini_not_before = 0.0
     cloud_outbox_lock = threading.Lock()
     cloud_cleanup_lock = threading.Lock()
     cloud_cleanup_last_started = float("-inf")
@@ -412,6 +417,22 @@ def create_app(
             return False
         return remote_session_store.is_valid(token)
 
+    def extend_gemini_cooldown(delay_sec: float) -> None:
+        nonlocal gemini_not_before
+        deadline = time.monotonic() + max(0.0, delay_sec)
+        with gemini_cooldown_lock:
+            gemini_not_before = max(gemini_not_before, deadline)
+
+    def wait_for_gemini_cooldown() -> bool:
+        while not maintenance_stop.is_set():
+            with gemini_cooldown_lock:
+                remaining = gemini_not_before - time.monotonic()
+            if remaining <= 0:
+                return True
+            if maintenance_stop.wait(remaining):
+                return False
+        return False
+
     def run_transcription_workflow(
         workflow_id: str,
         package_id: str,
@@ -422,12 +443,14 @@ def create_app(
         api_key: str,
         workflow_input_key: str,
         workflow_lease: _WorkflowInputLease,
+        gemini_slot_acquired: bool = False,
     ) -> None:
         output_root = active_settings.data_dir / "optimized"
         output_dir = output_root / package_id
         phase = "optimizing" if upload_id or cloud_recording_id else "transcribing"
         cloud_download_dir: Path | None = None
         workflow_lease_transferred = False
+        gemini_slot_held = gemini_slot_acquired
 
         def persist_state(
             status: str,
@@ -451,6 +474,8 @@ def create_app(
 
         release_system_awake = _request_system_awake()
         try:
+            if maintenance_stop.is_set():
+                return
             if (upload_id or cloud_recording_id) and not _optimized_package_complete(output_dir):
                 persist_state("optimizing")
                 shutil.rmtree(output_dir, ignore_errors=True)
@@ -490,12 +515,76 @@ def create_app(
 
             phase = "transcribing"
             persist_state("transcribing")
-            try:
-                transcript_result = transcribe_gemini_package(
-                    output_dir,
-                    active_settings,
-                    api_key=api_key,
+            if not gemini_slot_held and not gemini_workflow_gate.acquire(blocking=False):
+
+                def queued_gemini_worker() -> None:
+                    release_wait_awake = _request_system_awake()
+                    slot_ready = False
+                    try:
+                        while not maintenance_stop.wait(0.25):
+                            if gemini_workflow_gate.acquire(blocking=False):
+                                slot_ready = True
+                                break
+                    finally:
+                        with suppress(Exception):
+                            release_wait_awake()
+                    if slot_ready and maintenance_stop.is_set():
+                        gemini_workflow_gate.release()
+                        slot_ready = False
+                    if slot_ready:
+                        run_transcription_workflow(
+                            workflow_id,
+                            package_id,
+                            upload_id,
+                            cloud_recording_id,
+                            cloud_client,
+                            optimizer_request,
+                            api_key,
+                            workflow_input_key,
+                            workflow_lease,
+                            True,
+                        )
+                    else:
+                        workflow_lease.release()
+                        with active_workflow_lock:
+                            active_workflow_inputs.discard(workflow_input_key)
+
+                queued_thread = threading.Thread(
+                    target=queued_gemini_worker,
+                    name=f"phonescribe-gemini-queue-{workflow_id[:8]}",
+                    daemon=True,
                 )
+                queued_thread.start()
+                workflow_lease_transferred = True
+                return
+            gemini_slot_held = True
+            if not wait_for_gemini_cooldown() or maintenance_stop.is_set():
+                return
+            transcription_retry_count: int | None = None
+            retry_delay: float | None = None
+            try:
+                try:
+                    transcript_result = transcribe_gemini_package(
+                        output_dir,
+                        active_settings,
+                        api_key=api_key,
+                    )
+                except GeminiTransientError:
+                    if not _gemini_outputs_complete(output_dir):
+                        transcription_retry_count = (
+                            _workflow_transcription_retry_count(
+                                _workflow_state_path(active_settings, workflow_id)
+                            )
+                            + 1
+                        )
+                        retry_delay = _gemini_workflow_retry_delay(
+                            transcription_retry_count
+                        )
+                        extend_gemini_cooldown(retry_delay)
+                    raise
+                finally:
+                    gemini_workflow_gate.release()
+                    gemini_slot_held = False
             except GeminiTransientError as exc:
                 if _gemini_outputs_complete(output_dir):
                     auto_exported, auto_export_error = _auto_export_stored_transcript(
@@ -508,13 +597,14 @@ def create_app(
                         auto_export_error=auto_export_error,
                     )
                     return
-                transcription_retry_count = (
-                    _workflow_transcription_retry_count(
-                        _workflow_state_path(active_settings, workflow_id)
+                if transcription_retry_count is None or retry_delay is None:
+                    transcription_retry_count = (
+                        _workflow_transcription_retry_count(
+                            _workflow_state_path(active_settings, workflow_id)
+                        )
+                        + 1
                     )
-                    + 1
-                )
-                retry_delay = _gemini_workflow_retry_delay(transcription_retry_count)
+                    retry_delay = _gemini_workflow_retry_delay(transcription_retry_count)
                 persist_state(
                     "transcribing",
                     durable_fields={
@@ -612,7 +702,9 @@ def create_app(
                 error=_background_error_message(exc),
                 durable_fields={
                     "error_code": (
-                        "gemini_permanent"
+                        "empty_audio"
+                        if isinstance(exc, GeminiEmptyAudioError)
+                        else "gemini_permanent"
                         if isinstance(exc, GeminiPermanentError)
                         else "workflow_failed"
                     )
@@ -621,8 +713,61 @@ def create_app(
         finally:
             if cloud_download_dir is not None:
                 shutil.rmtree(cloud_download_dir, ignore_errors=True)
+            if gemini_slot_held:
+                gemini_workflow_gate.release()
             release_system_awake()
             if not workflow_lease_transferred:
+                workflow_lease.release()
+                with active_workflow_lock:
+                    active_workflow_inputs.discard(workflow_input_key)
+
+    def launch_transcription_workflow(
+        workflow_id: str,
+        package_id: str,
+        upload_id: str | None,
+        cloud_recording_id: str | None,
+        cloud_client: SupabaseCloudClient | None,
+        optimizer_request: OptimizerRequest,
+        api_key: str,
+        workflow_input_key: str,
+        workflow_lease: _WorkflowInputLease,
+    ) -> None:
+        worker = threading.Thread(
+            target=run_transcription_workflow,
+            args=(
+                workflow_id,
+                package_id,
+                upload_id,
+                cloud_recording_id,
+                cloud_client,
+                optimizer_request,
+                api_key,
+                workflow_input_key,
+                workflow_lease,
+            ),
+            name=f"phonescribe-workflow-{workflow_id[:8]}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001 - the accepted workflow needs a durable failure.
+            LOGGER.error(
+                "Could not launch background workflow %s (%s)",
+                workflow_id,
+                type(exc).__name__,
+            )
+            try:
+                persist_workflow_state(
+                    workflow_id=workflow_id,
+                    package_id=package_id,
+                    status="failed",
+                    error="The server could not start the background transcription worker.",
+                    cloud_recording_id=cloud_recording_id,
+                    cloud_client=cloud_client,
+                    durable_fields={"error_code": "workflow_worker_start_failed"},
+                    attempt_cloud_delivery=False,
+                )
+            finally:
                 workflow_lease.release()
                 with active_workflow_lock:
                     active_workflow_inputs.discard(workflow_input_key)
@@ -1416,7 +1561,7 @@ def create_app(
                 },
             )
             background_tasks.add_task(
-                run_transcription_workflow,
+                launch_transcription_workflow,
                 workflow_id,
                 resolved_package_id,
                 upload_id,
@@ -2203,6 +2348,11 @@ def _gemini_outputs_complete(package_dir: Path) -> bool:
 def _optimized_package_complete(package_dir: Path) -> bool:
     try:
         manifest = _read_json_object(package_dir / "manifest.json")
+        source = manifest.get("source")
+        if isinstance(source, dict) and "duration_sec" in source:
+            source_duration = float(str(source["duration_sec"]))
+            if not math.isfinite(source_duration) or source_duration <= 0:
+                return False
         raw_chunks = manifest.get("chunks")
         if not isinstance(raw_chunks, list) or not raw_chunks:
             return False
@@ -2212,11 +2362,25 @@ def _optimized_package_complete(package_dir: Path) -> bool:
             filename = str(item.get("filename") or "")
             if not filename or Path(filename).name != filename:
                 return False
+            start_sec = float(str(item.get("start_sec")))
+            end_sec = float(str(item.get("end_sec")))
+            if (
+                not math.isfinite(start_sec)
+                or not math.isfinite(end_sec)
+                or end_sec <= start_sec
+            ):
+                return False
+            if "duration_sec" in item:
+                duration_sec = float(str(item["duration_sec"]))
+                if not math.isfinite(duration_sec) or duration_sec <= 0:
+                    return False
+            if "bytes" in item and int(str(item["bytes"])) <= 0:
+                return False
             chunk_path = package_dir / filename
             if not chunk_path.is_file() or chunk_path.stat().st_size <= 0:
                 return False
         return True
-    except (LocalMeetScribeError, OSError):
+    except (LocalMeetScribeError, OSError, TypeError, ValueError):
         return False
 
 

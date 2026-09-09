@@ -22,7 +22,7 @@ INLINE_LIMIT_BYTES = 20 * 1024 * 1024
 MAX_REQUEST_ATTEMPTS = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MODEL_FALLBACK_STATUS_CODES = RETRYABLE_STATUS_CODES | {400, 404}
-GEMINI_FALLBACK_MODELS = ("gemini-3.5-flash", "gemini-3.5-flash-lite")
+GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash",)
 INTERACTION_POLL_ATTEMPTS = 120
 PARTIAL_TRANSCRIPT_FILENAME = "gemini_transcript.partial.json"
 PROGRESS_FILENAME = "gemini_progress.json"
@@ -41,6 +41,10 @@ class GeminiTransientError(LocalMeetScribeError):
 
 class GeminiPermanentError(LocalMeetScribeError):
     """A Gemini request failure that requires configuration or input changes."""
+
+
+class GeminiEmptyAudioError(GeminiPermanentError):
+    """An optimized package that contains no playable audio."""
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,12 @@ def transcribe_gemini_package(
             started_at=datetime.now(UTC).isoformat(),
         )
         return completed_result
+
+    if not any(_chunk_duration_sec(item) > 0 for item in valid_chunks_meta):
+        raise GeminiEmptyAudioError(
+            "The recording contains no usable audio, so it cannot be transcribed. "
+            "Start a new recording and confirm that its timer is moving before stopping it."
+        )
 
     httpx = _load_httpx()
     partial_path = package_dir / PARTIAL_TRANSCRIPT_FILENAME
@@ -868,6 +878,21 @@ def _model_candidates(configured_model: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((configured_model, *GEMINI_FALLBACK_MODELS)))
 
 
+def _chunk_duration_sec(chunk_meta: dict[str, Any]) -> float:
+    try:
+        duration = float(chunk_meta.get("duration_sec") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration > 0:
+        return duration
+    try:
+        start_sec = float(chunk_meta.get("start_sec") or 0.0)
+        end_sec = float(chunk_meta.get("end_sec") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, end_sec - start_sec)
+
+
 def _result_model(chunks: list[GeminiChunkTranscript], configured_model: str) -> str:
     models = list(dict.fromkeys(chunk.model or configured_model for chunk in chunks))
     return " + ".join(models) if models else configured_model
@@ -908,8 +933,9 @@ def _load_partial_transcripts(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    if payload.get("model") != model or not isinstance(payload.get("chunks"), list):
+    if not isinstance(payload.get("chunks"), list):
         return {}
+    checkpoint_model = str(payload.get("model") or model)
     completed: dict[str, GeminiChunkTranscript] = {}
     for item in payload["chunks"]:
         if not isinstance(item, dict):
@@ -926,7 +952,7 @@ def _load_partial_transcripts(
             delivery=delivery,  # type: ignore[arg-type]
             mime_type=str(item.get("mime_type") or "audio/mp3"),
             text=text,
-            model=str(item.get("model") or model),
+            model=str(item.get("model") or checkpoint_model),
         )
     return completed
 

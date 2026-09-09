@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import wave
@@ -49,6 +50,105 @@ def _require_tool(binary: str, install_hint: str) -> str:
     raise ExternalToolError(binary, install_hint)
 
 
+def _finite_float(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _packet_duration(path: Path, ffprobe: str) -> float:
+    """Derive duration from packet timestamps when a streamed container omits it."""
+
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=pts_time,duration_time",
+            "-of",
+            "compact=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return 0.0
+
+    first_pts: float | None = None
+    last_end: float | None = None
+    for line in completed.stdout.splitlines():
+        fields = {}
+        for entry in line.split("|"):
+            key, separator, value = entry.partition("=")
+            if separator:
+                fields[key] = value
+        pts = _finite_float(fields.get("pts_time"))
+        if pts is None:
+            continue
+        packet_duration = _finite_float(fields.get("duration_time")) or 0.0
+        first_pts = pts if first_pts is None else min(first_pts, pts)
+        packet_end = pts + max(0.0, packet_duration)
+        last_end = packet_end if last_end is None else max(last_end, packet_end)
+
+    if first_pts is None or last_end is None:
+        return 0.0
+    return max(0.0, last_end - first_pts)
+
+
+def _decoded_duration(path: Path, settings: Settings) -> float:
+    """Decode to a null sink as a final duration fallback without retaining audio."""
+
+    ffmpeg = _require_tool(
+        settings.ffmpeg_binary,
+        "Install ffmpeg/ffprobe and ensure it is on PATH, or provide a 16 kHz mono WAV.",
+    )
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-f",
+            "null",
+            "-",
+            "-progress",
+            "pipe:1",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return 0.0
+
+    duration = 0.0
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in {"out_time_us", "out_time_ms"}:
+            continue
+        raw_duration = _finite_float(value)
+        if raw_duration is not None:
+            duration = max(duration, raw_duration / 1_000_000)
+    return duration
+
+
 def probe_media(path: Path, settings: Settings) -> MediaInfo:
     if not path.exists():
         raise LocalMeetScribeError(f"Input file does not exist: {path}")
@@ -91,10 +191,20 @@ def probe_media(path: Path, settings: Settings) -> MediaInfo:
     )
     if audio_stream is None:
         raise LocalMeetScribeError("Input does not contain an audio stream.")
-    duration_raw = audio_stream.get("duration") or data.get("format", {}).get("duration") or 0
+    duration = _finite_float(audio_stream.get("duration")) or _finite_float(
+        data.get("format", {}).get("duration")
+    )
+    if duration is None or duration <= 0:
+        duration = _packet_duration(path, ffprobe)
+    if duration <= 0:
+        duration = _decoded_duration(path, settings)
+    if duration <= 0:
+        raise LocalMeetScribeError(
+            "The audio stream is present but has no decodable positive duration."
+        )
     return MediaInfo(
         filename=path.name,
-        duration_sec=float(duration_raw),
+        duration_sec=duration,
         sample_rate=int(audio_stream.get("sample_rate") or 0),
         channels=int(audio_stream.get("channels") or 1),
     )
