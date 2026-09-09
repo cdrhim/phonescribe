@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import * as api from "../src/api";
@@ -42,6 +42,7 @@ const runtime: RuntimeProfile = {
 };
 let restoreRecordingBrowser: (() => void) | null = null;
 let restoreWakeLockBrowser: (() => void) | null = null;
+let restoreFullscreenBrowser: (() => void) | null = null;
 
 function analysis(filename: string, upload_id = "test-upload"): OptimizerAnalysisResponse {
   return {
@@ -147,11 +148,24 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
       } as BlobEvent);
       this.onstop?.(new Event("stop"));
     }
+
+    fail() {
+      this.state = "inactive";
+      this.onerror?.(new Event("error"));
+    }
   }
+
+  let recorder: MockMediaRecorder | null = null;
 
   Object.defineProperty(globalThis, "MediaRecorder", {
     configurable: true,
-    value: MockMediaRecorder
+    value: class extends MockMediaRecorder {
+      constructor(...args: ConstructorParameters<typeof MediaRecorder>) {
+        super();
+        void args;
+        recorder = this;
+      }
+    }
   });
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
@@ -169,11 +183,18 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
       Reflect.deleteProperty(navigator, "mediaDevices");
     }
   };
+  return {
+    fail() {
+      recorder?.fail();
+    }
+  };
 }
 
 async function recordNow() {
   fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
-  await screen.findByText("녹음 중");
+  await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+    "녹음 중"
+  );
   fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
 }
 
@@ -182,7 +203,9 @@ async function recordNowWithFakeTimers() {
   await act(async () => {
     await Promise.resolve();
   });
-  expect(screen.getByText("녹음 중")).toBeTruthy();
+  expect(
+    within(screen.getByRole("dialog", { name: "녹음 중 화면" })).getByText("녹음 중")
+  ).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
   await act(async () => {
     await Promise.resolve();
@@ -237,6 +260,62 @@ function installUnsupportedWakeLockBrowser() {
   };
 }
 
+function installFullscreenBrowser(options: { reject?: boolean; unsupported?: boolean } = {}) {
+  const requestDescriptor = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "requestFullscreen"
+  );
+  const exitDescriptor = Object.getOwnPropertyDescriptor(document, "exitFullscreen");
+  const elementDescriptor = Object.getOwnPropertyDescriptor(document, "fullscreenElement");
+  let fullscreenElement: Element | null = null;
+  const request = vi.fn(async function (this: HTMLElement) {
+    if (options.reject) throw new DOMException("denied", "NotAllowedError");
+    fullscreenElement = this;
+    document.dispatchEvent(new Event("fullscreenchange"));
+  });
+  const exit = vi.fn(async () => {
+    fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+  });
+
+  Object.defineProperty(document, "fullscreenElement", {
+    configurable: true,
+    get: () => fullscreenElement
+  });
+  if (options.unsupported) {
+    Reflect.deleteProperty(HTMLElement.prototype, "requestFullscreen");
+    Reflect.deleteProperty(document, "exitFullscreen");
+  } else {
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      value: request
+    });
+    Object.defineProperty(document, "exitFullscreen", {
+      configurable: true,
+      value: exit
+    });
+  }
+
+  restoreFullscreenBrowser = () => {
+    if (requestDescriptor) {
+      Object.defineProperty(HTMLElement.prototype, "requestFullscreen", requestDescriptor);
+    } else {
+      Reflect.deleteProperty(HTMLElement.prototype, "requestFullscreen");
+    }
+    if (exitDescriptor) {
+      Object.defineProperty(document, "exitFullscreen", exitDescriptor);
+    } else {
+      Reflect.deleteProperty(document, "exitFullscreen");
+    }
+    if (elementDescriptor) {
+      Object.defineProperty(document, "fullscreenElement", elementDescriptor);
+    } else {
+      Reflect.deleteProperty(document, "fullscreenElement");
+    }
+  };
+  return { request, exit };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
@@ -256,6 +335,9 @@ afterEach(() => {
   restoreRecordingBrowser = null;
   restoreWakeLockBrowser?.();
   restoreWakeLockBrowser = null;
+  restoreFullscreenBrowser?.();
+  restoreFullscreenBrowser = null;
+  document.body.classList.remove("recording-focus-active");
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -289,7 +371,9 @@ describe("direct phone recording", () => {
 
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
-    await screen.findByText("녹음 중");
+    await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+      "녹음 중"
+    );
     fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
 
     await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
@@ -344,7 +428,11 @@ describe("direct phone recording", () => {
     expect((newRecording as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(newRecording);
 
-    expect(await screen.findByText("마이크 연결 중")).toBeTruthy();
+    expect(
+      await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+        "마이크 연결 중"
+      )
+    ).toBeTruthy();
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).workflowId).toBe(OLD_ID);
     expect(window.location.search).toContain(OLD_ID);
 
@@ -354,7 +442,11 @@ describe("direct phone recording", () => {
       } as unknown as MediaStream);
     });
 
-    expect(await screen.findByText("녹음 중")).toBeTruthy();
+    expect(
+      await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+        "녹음 중"
+      )
+    ).toBeTruthy();
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
     expect(window.location.search).toBe("");
   });
@@ -392,7 +484,11 @@ describe("direct phone recording", () => {
     expect((startRecording as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(startRecording);
 
-    expect(await screen.findByText("녹음 중")).toBeTruthy();
+    expect(
+      await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+        "녹음 중"
+      )
+    ).toBeTruthy();
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
     expect(window.location.search).toBe("");
   });
@@ -419,11 +515,12 @@ describe("direct phone recording", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
 
-    expect(await screen.findByText(/화면 자동 잠금 방지 중입니다/)).toBeTruthy();
+    const recordingScreen = await screen.findByRole("dialog", { name: "녹음 중 화면" });
+    expect(await within(recordingScreen).findByText(/화면 자동 잠금 방지 중입니다/)).toBeTruthy();
     expect(wakeLock.request).toHaveBeenCalledWith("screen");
     act(() => wakeLock.releaseFromBrowser());
     expect(
-      await screen.findByText(/화면 자동 잠금 방지가 해제되었습니다/)
+      await within(recordingScreen).findByText(/화면 자동 잠금 방지가 해제되었습니다/)
     ).toBeTruthy();
   });
 
@@ -437,7 +534,9 @@ describe("direct phone recording", () => {
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
 
     expect(
-      await screen.findByText(/화면 자동 잠금 방지를 사용할 수 없습니다/)
+      await within(
+        await screen.findByRole("dialog", { name: "녹음 중 화면" })
+      ).findByText(/화면 자동 잠금 방지를 사용할 수 없습니다/)
     ).toBeTruthy();
   });
 
@@ -451,8 +550,147 @@ describe("direct phone recording", () => {
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
 
     expect(
-      await screen.findByText(/화면 자동 잠금 방지를 사용할 수 없습니다/)
+      await within(
+        await screen.findByRole("dialog", { name: "녹음 중 화면" })
+      ).findByText(/화면 자동 잠금 방지를 사용할 수 없습니다/)
     ).toBeTruthy();
+  });
+
+  it("enters a dark fullscreen recording view with an elapsed timer and explicit stop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-09T13:32:19+09:00"));
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    const fullscreen = installFullscreenBrowser();
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" })).toBeTruthy();
+    expect(document.body.classList.contains("recording-focus-active")).toBe(true);
+    expect(fullscreen.request).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2100);
+    });
+    expect(
+      within(screen.getByRole("dialog", { name: "녹음 중 화면" })).getByText("0:02")
+    ).toBeTruthy();
+  });
+
+  it("leaves fullscreen and restores the normal page when recording stops", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    const wakeLock = installWakeLockBrowser();
+    const fullscreen = installFullscreenBrowser();
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "녹음 중 화면" })).toBeNull();
+      expect(document.body.classList.contains("recording-focus-active")).toBe(false);
+      expect(fullscreen.exit).toHaveBeenCalledOnce();
+      expect(wakeLock.release).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each([
+    ["is unavailable", { unsupported: true }],
+    ["is rejected", { reject: true }]
+  ])("keeps recording when fullscreen %s", async (_label, options) => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    installFullscreenBrowser(options);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+
+    expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+    expect(
+      within(screen.getByRole("dialog", { name: "녹음 중 화면" })).getByText("녹음 중")
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" })).toBeTruthy();
+    expect(document.body.classList.contains("recording-focus-active")).toBe(true);
+  });
+
+  it("restores the normal page when the recorder reports an error", async () => {
+    const recording = installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    const fullscreen = installFullscreenBrowser();
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+
+    act(() => recording.fail());
+
+    expect(
+      await screen.findByText("녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요.")
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "녹음 중 화면" })).toBeNull();
+      expect(document.body.classList.contains("recording-focus-active")).toBe(false);
+      expect(fullscreen.exit).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("restores fullscreen, Wake Lock, and the page class when App unmounts", async () => {
+    const stopTrack = vi.fn();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: stopTrack }]
+    } as unknown as MediaStream));
+    const wakeLock = installWakeLockBrowser();
+    const fullscreen = installFullscreenBrowser();
+
+    const view = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+
+    view.unmount();
+
+    await waitFor(() => {
+      expect(document.body.classList.contains("recording-focus-active")).toBe(false);
+      expect(fullscreen.exit).toHaveBeenCalledOnce();
+      expect(wakeLock.release).toHaveBeenCalledOnce();
+      expect(stopTrack).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("prevents accidental navigation only while a recording is active", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    installFullscreenBrowser();
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
+
+    const duringRecording = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(duringRecording);
+    expect(duringRecording.defaultPrevented).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "녹음 중 화면" })).toBeNull();
+    });
+
+    const afterRecording = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(afterRecording);
+    expect(afterRecording.defaultPrevented).toBe(false);
   });
 });
 
@@ -566,7 +804,9 @@ describe("recording transfer retry", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "새 녹음 시작" }));
-    await screen.findByText("녹음 중");
+    await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
+      "녹음 중"
+    );
     fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
     await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce());
 
@@ -679,7 +919,9 @@ describe("recording transfer retry", () => {
     await act(async () => {
       await Promise.resolve();
     });
-    expect(screen.getByText("녹음 중")).toBeTruthy();
+    expect(
+      within(screen.getByRole("dialog", { name: "녹음 중 화면" })).getByText("녹음 중")
+    ).toBeTruthy();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);

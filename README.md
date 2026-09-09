@@ -128,10 +128,14 @@ The phone page offers `Start recording now`. It records from the browser microph
 supported Opus WebM or MP4 audio container, and begins transcription preparation when the user
 presses `Stop recording and start transcription`. If shared access has not been confirmed, the
 recording stays in the current tab until the passcode is confirmed. The page requests a Screen Wake
-Lock while recording and until the server accepts the job.
+Lock while recording and until the server accepts the job. Starting a recording also opens a
+near-black focus screen, requests browser fullscreen where supported, and leaves only the elapsed
+time and the stop button visible. Stopping, a recording error, or leaving the page restores the normal
+theme and releases fullscreen and the Wake Lock.
 
 Mobile browsers cannot guarantee microphone capture after the user locks the phone or the operating
-system suspends the browser. The Wake Lock prevents automatic screen locking where supported. For
+system suspends the browser. A web page cannot change hardware brightness or block the power, Home,
+Back, or app-close controls. The Wake Lock prevents automatic screen locking where supported. For
 guaranteed recording with the screen off, this repository now includes the native Android recorder
 under `android-recorder`. After recording stops and the upload is accepted, processing no longer
 depends on the phone screen.

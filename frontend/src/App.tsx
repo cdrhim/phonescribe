@@ -138,12 +138,17 @@ export function App() {
   const [serverExportStatus, setServerExportStatus] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
+  const darkRecordingMode =
+    recordingState === "starting" || recordingState === "recording";
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStartedAtRef = useRef<number | null>(null);
+  const recordingFocusRequestedRef = useRef(false);
+  const recordingFullscreenOwnedRef = useRef(false);
+  const recordingStopButtonRef = useRef<HTMLButtonElement | null>(null);
   const workflowStartingRef = useRef(false);
   const analysisStartingRef = useRef(false);
   const uploadAbortRef = useRef<AbortController | null>(null);
@@ -173,6 +178,31 @@ export function App() {
     return () => URL.revokeObjectURL(objectUrl);
   }, [file]);
 
+  useEffect(() => {
+    if (!darkRecordingMode) return;
+    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    const previousThemeColor = themeColor?.content;
+    const preventAccidentalClose = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+
+    document.body.classList.add("recording-focus-active");
+    if (themeColor) themeColor.content = "#020202";
+    window.addEventListener("beforeunload", preventAccidentalClose);
+    return () => {
+      document.body.classList.remove("recording-focus-active");
+      if (themeColor && previousThemeColor !== undefined) {
+        themeColor.content = previousThemeColor;
+      }
+      window.removeEventListener("beforeunload", preventAccidentalClose);
+    };
+  }, [darkRecordingMode]);
+
+  useEffect(() => {
+    if (recordingState === "recording") recordingStopButtonRef.current?.focus();
+  }, [recordingState]);
+
   useEffect(
     () => () => {
       selectionVersionRef.current += 1;
@@ -182,6 +212,7 @@ export function App() {
         recordingRetryTimerRef.current = null;
       }
       stopProgressPolling();
+      endRecordingFocusMode();
       void wakeLockRef.current?.release();
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state !== "inactive") {
@@ -662,8 +693,46 @@ export function App() {
     setSaveBaseName(baseNameFromFile(selected.name));
   }
 
+  function beginRecordingFocusMode() {
+    recordingFocusRequestedRef.current = true;
+    const root = document.documentElement;
+    if (
+      document.fullscreenElement ||
+      document.fullscreenEnabled === false ||
+      typeof root.requestFullscreen !== "function"
+    ) {
+      return;
+    }
+    void root
+      .requestFullscreen()
+      .then(() => {
+        recordingFullscreenOwnedRef.current = document.fullscreenElement === root;
+        if (!recordingFocusRequestedRef.current) endRecordingFocusMode();
+      })
+      .catch(() => {
+        // The fixed dark recording screen still works when fullscreen is unavailable.
+      });
+  }
+
+  function endRecordingFocusMode() {
+    recordingFocusRequestedRef.current = false;
+    if (
+      !recordingFullscreenOwnedRef.current ||
+      !document.fullscreenElement ||
+      typeof document.exitFullscreen !== "function"
+    ) {
+      recordingFullscreenOwnedRef.current = false;
+      return;
+    }
+    recordingFullscreenOwnedRef.current = false;
+    void document.exitFullscreen().catch(() => {
+      // Fullscreen may already have been left through browser or system controls.
+    });
+  }
+
   async function startDirectRecording(replaceCurrent = false) {
     if (!recordingSupported || recordingActive || (busy && !replaceCurrent)) return;
+    beginRecordingFocusMode();
     setRecordingState("starting");
     setRecordingElapsedSec(0);
     setError(null);
@@ -689,8 +758,10 @@ export function App() {
         if (event.data.size > 0) recordingChunksRef.current.push(event.data);
       };
       recorder.onerror = () => {
-        setError("녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요.");
-        finishDirectRecording(null);
+        finishDirectRecording(
+          null,
+          "녹음이 중단되었습니다. 마이크 권한과 브라우저 상태를 확인하세요."
+        );
       };
       recorder.onstop = () => {
         const chunks = recordingChunksRef.current;
@@ -702,6 +773,7 @@ export function App() {
       if (replaceCurrent) resetFile();
       setRecordingState("recording");
     } catch (recordingError) {
+      endRecordingFocusMode();
       stopRecordingStream();
       setRecordingState("idle");
       setError(recordingPermissionMessage(recordingError));
@@ -711,6 +783,7 @@ export function App() {
   function stopDirectRecording() {
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === "inactive" || recordingState === "stopping") return;
+    endRecordingFocusMode();
     setRecordingState("stopping");
     try {
       recorder.requestData();
@@ -720,14 +793,18 @@ export function App() {
     recorder.stop();
   }
 
-  function finishDirectRecording(recording: Blob | null) {
+  function finishDirectRecording(
+    recording: Blob | null,
+    emptyRecordingError = "녹음된 음성이 없습니다. 다시 녹음해 주세요."
+  ) {
+    endRecordingFocusMode();
     mediaRecorderRef.current = null;
     recordingStartedAtRef.current = null;
     recordingChunksRef.current = [];
     stopRecordingStream();
     setRecordingState("idle");
     if (!recording || recording.size === 0) {
-      setError("녹음된 음성이 없습니다. 다시 녹음해 주세요.");
+      setError(emptyRecordingError);
       return;
     }
     const extension = recordingExtension(recording.type);
@@ -1348,7 +1425,40 @@ export function App() {
 
   return (
     <main className="app-page">
-      <div className="app-shell">
+      {darkRecordingMode && (
+        <section
+          className="recording-focus-screen"
+          role="dialog"
+          aria-label="녹음 중 화면"
+          aria-modal="true"
+          tabIndex={-1}
+          autoFocus
+        >
+          <div className="recording-focus-content">
+            <span className="recording-focus-indicator" aria-hidden="true" />
+            <strong aria-live="polite">
+              {recordingState === "starting" ? "마이크 연결 중" : "녹음 중"}
+            </strong>
+            <span className="recording-focus-time">{formatClock(recordingElapsedSec)}</span>
+            <p>어두운 녹음 화면입니다. {recordingWakeLockMessage(wakeLockStatus)}</p>
+            <button
+              ref={recordingStopButtonRef}
+              className="recording-focus-stop"
+              type="button"
+              disabled={recordingState !== "recording"}
+              onClick={stopDirectRecording}
+            >
+              {recordingState === "starting" ? (
+                <Loader2 className="spin" size={21} />
+              ) : (
+                <Square size={19} fill="currentColor" />
+              )}
+              녹음 종료 및 전사 시작
+            </button>
+          </div>
+        </section>
+      )}
+      <div className="app-shell" aria-hidden={darkRecordingMode || undefined}>
         <header className="app-header">
           <div className="brand-mark" aria-hidden="true">
             <Smartphone size={21} />
