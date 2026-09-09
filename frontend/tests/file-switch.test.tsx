@@ -38,7 +38,7 @@ const runtime: RuntimeProfile = {
   device: "cpu", cuda: false, fast_model: "mock", accurate_model: "mock",
   gemini_transcription_enabled: true, gemini_api_key_configured: true,
   gemini_model: "mock", gemini_share_enabled: true, gemini_share_ready: true,
-  local_admin: false
+  local_admin: false, remote_session_valid: true
 };
 let restoreRecordingBrowser: (() => void) | null = null;
 let restoreWakeLockBrowser: (() => void) | null = null;
@@ -191,7 +191,7 @@ function installRecordingBrowser(getUserMedia: () => Promise<MediaStream>) {
 }
 
 async function recordNow() {
-  fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+  fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
   await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
     "녹음 중"
   );
@@ -199,6 +199,9 @@ async function recordNow() {
 }
 
 async function recordNowWithFakeTimers() {
+  await act(async () => {
+    await Promise.resolve();
+  });
   fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
   await act(async () => {
     await Promise.resolve();
@@ -343,14 +346,52 @@ afterEach(() => {
 });
 
 describe("direct phone recording", () => {
-  it("exposes recording only and no file picker", () => {
+  it("requires a fresh remote session before allowing a new recording", async () => {
+    const getUserMedia = vi.fn(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    installRecordingBrowser(getUserMedia);
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({
+      ...runtime,
+      remote_session_valid: false
+    });
+    vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
+      valid: true,
+      key_ready: true,
+      expires_in: 3600
+    });
+
+    render(<App />);
+
+    const blockedRecording = await screen.findByRole("button", {
+      name: "비밀번호 확인 후 녹음 시작"
+    });
+    expect(blockedRecording).toHaveProperty("disabled", true);
+    expect(api.clearApiAccessToken).toHaveBeenCalledOnce();
+    expect(screen.getByText("녹음 전에 공유 비밀번호를 확인해 주세요.")).toBeTruthy();
+    expect(getUserMedia).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByPlaceholderText("4자리 이상"), {
+      target: { value: "0000" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "비밀번호 확인" }));
+
+    const enabledRecording = await screen.findByRole("button", { name: "바로 녹음 시작" });
+    await waitFor(() => expect(enabledRecording).toHaveProperty("disabled", false));
+    fireEvent.click(enabledRecording);
+    await screen.findByRole("dialog", { name: "녹음 중 화면" });
+    expect(getUserMedia).toHaveBeenCalledOnce();
+  });
+
+  it("exposes recording only and no file picker", async () => {
     installRecordingBrowser(async () => ({
       getTracks: () => [{ stop: vi.fn() }]
     } as unknown as MediaStream));
 
     render(<App />);
 
-    expect(screen.getByRole("button", { name: "바로 녹음 시작" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "바로 녹음 시작" })).toBeTruthy();
     expect(document.querySelector('input[type="file"]')).toBeNull();
     expect(document.querySelector('input[type="checkbox"]')).toBeNull();
     expect(screen.queryByText("파일 1개 선택")).toBeNull();
@@ -370,7 +411,7 @@ describe("direct phone recording", () => {
     vi.mocked(api.analyzeOptimizer).mockResolvedValue(analysis("recorded.webm"));
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
     await within(await screen.findByRole("dialog", { name: "녹음 중 화면" })).findByText(
       "녹음 중"
     );
@@ -499,7 +540,7 @@ describe("direct phone recording", () => {
     });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
 
     expect(
       await screen.findByText("마이크 권한이 필요합니다. 주소창의 권한 설정에서 마이크를 허용해 주세요.")
@@ -513,7 +554,7 @@ describe("direct phone recording", () => {
     const wakeLock = installWakeLockBrowser();
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
 
     const recordingScreen = await screen.findByRole("dialog", { name: "녹음 중 화면" });
     expect(await within(recordingScreen).findByText(/화면 자동 잠금 방지 중입니다/)).toBeTruthy();
@@ -531,7 +572,7 @@ describe("direct phone recording", () => {
     installWakeLockBrowser({ reject: true });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
 
     expect(
       await within(
@@ -547,7 +588,7 @@ describe("direct phone recording", () => {
     installUnsupportedWakeLockBrowser();
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
 
     expect(
       await within(
@@ -565,6 +606,10 @@ describe("direct phone recording", () => {
     const fullscreen = installFullscreenBrowser();
 
     render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
     await act(async () => {
       await Promise.resolve();
@@ -592,7 +637,7 @@ describe("direct phone recording", () => {
     const fullscreen = installFullscreenBrowser();
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
     expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
@@ -615,7 +660,7 @@ describe("direct phone recording", () => {
     installFullscreenBrowser(options);
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
 
     expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
     expect(
@@ -632,7 +677,7 @@ describe("direct phone recording", () => {
     const fullscreen = installFullscreenBrowser();
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
     expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
 
     act(() => recording.fail());
@@ -656,7 +701,7 @@ describe("direct phone recording", () => {
     const fullscreen = installFullscreenBrowser();
 
     const view = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
     expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
 
     view.unmount();
@@ -676,7 +721,7 @@ describe("direct phone recording", () => {
     installFullscreenBrowser();
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "바로 녹음 시작" }));
+    fireEvent.click(await screen.findByRole("button", { name: "바로 녹음 시작" }));
     expect(await screen.findByRole("dialog", { name: "녹음 중 화면" })).toBeTruthy();
 
     const duringRecording = new Event("beforeunload", { cancelable: true });
@@ -861,8 +906,10 @@ describe("recording transfer retry", () => {
     await recordNowWithFakeTimers();
     expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.createCloudUploadDescriptor).mock.calls[0][0];
-    expect(screen.getByText(/1초 후 같은 녹음으로 다시 시도/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeTruthy();
+    expect(
+      screen.getByText("녹음 완료 · 전사 준비 중입니다. 연결되는 즉시 자동으로 계속합니다.")
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -878,12 +925,17 @@ describe("recording transfer retry", () => {
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
   });
 
-  it("lets the user retry the same in-memory recording immediately", async () => {
+  it("keeps retrying automatically beyond the old four-attempt limit", async () => {
+    vi.useFakeTimers();
     installRecordingBrowser(async () => ({
       getTracks: () => [{ stop: vi.fn() }]
     } as unknown as MediaStream));
     vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
     vi.mocked(api.analyzeOptimizer)
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockRejectedValueOnce(new api.ApiNetworkError())
       .mockRejectedValueOnce(new api.ApiNetworkError())
       .mockResolvedValueOnce(analysis("recorded.webm"));
 
@@ -891,16 +943,18 @@ describe("recording transfer retry", () => {
     await recordNowWithFakeTimers();
     expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
-    const retryButton = await screen.findByRole("button", {
-      name: "같은 녹음으로 다시 시도"
-    });
 
-    fireEvent.click(retryButton);
-    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledTimes(2));
+    for (const delayMs of [1_000, 3_000, 10_000, 30_000, 30_000]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delayMs);
+      });
+    }
 
-    expect(vi.mocked(api.analyzeOptimizer).mock.calls[1][0].file).toBe(
-      originalRecording
-    );
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(6);
+
+    for (const [options] of vi.mocked(api.analyzeOptimizer).mock.calls) {
+      expect(options.file).toBe(originalRecording);
+    }
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
   });
 

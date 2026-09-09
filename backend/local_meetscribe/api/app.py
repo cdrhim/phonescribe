@@ -699,13 +699,6 @@ def create_app(
             maintenance_thread.join(timeout=2.0)
 
     app = FastAPI(title="LocalMeetScribe", version="0.1.0", lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(active_settings.cors_origins),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     @app.middleware("http")
     async def protect_remote_api(request: Request, call_next: Callable):
@@ -728,6 +721,17 @@ def create_app(
             )
         return await call_next(request)
 
+    # Starlette inserts newly registered middleware at the outside of the
+    # existing stack. Register CORS after remote authentication so even early
+    # 401 responses carry the configured cross-origin response headers.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(active_settings.cors_origins),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -737,6 +741,12 @@ def create_app(
         cuda = has_cuda_runtime()
         saved_share_key = share_store.api_key_configured
         cloud_upload_enabled = current_supabase_client() is not None
+        local_admin = _is_loopback_request(request)
+        remote_session_valid = (
+            not active_settings.remote_access_enabled
+            or local_admin
+            or remote_session_is_valid(request.headers.get("authorization"))
+        )
         return {
             "device": "cuda" if cuda else "cpu",
             "cuda": cuda,
@@ -759,7 +769,8 @@ def create_app(
             )
             or supabase_store.configured,
             "cloud_upload_enabled": cloud_upload_enabled,
-            "local_admin": _is_loopback_request(request),
+            "local_admin": local_admin,
+            "remote_session_valid": remote_session_valid,
         }
 
     @app.post("/api/gemini-share/verify")

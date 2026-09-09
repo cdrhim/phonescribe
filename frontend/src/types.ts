@@ -21,6 +21,7 @@ export interface RuntimeProfile {
   gemini_share_ready: boolean;
   local_admin: boolean;
   cloud_upload_enabled?: boolean;
+  remote_session_valid?: boolean;
 }
 
 export interface CloudUploadPart {

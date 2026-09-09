@@ -25,7 +25,9 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
     client = TestClient(create_app(settings), base_url="https://phone.example.ts.net")
 
     assert client.get("/api/health").status_code == 200
-    assert client.get("/api/runtime").status_code == 200
+    anonymous_runtime = client.get("/api/runtime")
+    assert anonymous_runtime.status_code == 200
+    assert anonymous_runtime.json()["remote_session_valid"] is False
     assert client.get("/api/jobs").status_code == 401
     assert client.get("/api/jobs", headers={"Authorization": "Bearer forged"}).status_code == 401
     assert (
@@ -50,6 +52,7 @@ def test_remote_api_requires_passcode_session(tmp_path: Path) -> None:
     token = verified.json()["access_token"]
     assert token and token != "35433543"
     authorized = {"Authorization": f"Bearer {token}"}
+    assert client.get("/api/runtime", headers=authorized).json()["remote_session_valid"] is True
     assert client.get("/api/jobs", headers=authorized).status_code == 200
 
     package_id = "a" * 32
@@ -209,20 +212,39 @@ def test_remote_cors_allows_only_configured_frontend(tmp_path: Path) -> None:
     client = TestClient(create_app(settings), base_url="https://phone.example.ts.net")
 
     allowed = client.options(
-        "/api/runtime",
+        "/api/cloud-recordings/upload-descriptor",
         headers={
             "Origin": "https://phonescribe.vercel.app",
-            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
         },
     )
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == "https://phonescribe.vercel.app"
 
+    unauthorized = client.post(
+        "/api/cloud-recordings/upload-descriptor",
+        headers={
+            "Origin": "https://phonescribe.vercel.app",
+            "Authorization": "Bearer expired",
+        },
+        json={
+            "filename": "phone.webm",
+            "content_type": "audio/webm",
+            "size_bytes": 1,
+        },
+    )
+    assert unauthorized.status_code == 401
+    assert (
+        unauthorized.headers["access-control-allow-origin"]
+        == "https://phonescribe.vercel.app"
+    )
+
     denied = client.options(
-        "/api/runtime",
+        "/api/cloud-recordings/upload-descriptor",
         headers={
             "Origin": "https://attacker.example",
-            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Method": "POST",
         },
     )
     assert "access-control-allow-origin" not in denied.headers

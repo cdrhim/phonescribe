@@ -163,7 +163,18 @@ export function App() {
 
   useEffect(() => {
     void getRuntime()
-      .then(setRuntime)
+      .then((profile) => {
+        setRuntime(profile);
+        if (profile.remote_session_valid === false) {
+          clearApiAccessToken();
+          setShareAccessReady(false);
+          setAccessNeedsReconnect(false);
+          setAccessRecoveryTarget(null);
+          if (profile.gemini_share_enabled) {
+            setShareStatus("녹음 전에 공유 비밀번호를 확인해 주세요.");
+          }
+        }
+      })
       .catch(() => setRuntime(null))
       .finally(() => setRuntimeChecked(true));
   }, []);
@@ -264,6 +275,13 @@ export function App() {
   const wakeLockActive = wakeLockStatus === "active";
   const recordingSupported = Boolean(
     typeof MediaRecorder !== "undefined" && navigator.mediaDevices?.getUserMedia
+  );
+  const recordingAccessReady = Boolean(
+    runtimeChecked &&
+      (!shareMode ||
+        runtime?.local_admin ||
+        runtime?.remote_session_valid !== false ||
+        shareAccessReady)
   );
   const canStart = Boolean(
     (stagedUploadId || cloudRecordingId || optimizedPackage) &&
@@ -732,6 +750,10 @@ export function App() {
 
   async function startDirectRecording(replaceCurrent = false) {
     if (!recordingSupported || recordingActive || (busy && !replaceCurrent)) return;
+    if (!recordingAccessReady) {
+      setShareStatus("녹음 전에 공유 비밀번호를 확인해 주세요.");
+      return;
+    }
     beginRecordingFocusMode();
     setRecordingState("starting");
     setRecordingElapsedSec(0);
@@ -839,35 +861,29 @@ export function App() {
   function scheduleRecordingRetry(selected: File, selectionVersion: number) {
     if (selectionVersion !== selectionVersionRef.current) return;
     clearRecordingRetryTimer();
-    setStage("failed");
+    setStage("analyzing");
     setError(null);
     setCloudUploadProgress(null);
-    setSameRecordingRetryAvailable(true);
+    setSameRecordingRetryAvailable(false);
 
     const retryIndex = recordingRetryAttemptRef.current;
-    if (retryIndex >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length) {
-      setRecordingRetryScheduled(false);
-      setRecordingRetryNotice(
-        "연결 재시도를 마쳤습니다. 녹음은 이 기기에 그대로 있습니다. 같은 녹음으로 다시 시도를 눌러 주세요."
-      );
-      return;
-    }
-
-    const delayMs = RECORDING_UPLOAD_RETRY_DELAYS_MS[retryIndex];
-    recordingRetryAttemptRef.current = retryIndex + 1;
+    const delayMs =
+      RECORDING_UPLOAD_RETRY_DELAYS_MS[
+        Math.min(retryIndex, RECORDING_UPLOAD_RETRY_DELAYS_MS.length - 1)
+      ];
+    recordingRetryAttemptRef.current = Math.min(
+      retryIndex + 1,
+      RECORDING_UPLOAD_RETRY_DELAYS_MS.length
+    );
     setRecordingRetryScheduled(true);
     setRecordingRetryNotice(
-      `연결이 잠시 끊겼습니다. 녹음은 이 기기에 그대로 있습니다. ${Math.ceil(
-        delayMs / 1000
-      )}초 후 같은 녹음으로 다시 시도합니다. (${retryIndex + 1}/${
-        RECORDING_UPLOAD_RETRY_DELAYS_MS.length
-      })`
+      "녹음 완료 · 전사 준비 중입니다. 연결되는 즉시 자동으로 계속합니다."
     );
     recordingRetryTimerRef.current = window.setTimeout(() => {
       recordingRetryTimerRef.current = null;
       if (selectionVersion !== selectionVersionRef.current) return;
       setRecordingRetryScheduled(false);
-      setRecordingRetryNotice("같은 녹음으로 다시 시도하고 있습니다.");
+      setRecordingRetryNotice("녹음 완료 · 전사 준비를 계속하고 있습니다.");
       void analyzeSelectedFile(selected, true);
     }, delayMs);
   }
@@ -891,7 +907,7 @@ export function App() {
     if (retrying) {
       clearRecordingRetryTimer();
       setRecordingRetryScheduled(false);
-      setRecordingRetryNotice("같은 녹음으로 다시 시도하고 있습니다.");
+      setRecordingRetryNotice("녹음 완료 · 전사 준비를 계속하고 있습니다.");
     } else {
       clearRecordingRetryState();
     }
@@ -1580,11 +1596,15 @@ export function App() {
               <button
                 className="direct-record-button"
                 type="button"
-                disabled={!recordingSupported}
+                disabled={!recordingSupported || !recordingAccessReady}
                 onClick={() => void startDirectRecording(Boolean(activeWorkflowId))}
               >
                 <Mic size={18} />
-                {recordingSupported ? "바로 녹음 시작" : "이 브라우저는 직접 녹음 미지원"}
+                {!recordingSupported
+                  ? "이 브라우저는 직접 녹음 미지원"
+                  : recordingAccessReady
+                    ? "바로 녹음 시작"
+                    : "비밀번호 확인 후 녹음 시작"}
               </button>
             </div>
           ) : (
@@ -1611,7 +1631,7 @@ export function App() {
               <button
                 className="secondary-button change-file-button"
                 type="button"
-                disabled={!recordingSupported}
+                disabled={!recordingSupported || !recordingAccessReady}
                 onClick={() => void startDirectRecording(true)}
                 title="새 녹음 시작"
                 aria-label="새 녹음 시작"

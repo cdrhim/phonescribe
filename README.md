@@ -214,7 +214,10 @@ session returned after a correct passcode. The raw token is stored only in the c
 server restarts, expire with the configured TTL, and are cleared when the passcode changes. The
 network startup script uses a 24-hour TTL. If a token truly expires, the page stops retrying, keeps
 the current recording or workflow, and shows one inline passcode form; successful re-verification
-automatically continues the same work without another recording.
+automatically continues the same work without another recording. Runtime discovery also validates
+an existing tab token before enabling the record button, so a stale session is repaired before a
+new recording starts. Genuine temporary network failures stay in the transcription-preparation
+state and retry automatically with a capped delay instead of ending after a fixed retry count.
 
 After a completed or failed workflow, `새 녹음 시작` clears only the current browser view and starts
 the microphone again. Already accepted server jobs and transcript files remain untouched.
