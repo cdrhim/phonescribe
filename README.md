@@ -114,7 +114,7 @@ calculated after the first chunk completes.
 
 Gemini calls use the Interactions API. The default is the GA, audio-capable
 `gemini-3.8-flash`; retryable service failures fall back once to the stable audio-capable
-`gemini-2.5-flash`. Optimized audio and completed chunks remain on disk, so a retry does not
+`gemini-3.6-flash`. Optimized audio and completed chunks remain on disk, so a retry does not
 require another upload or repeat successful chunks. Gemini requests are serialized on the server
 so restart recovery cannot send several recordings to Gemini at once and amplify rate limits.
 Zero-duration recording artifacts are rejected locally before any Gemini request and are reported

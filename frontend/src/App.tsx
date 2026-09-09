@@ -904,14 +904,19 @@ export function App() {
     setSameRecordingRetryAvailable(false);
 
     const retryIndex = recordingRetryAttemptRef.current;
+    if (retryIndex >= RECORDING_UPLOAD_RETRY_DELAYS_MS.length) {
+      setStage("failed");
+      setRecordingRetryScheduled(false);
+      setSameRecordingRetryAvailable(true);
+      setRecordingRetryNotice(
+        "자동 연결 확인을 마쳤습니다. 녹음은 이 기기에 그대로 있습니다."
+      );
+      setError("서버 연결 후 아래 버튼을 한 번 누르면 같은 녹음으로 계속합니다.");
+      return;
+    }
     const delayMs =
-      RECORDING_UPLOAD_RETRY_DELAYS_MS[
-        Math.min(retryIndex, RECORDING_UPLOAD_RETRY_DELAYS_MS.length - 1)
-      ];
-    recordingRetryAttemptRef.current = Math.min(
-      retryIndex + 1,
-      RECORDING_UPLOAD_RETRY_DELAYS_MS.length
-    );
+      RECORDING_UPLOAD_RETRY_DELAYS_MS[retryIndex];
+    recordingRetryAttemptRef.current = retryIndex + 1;
     setRecordingRetryScheduled(true);
     setRecordingRetryNotice(
       "녹음 완료 · 전사 준비 중입니다. 연결되는 즉시 자동으로 계속합니다."

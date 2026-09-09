@@ -930,7 +930,7 @@ describe("recording transfer retry", () => {
     expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
   });
 
-  it("keeps retrying automatically beyond the old four-attempt limit", async () => {
+  it("stops automatic connection checks after four retries and keeps one manual retry", async () => {
     vi.useFakeTimers();
     installRecordingBrowser(async () => ({
       getTracks: () => [{ stop: vi.fn() }]
@@ -949,18 +949,24 @@ describe("recording transfer retry", () => {
     expect(api.analyzeOptimizer).toHaveBeenCalledOnce();
     const originalRecording = vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file;
 
-    for (const delayMs of [1_000, 3_000, 10_000, 30_000, 30_000]) {
+    for (const delayMs of [1_000, 3_000, 10_000, 30_000]) {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(delayMs);
       });
     }
 
-    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(6);
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(5);
 
     for (const [options] of vi.mocked(api.analyzeOptimizer).mock.calls) {
       expect(options.file).toBe(originalRecording);
     }
-    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
+    expect(
+      screen.getByText("자동 연결 확인을 마쳤습니다. 녹음은 이 기기에 그대로 있습니다.")
+    ).toBeTruthy();
+    const retryButton = screen.getByRole("button", { name: "같은 녹음으로 다시 시도" });
+    fireEvent.click(retryButton);
+    expect(api.analyzeOptimizer).toHaveBeenCalledTimes(6);
+    expect(vi.mocked(api.analyzeOptimizer).mock.calls[5][0].file).toBe(originalRecording);
   });
 
   it("cancels an automatic retry when a new recording resets the selection", async () => {

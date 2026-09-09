@@ -37,7 +37,7 @@ if (-not (Test-LocalMeetScribeHealth)) {
     }
 
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-    Start-Process `
+    $serverProcess = Start-Process `
         -FilePath $python `
         -ArgumentList @(
             "-m",
@@ -51,11 +51,20 @@ if (-not (Test-LocalMeetScribeHealth)) {
         -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logDir "server.stdout.log") `
-        -RedirectStandardError (Join-Path $logDir "server.stderr.log")
+        -RedirectStandardError (Join-Path $logDir "server.stderr.log") `
+        -PassThru
 
-    $deadline = (Get-Date).AddSeconds(20)
+    # App startup first restores durable workflows. Avoid short HTTP probes while
+    # Uvicorn is still starting: abandoned probe sockets can break Proactor accept
+    # on Windows before the health route is ready.
+    Start-Sleep -Seconds 15
+    if ($serverProcess.HasExited) {
+        throw "LocalMeetScribe exited during startup. Check data\logs\server.stderr.log."
+    }
+
+    $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not (Test-LocalMeetScribeHealth)) {
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Seconds 1
     }
     if (-not (Test-LocalMeetScribeHealth)) {
         throw "LocalMeetScribe did not become healthy. Check data\logs\server.stderr.log."

@@ -644,7 +644,7 @@ def test_gemini_default_model_has_one_stable_audio_fallback(tmp_path: Path) -> N
     assert settings.gemini_model == "gemini-3.8-flash"
     assert gemini_module._model_candidates(settings.gemini_model) == (  # noqa: SLF001
         "gemini-3.8-flash",
-        "gemini-2.5-flash",
+        "gemini-3.6-flash",
     )
 
 
@@ -700,9 +700,9 @@ def test_gemini_interactions_falls_back_to_stable_audio_model(
         "Transcribe faithfully.",
     )
 
-    assert generation.model == "gemini-2.5-flash"
+    assert generation.model == "gemini-3.6-flash"
     assert generation.text == "[00:00] test speech"
-    assert client.models == ["gemini-3.8-flash"] * 3 + ["gemini-2.5-flash"]
+    assert client.models == ["gemini-3.8-flash"] * 3 + ["gemini-3.6-flash"]
     assert all(url.endswith("/v1beta/interactions") for url in client.urls)
 
 
@@ -755,9 +755,9 @@ def test_gemini_interactions_falls_back_when_http_200_has_no_transcript(
         "Transcribe faithfully.",
     )
 
-    assert generation.model == "gemini-2.5-flash"
+    assert generation.model == "gemini-3.6-flash"
     assert generation.text == "[00:00] recovered"
-    assert client.models == ["gemini-3.8-flash", "gemini-2.5-flash"]
+    assert client.models == ["gemini-3.8-flash", "gemini-3.6-flash"]
 
 
 def test_failed_workflow_recovers_when_completed_artifacts_exist(tmp_path: Path) -> None:
