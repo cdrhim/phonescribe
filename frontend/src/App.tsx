@@ -66,6 +66,7 @@ type NamingMode = "original" | "recommended" | "custom";
 type RecordingState = "idle" | "starting" | "recording" | "stopping";
 type WakeLockStatus = "idle" | "requesting" | "active" | "unavailable" | "released";
 type TranscriptView = "raw" | TranscriptArtifactKind;
+type AccessRecoveryTarget = "recording" | "workflow";
 
 const workflowSteps = ["분석", "최적화", "전사", "완료"];
 const ACTIVE_WORKFLOW_STORAGE_KEY = "local-meetscribe.active-workflow.v1";
@@ -118,6 +119,8 @@ export function App() {
   const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [verifyingShareAccess, setVerifyingShareAccess] = useState(false);
   const [accessNeedsReconnect, setAccessNeedsReconnect] = useState(false);
+  const [accessRecoveryTarget, setAccessRecoveryTarget] =
+    useState<AccessRecoveryTarget | null>(null);
   const [showKeySetup, setShowKeySetup] = useState(false);
   const [savingShareKey, setSavingShareKey] = useState(false);
   const [stage, setStage] = useState<WorkflowStage>("idle");
@@ -147,6 +150,7 @@ export function App() {
   const recordingRetryTimerRef = useRef<number | null>(null);
   const recordingRetryAttemptRef = useRef(0);
   const autoStartSuppressedRef = useRef(false);
+  const pendingRecordingAccessRef = useRef<number | null>(null);
   // Switching recordings detaches the UI, never cancels a server-side workflow.
   const selectionVersionRef = useRef(0);
   const pollingVersionRef = useRef(0);
@@ -612,6 +616,17 @@ export function App() {
 
       setShareAccessReady(true);
       setAccessNeedsReconnect(false);
+      const pendingRecordingVersion = pendingRecordingAccessRef.current;
+      if (pendingRecordingVersion === selectionVersion && file) {
+        pendingRecordingAccessRef.current = null;
+        setAccessRecoveryTarget(null);
+        clearRecordingRetryState();
+        setShareStatus("연결 복구 완료 · 같은 녹음 처리를 자동으로 계속합니다.");
+        setError(null);
+        return;
+      }
+      pendingRecordingAccessRef.current = null;
+      setAccessRecoveryTarget(null);
       if (selectionVersion !== selectionVersionRef.current) {
         setShareStatus("확인 완료 · 새로 시작한 녹음으로 진행합니다.");
         return;
@@ -886,7 +901,7 @@ export function App() {
             if (selectionVersion !== selectionVersionRef.current) return;
             if (isApiAuthenticationError(workflowError)) {
               setStage("ready");
-              requireAccessReconnect();
+              requireAccessReconnect("recording", selectionVersion);
               return;
             }
             setStage("failed");
@@ -913,7 +928,7 @@ export function App() {
           }
           if (isApiAuthenticationError(cloudUploadError)) {
             setStage("idle");
-            requireAccessReconnect();
+            requireAccessReconnect("recording", selectionVersion);
             return;
           }
           if (isApiTransientError(cloudUploadError)) {
@@ -1011,7 +1026,7 @@ export function App() {
               "PC 연결 완료 · 비밀번호 확인 후 전사 작업을 다시 접수합니다."
             );
             setStage("ready");
-            requireAccessReconnect();
+            requireAccessReconnect("recording", selectionVersion);
             return;
           }
           setStage("failed");
@@ -1036,7 +1051,7 @@ export function App() {
       if (selectionVersion !== selectionVersionRef.current) return;
       if (isApiAuthenticationError(analysisError)) {
         setStage("idle");
-        requireAccessReconnect();
+        requireAccessReconnect("recording", selectionVersion);
         return;
       }
       if (isApiTransientError(analysisError) && !remoteUploadAccepted) {
@@ -1134,7 +1149,7 @@ export function App() {
           );
         }
         setStage("ready");
-        requireAccessReconnect();
+        requireAccessReconnect(file ? "recording" : "workflow", selectionVersion);
         return;
       }
       setStage("failed");
@@ -1190,6 +1205,7 @@ export function App() {
 
   function resetFile() {
     selectionVersionRef.current += 1;
+    pendingRecordingAccessRef.current = null;
     uploadAbortRef.current?.abort();
     uploadAbortRef.current = null;
     clearRecordingRetryState();
@@ -1200,6 +1216,7 @@ export function App() {
     analysisStartingRef.current = false;
     workflowStartingRef.current = false;
     setAccessNeedsReconnect(false);
+    setAccessRecoveryTarget(null);
     setShareStatus(null);
     setFile(null);
     setSourceName("");
@@ -1287,15 +1304,34 @@ export function App() {
     }
   }
 
-  function requireAccessReconnect() {
+  function requireAccessReconnect(
+    target: AccessRecoveryTarget = "workflow",
+    recordingSelectionVersion?: number
+  ) {
+    const recordingRecovery =
+      target === "recording" || pendingRecordingAccessRef.current !== null;
+    if (target === "recording") {
+      pendingRecordingAccessRef.current =
+        recordingSelectionVersion ?? selectionVersionRef.current;
+      uploadAbortRef.current?.abort();
+      clearRecordingRetryState();
+      setCloudUploadProgress(null);
+      setCloudUploadNotice(null);
+      setActiveWorkflowId(null);
+      setActivePackageId(null);
+      setWorkflowUrl(null);
+    }
     clearApiAccessToken();
     setShareAccessReady(false);
     setAccessNeedsReconnect(true);
+    setAccessRecoveryTarget(recordingRecovery ? "recording" : "workflow");
     setShareStatus("보안을 위해 공유 비밀번호를 다시 확인해 주세요.");
     setError(
-      activeWorkflowId
-        ? "PC 작업은 보존되어 있습니다. 비밀번호를 다시 확인하면 결과를 바로 가져옵니다."
-        : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 자동으로 진행됩니다."
+      recordingRecovery
+        ? null
+        : activeWorkflowId
+          ? "PC 작업은 보존되어 있습니다. 비밀번호를 다시 확인하면 결과를 바로 가져옵니다."
+          : "인증 세션이 만료되었습니다. 비밀번호를 다시 확인하면 자동으로 진행됩니다."
     );
     stopProgressPolling();
   }
@@ -1342,9 +1378,17 @@ export function App() {
             }}
           >
             <div>
-              <strong>{activeWorkflowId ? "전사 결과 연결 복구" : "Gemini 연결 복구"}</strong>
+              <strong>
+                {accessRecoveryTarget === "recording"
+                  ? "비밀번호 다시 확인"
+                  : activeWorkflowId
+                    ? "전사 결과 연결 복구"
+                    : "Gemini 연결 복구"}
+              </strong>
               <span>
-                {activeWorkflowId
+                {accessRecoveryTarget === "recording"
+                  ? "녹음은 이 기기에 그대로 있습니다. 확인하면 같은 녹음으로 자동 진행합니다."
+                  : activeWorkflowId
                   ? "PC의 작업은 그대로 있습니다. 비밀번호만 다시 확인하세요."
                   : "현재 녹음을 유지한 채 자동으로 진행합니다."}
               </span>
@@ -1376,7 +1420,11 @@ export function App() {
               ) : (
                 <ShieldCheck size={17} />
               )}
-              {activeWorkflowId ? "확인하고 결과 받기" : "비밀번호 확인"}
+              {accessRecoveryTarget === "recording"
+                ? "확인하고 계속"
+                : activeWorkflowId
+                  ? "확인하고 결과 받기"
+                  : "비밀번호 확인"}
             </button>
           </form>
         )}
@@ -1435,7 +1483,9 @@ export function App() {
               <div>
                 <strong>{displaySourceName}</strong>
                 <span>
-                  {stage === "analyzing" && cloudUploadProgress !== null
+                  {accessNeedsReconnect && accessRecoveryTarget === "recording"
+                    ? "녹음은 이 기기에 보관되어 있습니다."
+                    : stage === "analyzing" && cloudUploadProgress !== null
                     ? `녹음 처리 ${Math.round(cloudUploadProgress * 100)}%`
                     : stage === "analyzing"
                       ? "길이, 언어, 전사 방식을 확인하고 있습니다."
@@ -1536,18 +1586,19 @@ export function App() {
           </p>
         </section>
 
-        <section className="flow-section">
-          <SectionTitle
-            index="02"
-            title="Gemini 연결"
-            note={
-              shareMode
-                ? "공유 비밀번호로 연결"
-                : serverKeyReady
-                  ? "서버 키 연결됨"
-                  : "무료 AI Studio 키"
-            }
-          />
+        {(!accessNeedsReconnect || !shareMode) && (
+          <section className="flow-section">
+            <SectionTitle
+              index="02"
+              title="Gemini 연결"
+              note={
+                shareMode
+                  ? "공유 비밀번호로 연결"
+                  : serverKeyReady
+                    ? "서버 키 연결됨"
+                    : "무료 AI Studio 키"
+              }
+            />
 
           {shareMode ? (
             <div className="share-access">
@@ -1717,7 +1768,8 @@ export function App() {
             </div>
           )}
 
-        </section>
+          </section>
+        )}
 
         <section className="action-section">
           {stage === "complete" && transcript ? (

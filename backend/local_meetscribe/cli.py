@@ -40,7 +40,7 @@ def configure_share_passcode() -> None:
     except LocalMeetScribeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
-    typer.echo("PhoneScribe share passcode updated. Existing browser sessions expire on restart.")
+    typer.echo("PhoneScribe share passcode updated. Existing browser sessions were cleared.")
 
 
 @supabase_app.command("configure")

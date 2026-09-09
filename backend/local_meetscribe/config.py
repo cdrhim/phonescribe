@@ -34,7 +34,7 @@ class Settings:
     faster_whisper_cuda_model: str = "turbo"
     faster_whisper_cpu_threads: int = 0
     remote_access_enabled: bool = False
-    remote_session_ttl_sec: int = 2 * 60 * 60
+    remote_session_ttl_sec: int = 24 * 60 * 60
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -102,7 +102,7 @@ def get_settings() -> Settings:
         remote_access_enabled=_env_bool("LOCAL_MEETSCRIBE_REMOTE_ACCESS", False),
         remote_session_ttl_sec=max(
             300,
-            _env_int("LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC", 2 * 60 * 60),
+            _env_int("LOCAL_MEETSCRIBE_REMOTE_SESSION_TTL_SEC", 24 * 60 * 60),
         ),
         cors_origins=_env_csv(
             "LOCAL_MEETSCRIBE_CORS_ORIGINS",

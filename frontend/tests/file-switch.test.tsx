@@ -457,6 +457,141 @@ describe("direct phone recording", () => {
 });
 
 describe("recording transfer retry", () => {
+  it("cancels the recording retry schedule as soon as a retry receives 401", async () => {
+    vi.useFakeTimers();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor)
+      .mockRejectedValueOnce(new api.ApiNetworkError())
+      .mockRejectedValueOnce(new api.ApiRequestError("expired", 401));
+
+    render(<App />);
+    await recordNowWithFakeTimers();
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "확인하고 계속" })).toBeTruthy();
+    expect(screen.queryByText(/초 후 같은 녹음으로 다시 시도/)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2);
+  });
+
+  it("pauses immediately on an expired session and resumes the same recording after one password check", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.createCloudUploadDescriptor)
+      .mockRejectedValueOnce(new api.ApiRequestError("expired", 401))
+      .mockResolvedValueOnce(cloudUploadDescriptor());
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    vi.mocked(api.completeCloudRecordingUpload).mockResolvedValue({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    });
+    vi.mocked(api.startTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "queued"
+    });
+    vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
+      valid: true,
+      key_ready: true,
+      expires_in: 3600
+    });
+
+    render(<App />);
+    await recordNow();
+
+    await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce());
+    const recordedFile = vi.mocked(api.createCloudUploadDescriptor).mock.calls[0][0];
+    expect(screen.getByRole("button", { name: "확인하고 계속" })).toBeTruthy();
+    expect(document.querySelectorAll('input[type="password"]')).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "같은 녹음으로 다시 시도" })).toBeNull();
+    expect(screen.queryByText(/초 후 같은 녹음으로 다시 시도/)).toBeNull();
+    expect(screen.getByText("녹음은 이 기기에 보관되어 있습니다.")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("공유 비밀번호 다시 입력"), {
+      target: { value: "0000" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "확인하고 계속" }));
+
+    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("0000"));
+    await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.createCloudUploadDescriptor).mock.calls[1][0]).toBe(recordedFile);
+    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "확인하고 계속" })).toBeNull();
+  });
+
+  it("keeps new-recording recovery ahead of a stale old-workflow 401", async () => {
+    const oldWorkflowRequest = deferred<TranscriptionWorkflowStatus>();
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    seedOldWorkflow();
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({ ...runtime, cloud_upload_enabled: true });
+    vi.mocked(api.getTranscriptionWorkflow).mockImplementation((workflowId) =>
+      workflowId === OLD_ID ? oldWorkflowRequest.promise : new Promise(() => {})
+    );
+    vi.mocked(api.createCloudUploadDescriptor)
+      .mockRejectedValueOnce(new api.ApiRequestError("expired", 401))
+      .mockResolvedValueOnce(cloudUploadDescriptor());
+    vi.mocked(api.uploadCloudRecording).mockResolvedValue();
+    vi.mocked(api.completeCloudRecordingUpload).mockResolvedValue({
+      recording_id: "cloud-recording-id",
+      status: "ready"
+    });
+    const newWorkflowId = "b".repeat(32);
+    vi.mocked(api.startTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: newWorkflowId,
+      package_id: newWorkflowId,
+      status: "queued"
+    });
+    vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
+      valid: true,
+      key_ready: true,
+      expires_in: 3600
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "새 녹음 시작" }));
+    await screen.findByText("녹음 중");
+    fireEvent.click(screen.getByRole("button", { name: "녹음 종료 및 전사 시작" }));
+    await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledOnce());
+
+    await act(async () => {
+      oldWorkflowRequest.reject(new api.ApiRequestError("old session expired", 401));
+    });
+    expect(screen.getByRole("button", { name: "확인하고 계속" })).toBeTruthy();
+    expect(document.querySelectorAll('input[type="password"]')).toHaveLength(1);
+
+    fireEvent.change(screen.getByLabelText("공유 비밀번호 다시 입력"), {
+      target: { value: "0000" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "확인하고 계속" }));
+
+    await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.getTranscriptionWorkflow).mock.calls.filter(
+      ([workflowId]) => workflowId === OLD_ID
+    )).toHaveLength(1);
+    expect(api.startTranscriptionWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ file: expect.any(File) }),
+      expect.objectContaining({ cloudRecordingId: "cloud-recording-id" })
+    );
+  });
+
   it("automatically retries the same in-memory recording before cloud acceptance", async () => {
     vi.useFakeTimers();
     installRecordingBrowser(async () => ({

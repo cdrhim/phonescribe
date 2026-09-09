@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import threading
 import time
@@ -70,7 +69,7 @@ from local_meetscribe.schemas import (
     TranscriptPatch,
     load_transcript,
 )
-from local_meetscribe.security import GeminiShareStore, SupabaseConfigStore
+from local_meetscribe.security import GeminiShareStore, RemoteSessionStore, SupabaseConfigStore
 from local_meetscribe.utils.errors import LocalMeetScribeError
 
 LOGGER = logging.getLogger(__name__)
@@ -129,8 +128,7 @@ def create_app(
     supabase_store = SupabaseConfigStore(active_settings.data_dir)
     share_failures: dict[str, list[float]] = {}
     share_failure_lock = threading.Lock()
-    remote_sessions: dict[str, float] = {}
-    remote_session_lock = threading.Lock()
+    remote_session_store = RemoteSessionStore(active_settings.data_dir)
     active_workflow_inputs: set[str] = set()
     active_workflow_lock = threading.Lock()
     cloud_outbox_lock = threading.Lock()
@@ -355,28 +353,13 @@ def create_app(
             share_failures.pop(client_id, None)
 
     def issue_remote_session() -> str:
-        now = time.time()
-        token = secrets.token_urlsafe(32)
-        with remote_session_lock:
-            expired = [value for value, expires_at in remote_sessions.items() if expires_at <= now]
-            for value in expired:
-                remote_sessions.pop(value, None)
-            remote_sessions[token] = now + active_settings.remote_session_ttl_sec
-        return token
+        return remote_session_store.issue(active_settings.remote_session_ttl_sec)
 
     def remote_session_is_valid(authorization: str | None) -> bool:
         scheme, separator, token = (authorization or "").partition(" ")
         if not separator or scheme.casefold() != "bearer" or not token:
             return False
-        now = time.time()
-        with remote_session_lock:
-            expires_at = remote_sessions.get(token)
-            if expires_at is None:
-                return False
-            if expires_at <= now:
-                remote_sessions.pop(token, None)
-                return False
-        return True
+        return remote_session_store.is_valid(token)
 
     def run_transcription_workflow(
         workflow_id: str,

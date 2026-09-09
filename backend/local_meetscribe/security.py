@@ -6,8 +6,12 @@ import ctypes
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
+import tempfile
+import threading
+import time
 from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -18,6 +22,104 @@ from urllib.parse import urlparse
 from local_meetscribe.utils.errors import LocalMeetScribeError
 
 PBKDF2_ITERATIONS = 240_000
+REMOTE_SESSION_FILE_VERSION = 1
+_REMOTE_SESSION_FILE_LOCK = threading.Lock()
+
+
+class RemoteSessionStore:
+    """Durable bearer sessions stored as one-way token hashes.
+
+    The caller receives the random bearer token exactly once. Only its SHA-256
+    digest and absolute expiry are persisted, so copying the data directory
+    cannot reveal an active bearer credential.
+    """
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "config" / "remote_sessions.json"
+        self._lock = _REMOTE_SESSION_FILE_LOCK
+
+    def issue(self, ttl_sec: int) -> str:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        token_hash = _remote_session_hash(token)
+        with self._lock:
+            sessions = self._read_sessions()
+            _prune_remote_sessions(sessions, now)
+            sessions[token_hash] = now + max(1, ttl_sec)
+            self._write_sessions(sessions)
+        return token
+
+    def is_valid(self, token: str) -> bool:
+        if not token:
+            return False
+        now = time.time()
+        token_hash = _remote_session_hash(token)
+        with self._lock:
+            sessions = self._read_sessions()
+            changed = _prune_remote_sessions(sessions, now)
+            expires_at = sessions.get(token_hash)
+            if changed:
+                self._write_sessions(sessions)
+        return expires_at is not None and expires_at > now
+
+    def clear(self) -> None:
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+
+    def _read_sessions(self) -> dict[str, float]:
+        if not self.path.exists():
+            return {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return {}
+        if not isinstance(payload, dict) or payload.get("version") != REMOTE_SESSION_FILE_VERSION:
+            return {}
+        raw_sessions = payload.get("sessions")
+        if not isinstance(raw_sessions, dict):
+            return {}
+        sessions: dict[str, float] = {}
+        for token_hash, raw_expiry in raw_sessions.items():
+            if not isinstance(token_hash, str) or not _is_sha256_hex(token_hash):
+                continue
+            if isinstance(raw_expiry, bool) or not isinstance(raw_expiry, (int, float)):
+                continue
+            expires_at = float(raw_expiry)
+            if math.isfinite(expires_at):
+                sessions[token_hash] = expires_at
+        return sessions
+
+    def _write_sessions(self, sessions: dict[str, float]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": REMOTE_SESSION_FILE_VERSION,
+            "sessions": sessions,
+        }
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump(payload, temporary, ensure_ascii=False, indent=2, sort_keys=True)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            with contextlib.suppress(OSError):
+                temporary_path.chmod(0o600)
+            os.replace(temporary_path, self.path)
+            temporary_path = None
+            with contextlib.suppress(OSError):
+                self.path.chmod(0o600)
+        finally:
+            if temporary_path is not None:
+                with contextlib.suppress(OSError):
+                    temporary_path.unlink()
 
 
 @dataclass(frozen=True)
@@ -148,6 +250,10 @@ class GeminiShareStore:
                 "passcode_hash": base64.b64encode(_passcode_hash(normalized, salt)).decode("ascii"),
             }
         )
+        # Invalidate old bearer sessions before committing the new passcode so a
+        # failed session-file update cannot leave credentials issued under the
+        # previous passcode active.
+        RemoteSessionStore(self.path.parent.parent).clear()
         self._write(payload)
 
     def verify_passcode(self, passcode: str) -> bool:
@@ -210,6 +316,21 @@ def _passcode_hash(passcode: str, salt: bytes) -> bytes:
         salt,
         PBKDF2_ITERATIONS,
     )
+
+
+def _remote_session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_sha256_hex(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _prune_remote_sessions(sessions: dict[str, float], now: float) -> bool:
+    expired = [token_hash for token_hash, expires_at in sessions.items() if expires_at <= now]
+    for token_hash in expired:
+        sessions.pop(token_hash, None)
+    return bool(expired)
 
 
 def _protect_secret(value: str) -> str:

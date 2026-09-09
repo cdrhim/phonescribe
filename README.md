@@ -204,12 +204,13 @@ tailscale funnel --bg http://127.0.0.1:8766
 Set `VITE_API_BASE_URL` in the Vercel project to the Funnel `https://...ts.net` origin. Start the
 server with `scripts/start-network.ps1`; it enables remote session protection and allows only the
 `https://phonescribe.vercel.app` browser origin. Health, runtime discovery, and passcode verification
-remain public. Every upload, workflow-status request, and download requires the short-lived bearer
-session returned after a correct passcode. The token is stored only in the current tab's
-`sessionStorage`, expires with the server TTL, and is cleared when the passcode changes. This lets a
-mobile browser restore the tab after the screen turns off without losing workflow polling. If the
-server restarts or the token expires, the page keeps the workflow ID and shows an inline passcode
-form; successful re-verification resumes polling and TXT download without another upload.
+remain public. Every upload, workflow-status request, and download requires the expiring bearer
+session returned after a correct passcode. The raw token is stored only in the current tab's
+`sessionStorage`; the server persists only its one-way hash and expiry. Sessions therefore survive
+server restarts, expire with the configured TTL, and are cleared when the passcode changes. The
+network startup script uses a 24-hour TTL. If a token truly expires, the page stops retrying, keeps
+the current recording or workflow, and shows one inline passcode form; successful re-verification
+automatically continues the same work without another recording.
 
 After a completed or failed workflow, `새 녹음 시작` clears only the current browser view and starts
 the microphone again. Already accepted server jobs and transcript files remain untouched.
