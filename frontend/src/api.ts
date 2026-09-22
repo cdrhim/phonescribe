@@ -1,5 +1,6 @@
 import type {
   CloudRecordingReady,
+  AccessMode,
   CloudUploadDescriptor,
   ExportKind,
   GeminiTranscriptionProgress,
@@ -434,11 +435,17 @@ export function createTranscriptArtifact(
 
 export function verifyGeminiSharePasscode(
   sharePasscode: string
-): Promise<{ valid: boolean; key_ready: boolean; expires_in: number }> {
+): Promise<{
+  valid: boolean;
+  key_ready: boolean;
+  access_mode?: AccessMode;
+  expires_in: number;
+}> {
   clearApiAccessToken();
   return request<{
     valid: boolean;
     key_ready: boolean;
+    access_mode?: AccessMode;
     access_token: string;
     expires_in: number;
   }>("/api/gemini-share/verify", {

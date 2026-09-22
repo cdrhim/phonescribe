@@ -19,9 +19,10 @@ import {
   ShieldCheck,
   Smartphone,
   Sparkles,
-  Square
+  Square,
+  Upload
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ChangeEvent, useEffect, useRef, useState } from "react";
 import {
   type OptimizerOptions,
   analyzeOptimizer,
@@ -51,6 +52,7 @@ import {
   type PendingRecording
 } from "./pendingRecording";
 import type {
+  AccessMode,
   GeminiTranscriptionProgress,
   GeminiTranscriptResult,
   OptimizedPackageResult,
@@ -138,6 +140,7 @@ export function App() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [sharePasscode, setSharePasscode] = useState("");
   const [shareAccessReady, setShareAccessReady] = useState(hasApiAccessToken);
+  const [accessMode, setAccessMode] = useState<AccessMode | null>(null);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [verifyingShareAccess, setVerifyingShareAccess] = useState(false);
   const [accessNeedsReconnect, setAccessNeedsReconnect] = useState(false);
@@ -165,6 +168,7 @@ export function App() {
   const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
   const darkRecordingMode =
     recordingState === "starting" || recordingState === "recording";
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -205,14 +209,21 @@ export function App() {
         if (profile.remote_session_valid === false) {
           clearApiAccessToken();
           setShareAccessReady(false);
+          setAccessMode(null);
           setAccessNeedsReconnect(false);
           setAccessRecoveryTarget(null);
           if (profile.gemini_share_enabled) {
             setShareStatus("녹음 전에 공유 비밀번호를 확인해 주세요.");
           }
+        } else {
+          if (profile.remote_session_valid === true) setShareAccessReady(true);
+          setAccessMode(profile.access_mode ?? "record");
         }
       })
-      .catch(() => setRuntime(null))
+      .catch(() => {
+        setRuntime(null);
+        setAccessMode(null);
+      })
       .finally(() => setRuntimeChecked(true));
   }, []);
 
@@ -358,6 +369,7 @@ export function App() {
   }, []);
 
   const shareMode = Boolean(runtime?.gemini_share_enabled);
+  const uploadMode = shareMode && accessMode === "upload";
   const serverKeyReady = Boolean(
     !shareMode &&
       runtime?.gemini_transcription_enabled &&
@@ -377,10 +389,10 @@ export function App() {
   );
   const recordingAccessReady = Boolean(
     runtimeChecked &&
+      runtime &&
       (!shareMode ||
         runtime?.local_admin ||
-        runtime?.remote_session_valid !== false ||
-        shareAccessReady)
+        (shareAccessReady && accessMode !== null))
   );
   const canStart = Boolean(
     (stagedUploadId || cloudRecordingId || optimizedPackage) &&
@@ -805,6 +817,8 @@ export function App() {
         return;
       }
 
+      const confirmedAccessMode = result.access_mode ?? "record";
+      setAccessMode(confirmedAccessMode);
       setShareAccessReady(true);
       setAccessNeedsReconnect(false);
       const pendingRecordingVersion = pendingRecordingAccessRef.current;
@@ -838,7 +852,11 @@ export function App() {
       if (file) {
         setShareStatus("확인 완료 · 전사 준비가 되었습니다.");
       } else {
-        setShareStatus("확인 완료 · 바로 녹음을 시작하세요.");
+        setShareStatus(
+          confirmedAccessMode === "upload"
+            ? "파일 업로드 모드 연결 완료 · 녹음파일을 선택하세요."
+            : "녹음 모드 연결 완료 · 바로 녹음을 시작하세요."
+        );
       }
     } catch (verificationError) {
       setShareAccessReady(false);
@@ -870,6 +888,19 @@ export function App() {
     setSourceName(selected.name);
     setSourceBytes(selected.size);
     setSaveBaseName(baseNameFromFile(selected.name));
+  }
+
+  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const selected = event.currentTarget.files?.[0];
+    if (selected) void selectFile(selected);
+  }
+
+  function openFilePicker() {
+    if (!fileInputRef.current) return;
+    // Clearing the native input allows the same recording to be selected again.
+    // Cancelling the picker leaves the current recording and workflow untouched.
+    fileInputRef.current.value = "";
+    fileInputRef.current.click();
   }
 
   function beginRecordingFocusMode() {
@@ -1855,7 +1886,22 @@ export function App() {
         )}
 
         <section className="flow-section">
-          <SectionTitle index="01" title="녹음" note="바로 녹음" />
+          <SectionTitle
+            index="01"
+            title={uploadMode ? "녹음 파일" : "녹음"}
+            note={uploadMode ? "파일 선택" : "바로 녹음"}
+          />
+          {uploadMode && (
+            <input
+              ref={fileInputRef}
+              className="visually-hidden"
+              type="file"
+              accept=".m4a,.mp3,.wav,.aac,.ogg,.flac,.webm,.3gp,audio/*"
+              onChange={handleFileChange}
+              aria-hidden="true"
+              tabIndex={-1}
+            />
+          )}
           {recordingActive ? (
             <div className="recording-panel" aria-live="polite">
               <span className="recording-indicator" aria-hidden="true" />
@@ -1885,6 +1931,21 @@ export function App() {
                   <Square size={17} fill="currentColor" />
                 )}
                 녹음 종료 및 전사 시작
+              </button>
+            </div>
+          ) : !hasSource && uploadMode ? (
+            <div className="drop-zone upload-only-zone">
+              <Upload size={28} />
+              <strong>전사할 녹음파일을 선택하세요</strong>
+              <span>파일을 선택하면 전사, 미팅록 확인, TXT 저장까지 자동으로 진행됩니다.</span>
+              <button
+                className="direct-record-button"
+                type="button"
+                disabled={!recordingAccessReady}
+                onClick={openFilePicker}
+              >
+                <FileAudio size={18} />
+                {recordingAccessReady ? "녹음파일 선택" : "비밀번호 확인 후 파일 선택"}
               </button>
             </div>
           ) : !hasSource ? (
@@ -1930,13 +1991,15 @@ export function App() {
               <button
                 className="secondary-button change-file-button"
                 type="button"
-                disabled={!recordingSupported || !recordingAccessReady}
-                onClick={() => void startDirectRecording(true)}
-                title="새 녹음 시작"
-                aria-label="새 녹음 시작"
+                disabled={!recordingAccessReady || (!uploadMode && !recordingSupported)}
+                onClick={
+                  uploadMode ? openFilePicker : () => void startDirectRecording(true)
+                }
+                title={uploadMode ? "다른 파일 선택" : "새 녹음 시작"}
+                aria-label={uploadMode ? "다른 파일 선택" : "새 녹음 시작"}
               >
-                <Mic size={17} />
-                새 녹음 시작
+                {uploadMode ? <Upload size={17} /> : <Mic size={17} />}
+                {uploadMode ? "다른 파일 선택" : "새 녹음 시작"}
               </button>
             </div>
           )}
@@ -2009,9 +2072,9 @@ export function App() {
             </p>
           )}
           <p className="recording-limit-note">
-            녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료 후
-            서버 작업 접수가 완료되면 화면을 꺼도 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의
-            녹음을 보장하려면 Android 전용 앱이 필요합니다.
+            {uploadMode
+              ? "파일 처리 작업이 서버에 접수되면 화면을 꺼도 전사와 저장을 계속합니다."
+              : "녹음 중에는 화면을 켜 둔 채 자동 잠금 방지를 사용합니다. 녹음 종료 후 서버 작업 접수가 완료되면 화면을 꺼도 전사와 저장을 계속합니다. 전원 버튼으로 화면을 끈 상태의 녹음을 보장하려면 Android 전용 앱이 필요합니다."}
           </p>
         </section>
 
@@ -2042,7 +2105,7 @@ export function App() {
                   <span>
                     <KeyRound size={16} />
                     공유 비밀번호
-                    <small>비밀번호를 확인한 뒤 녹음을 종료하고 전사를 시작하세요.</small>
+                    <small>비밀번호에 맞는 녹음 또는 파일 업로드 화면을 엽니다.</small>
                   </span>
                   <span className="secret-input single">
                     <input
@@ -2262,7 +2325,7 @@ export function App() {
                 {primaryActionLabel(stage)}
               </button>
               <p className="action-note">
-                {actionStatus(stage, keyReady, hasSource, shareMode)}
+                {actionStatus(stage, keyReady, hasSource, shareMode, uploadMode)}
               </p>
             </>
           )}
@@ -2680,13 +2743,16 @@ function actionStatus(
   stage: WorkflowStage,
   keyReady: boolean,
   hasSource: boolean,
-  shareMode: boolean
+  shareMode: boolean,
+  uploadMode: boolean
 ): string {
   if (stage === "analyzing") return "녹음 길이와 언어를 빠르게 확인하고 있습니다.";
   if (stage === "optimizing") return "음성을 선명하게 정리하고 안전한 크기로 나눕니다.";
   if (stage === "transcribing") return "완료된 구간을 안전하게 저장하며 계속 처리합니다.";
   if (stage === "complete") return "미팅록을 확인하거나 TXT로 내려받으세요.";
-  if (!hasSource) return "먼저 바로 녹음을 시작하세요.";
+  if (!hasSource) {
+    return uploadMode ? "먼저 녹음파일을 선택하세요." : "먼저 바로 녹음을 시작하세요.";
+  }
   if (!keyReady) {
     return shareMode ? "공유 비밀번호를 입력하세요." : "Gemini API key가 필요합니다.";
   }

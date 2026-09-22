@@ -8,6 +8,7 @@ export type OpenAITranscribeModel =
   | "gpt-4o-mini-transcribe"
   | "whisper-1";
 export type OptimizerCodec = "mp3" | "m4a" | "ogg";
+export type AccessMode = "record" | "upload";
 
 export interface RuntimeProfile {
   device: "cpu" | "cuda";
@@ -22,6 +23,7 @@ export interface RuntimeProfile {
   local_admin: boolean;
   cloud_upload_enabled?: boolean;
   remote_session_valid?: boolean;
+  access_mode?: AccessMode | null;
 }
 
 export interface CloudUploadPart {

@@ -73,7 +73,12 @@ from local_meetscribe.schemas import (
     TranscriptPatch,
     load_transcript,
 )
-from local_meetscribe.security import GeminiShareStore, RemoteSessionStore, SupabaseConfigStore
+from local_meetscribe.security import (
+    AccessMode,
+    GeminiShareStore,
+    RemoteSessionStore,
+    SupabaseConfigStore,
+)
 from local_meetscribe.utils.errors import LocalMeetScribeError
 
 LOGGER = logging.getLogger(__name__)
@@ -423,7 +428,7 @@ def create_app(
             "status": str(state.get("status") or "queued"),
         }
 
-    def require_share_passcode(request: Request, passcode: str | None) -> None:
+    def require_share_passcode(request: Request, passcode: str | None) -> AccessMode:
         client_id = request.client.host if request.client else "unknown"
         now = time.monotonic()
         with share_failure_lock:
@@ -438,21 +443,29 @@ def create_app(
                     status_code=429,
                     detail="비밀번호 확인 횟수를 초과했습니다. 1분 후 다시 시도하세요.",
                 )
-        if not passcode or not share_store.verify_passcode(passcode):
+        access_mode = share_store.access_mode_for_passcode(passcode or "")
+        if access_mode is None:
             with share_failure_lock:
                 share_failures.setdefault(client_id, []).append(now)
             raise HTTPException(status_code=401, detail="공유 비밀번호가 맞지 않습니다.")
         with share_failure_lock:
             share_failures.pop(client_id, None)
+        return access_mode
 
-    def issue_remote_session() -> str:
-        return remote_session_store.issue(active_settings.remote_session_ttl_sec)
+    def issue_remote_session(access_mode: AccessMode) -> str:
+        return remote_session_store.issue(
+            active_settings.remote_session_ttl_sec,
+            access_mode,
+        )
 
-    def remote_session_is_valid(authorization: str | None) -> bool:
+    def remote_session_access_mode(authorization: str | None) -> AccessMode | None:
         scheme, separator, token = (authorization or "").partition(" ")
         if not separator or scheme.casefold() != "bearer" or not token:
-            return False
-        return remote_session_store.is_valid(token)
+            return None
+        return remote_session_store.access_mode(token)
+
+    def remote_session_is_valid(authorization: str | None) -> bool:
+        return remote_session_access_mode(authorization) is not None
 
     def extend_gemini_cooldown(delay_sec: float) -> None:
         nonlocal gemini_not_before
@@ -1134,15 +1147,18 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/runtime")
-    def runtime(request: Request) -> dict[str, str | bool]:
+    def runtime(request: Request) -> dict[str, object]:
         cuda = has_cuda_runtime()
         saved_share_key = share_store.api_key_configured
         cloud_upload_enabled = current_supabase_client() is not None
         local_admin = _is_loopback_request(request)
+        authenticated_access_mode = remote_session_access_mode(
+            request.headers.get("authorization")
+        )
         remote_session_valid = (
             not active_settings.remote_access_enabled
             or local_admin
-            or remote_session_is_valid(request.headers.get("authorization"))
+            or authenticated_access_mode is not None
         )
         return {
             "device": "cuda" if cuda else "cpu",
@@ -1168,6 +1184,7 @@ def create_app(
             "cloud_upload_enabled": cloud_upload_enabled,
             "local_admin": local_admin,
             "remote_session_valid": remote_session_valid,
+            "access_mode": authenticated_access_mode,
         }
 
     @app.post("/api/gemini-share/verify")
@@ -1177,11 +1194,12 @@ def create_app(
     ) -> dict[str, object]:
         if not share_store.passcode_configured:
             raise HTTPException(status_code=404, detail="Shared Gemini access is not configured.")
-        require_share_passcode(request, share_passcode)
+        access_mode = require_share_passcode(request, share_passcode)
         return {
             "valid": True,
             "key_ready": bool(active_settings.gemini_api_key or share_store.api_key_configured),
-            "access_token": issue_remote_session(),
+            "access_mode": access_mode,
+            "access_token": issue_remote_session(access_mode),
             "expires_in": active_settings.remote_session_ttl_sec,
         }
 

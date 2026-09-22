@@ -384,6 +384,21 @@ afterEach(() => {
 });
 
 describe("direct phone recording", () => {
+  it("keeps recording disabled when the server runtime cannot be loaded", async () => {
+    installRecordingBrowser(async () => ({
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream));
+    vi.mocked(api.getRuntime).mockRejectedValue(new Error("offline"));
+
+    render(<App />);
+
+    const blockedRecording = await screen.findByRole("button", {
+      name: "비밀번호 확인 후 녹음 시작"
+    });
+    expect(blockedRecording).toHaveProperty("disabled", true);
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+  });
+
   it("requires a fresh remote session before allowing a new recording", async () => {
     const getUserMedia = vi.fn(async () => ({
       getTracks: () => [{ stop: vi.fn() }]
@@ -397,6 +412,7 @@ describe("direct phone recording", () => {
     vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
       valid: true,
       key_ready: true,
+      access_mode: "record",
       expires_in: 3600
     });
 
@@ -411,7 +427,7 @@ describe("direct phone recording", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByPlaceholderText("4자리 이상"), {
-      target: { value: "0000" }
+      target: { value: "1111" }
     });
     fireEvent.click(screen.getByRole("button", { name: "비밀번호 확인" }));
 
@@ -438,6 +454,59 @@ describe("direct phone recording", () => {
       screen.queryByText("최적화된 오디오를 Google Gemini로 전송합니다.")
     ).toBeNull();
     expect(document.body.textContent).not.toContain("자동 업로드");
+  });
+
+  it("opens the single-file upload flow only after the upload code is verified", async () => {
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(false);
+    vi.mocked(api.getRuntime).mockResolvedValue({
+      ...runtime,
+      remote_session_valid: false,
+      access_mode: null,
+      cloud_upload_enabled: false
+    });
+    vi.mocked(api.verifyGeminiSharePasscode).mockResolvedValue({
+      valid: true,
+      key_ready: true,
+      access_mode: "upload",
+      expires_in: 3600
+    });
+    vi.mocked(api.analyzeOptimizer).mockResolvedValue(analysis("meeting.m4a"));
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByPlaceholderText("4자리 이상"), {
+      target: { value: "2468" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "비밀번호 확인" }));
+
+    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("2468"));
+    expect(await screen.findByRole("button", { name: "녹음파일 선택" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "바로 녹음 시작" })).toBeNull();
+
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const selected = new File(["recording"], "meeting.m4a", { type: "audio/mp4" });
+    fireEvent.change(input!, { target: { files: [selected] } });
+
+    await waitFor(() => expect(api.analyzeOptimizer).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.analyzeOptimizer).mock.calls[0][0].file).toBe(selected);
+    expect(await screen.findByRole("button", { name: "다른 파일 선택" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "새 녹음 시작" })).toBeNull();
+  });
+
+  it("restores upload mode from the authenticated server session after reload", async () => {
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getRuntime).mockResolvedValue({
+      ...runtime,
+      remote_session_valid: true,
+      access_mode: "upload"
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "녹음파일 선택" })).toBeTruthy();
+    expect(document.querySelector('input[type="file"]')).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "바로 녹음 시작" })).toBeNull();
   });
 
   it("turns the captured audio into a file and starts transcription preparation", async () => {
@@ -1155,11 +1224,11 @@ describe("recording transfer retry", () => {
     expect(screen.getByText("녹음은 이 기기에 보관되어 있습니다.")).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText("공유 비밀번호 다시 입력"), {
-      target: { value: "0000" }
+      target: { value: "1111" }
     });
     fireEvent.click(screen.getByRole("button", { name: "확인하고 계속" }));
 
-    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("0000"));
+    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("1111"));
     await waitFor(() => expect(api.createCloudUploadDescriptor).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.createCloudUploadDescriptor).mock.calls[1][0]).toBe(recordedFile);
     await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledOnce());
@@ -1212,7 +1281,7 @@ describe("recording transfer retry", () => {
     expect(document.querySelectorAll('input[type="password"]')).toHaveLength(1);
 
     fireEvent.change(screen.getByLabelText("공유 비밀번호 다시 입력"), {
-      target: { value: "0000" }
+      target: { value: "1111" }
     });
     fireEvent.click(screen.getByRole("button", { name: "확인하고 계속" }));
 
@@ -1456,11 +1525,11 @@ describe("recording transfer retry", () => {
     expect(await screen.findByText(/녹음 준비 완료 · 전사 작업을 다시 처리/)).toBeTruthy();
 
     fireEvent.change(screen.getByPlaceholderText("4자리 이상"), {
-      target: { value: "0000" }
+      target: { value: "1111" }
     });
     fireEvent.click(screen.getByRole("button", { name: "비밀번호 확인" }));
 
-    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("0000"));
+    await waitFor(() => expect(api.verifyGeminiSharePasscode).toHaveBeenCalledWith("1111"));
     await waitFor(() => expect(api.startTranscriptionWorkflow).toHaveBeenCalledTimes(2));
     expect(api.startTranscriptionWorkflow).toHaveBeenLastCalledWith(
       expect.objectContaining({ file: expect.any(File) }),

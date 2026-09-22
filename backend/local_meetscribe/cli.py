@@ -55,6 +55,31 @@ def configure_share_passcode() -> None:
     typer.echo("PhoneScribe share passcode updated. Existing browser sessions were cleared.")
 
 
+@share_app.command("configure-access-codes")
+def configure_share_access_codes() -> None:
+    """Prompt locally for separate recording and file-upload access codes."""
+    record_code = typer.prompt(
+        "Recording access code (at least 4 digits)",
+        hide_input=True,
+        confirmation_prompt=True,
+    )
+    upload_code = typer.prompt(
+        "File-upload access code (at least 4 digits)",
+        hide_input=True,
+        confirmation_prompt=True,
+    )
+    store = GeminiShareStore(get_settings().data_dir)
+    try:
+        store.configure_access_codes(
+            record_code=record_code,
+            upload_code=upload_code,
+        )
+    except LocalMeetScribeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo("PhoneScribe access codes updated. Existing browser sessions were cleared.")
+
+
 @supabase_app.command("configure")
 def configure_supabase(
     project_url: Annotated[str, typer.Option("--url", help="Supabase project HTTPS URL.")],

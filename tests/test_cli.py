@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from local_meetscribe import cli
 from local_meetscribe.cli import app
+from local_meetscribe.security import GeminiShareStore
 from typer.testing import CliRunner
 
 from tests.helpers import write_tone_wav
@@ -52,6 +53,26 @@ def test_cli_models_status(tmp_path: Path, monkeypatch) -> None:  # type: ignore
 
     assert result.exit_code == 0, result.output
     assert "Qwen3-ASR" in result.output or "qwen_asr" in result.output
+
+
+def test_cli_configures_separate_access_codes(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(cli, "get_settings", lambda: SimpleNamespace(data_dir=data_dir))
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["share", "configure-access-codes"],
+        input="1234\n1234\n5678\n5678\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    store = GeminiShareStore(data_dir)
+    assert store.access_mode_for_passcode("1234") == "record"
+    assert store.access_mode_for_passcode("5678") == "upload"
+    stored_text = store.path.read_text(encoding="utf-8")
+    assert "1234" not in stored_text
+    assert "5678" not in stored_text
 
 
 def test_serve_uses_resilient_event_loop_factory(monkeypatch) -> None:  # type: ignore[no-untyped-def]
