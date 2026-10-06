@@ -1645,6 +1645,70 @@ describe("Supabase signed upload", () => {
 });
 
 describe("workflow errors", () => {
+  it("shows quota backoff instead of presenting zero percent as active work", async () => {
+    seedOldWorkflow();
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "transcribing",
+      error: null,
+      error_code: "gemini_quota_wait",
+      transcription_retry_count: 3,
+      next_retry_at: 1_800_000_000,
+      transcription_progress: {
+        status: "transcribing",
+        completed_chunks: 0,
+        total_chunks: 2,
+        current_chunk: 1,
+        progress: 0,
+        elapsed_sec: 0,
+        eta_sec: null
+      }
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("전사 재시도 대기")).toBeTruthy();
+    expect(screen.getByText(/Gemini 무료 사용 한도 대기 중/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Gemini 사용량 회복 대기" })).toBeTruthy();
+    expect(screen.queryByText("첫 구간 완료 후 남은 시간을 계산합니다.")).toBeNull();
+    expect(screen.queryByText(/1번째 처리 중/)).toBeNull();
+    expect(screen.getByText("저장된 음원을 보관한 채 Gemini 사용량 회복을 기다립니다.")).toBeTruthy();
+    expect(screen.queryByText("완료된 구간을 안전하게 저장하며 계속 처리합니다.")).toBeNull();
+  });
+
+  it("describes a transient retry as scheduled waiting, not active processing", async () => {
+    seedOldWorkflow();
+    vi.mocked(api.hasApiAccessToken).mockReturnValue(true);
+    vi.mocked(api.getTranscriptionWorkflow).mockResolvedValue({
+      workflow_id: OLD_ID,
+      package_id: OLD_ID,
+      status: "transcribing",
+      error: null,
+      error_code: "gemini_transient_retry",
+      transcription_retry_count: 2,
+      next_retry_at: 1_800_000_000,
+      transcription_progress: {
+        status: "transcribing",
+        completed_chunks: 0,
+        total_chunks: 2,
+        current_chunk: 1,
+        progress: 0,
+        elapsed_sec: 0,
+        eta_sec: null
+      }
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("전사 재시도 대기")).toBeTruthy();
+    expect(screen.getByText(/Gemini 응답 재시도 대기 중/)).toBeTruthy();
+    expect(screen.getByText("저장된 음원으로 예정된 시각에 자동 재시도합니다.")).toBeTruthy();
+    expect(screen.queryByText(/1번째 처리 중/)).toBeNull();
+    expect(screen.queryByText("완료된 구간을 안전하게 저장하며 계속 처리합니다.")).toBeNull();
+  });
+
   it.each([
     "The recording contains no usable audio, so it cannot be transcribed.",
     "The audio stream is present but has no decodable positive duration.",

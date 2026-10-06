@@ -638,13 +638,14 @@ def test_gemini_progress_recovers_completed_partial_chunks(tmp_path: Path) -> No
     assert progress.eta_sec is None
 
 
-def test_gemini_default_model_has_one_stable_audio_fallback(tmp_path: Path) -> None:
+def test_gemini_default_model_has_stable_audio_fallbacks(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path)
 
     assert settings.gemini_model == "gemini-3.8-flash"
     assert gemini_module._model_candidates(settings.gemini_model) == (  # noqa: SLF001
         "gemini-3.8-flash",
         "gemini-3.6-flash",
+        "gemini-3.5-flash",
     )
 
 
@@ -758,6 +759,315 @@ def test_gemini_interactions_falls_back_when_http_200_has_no_transcript(
     assert generation.model == "gemini-3.6-flash"
     assert generation.text == "[00:00] recovered"
     assert client.models == ["gemini-3.8-flash", "gemini-3.6-flash"]
+
+
+def test_gemini_quota_response_advances_models_without_retrying_same_model(
+    tmp_path: Path,
+) -> None:
+    class Response:
+        headers: dict[str, str] = {}
+
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class Client:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        def request(self, method: str, _url: str, **kwargs: object) -> Response:
+            assert method == "POST"
+            payload = kwargs["json"]
+            assert isinstance(payload, dict)
+            model = str(payload["model"])
+            self.models.append(model)
+            if model != "gemini-3.5-flash":
+                return Response(429, {"error": {"message": "quota exceeded"}})
+            return Response(
+                200,
+                {
+                    "status": "completed",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "[00:00] recovered"}],
+                        }
+                    ],
+                },
+            )
+
+    audio_path = tmp_path / "chunk.mp3"
+    audio_path.write_bytes(b"small audio fixture")
+    client = Client()
+
+    generation = gemini_module._generate_inline(
+        client,
+        make_test_settings(tmp_path),
+        audio_path,
+        "audio/mp3",
+        "Transcribe faithfully.",
+    )
+
+    assert generation.model == "gemini-3.5-flash"
+    assert client.models == [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ]
+
+
+def test_gemini_quota_error_propagates_longest_retry_after() -> None:
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "120"}
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "error": {
+                    "message": "quota exceeded",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "3600s",
+                        }
+                    ],
+                }
+            }
+
+    with pytest.raises(GeminiTransientError) as raised:
+        gemini_module._raise_for_gemini_error(Response())
+
+    assert raised.value.quota_limited is True
+    assert raised.value.retry_after_seconds == 3600.0
+
+
+def test_gemini_final_transient_error_does_not_inherit_prior_model_quota_delay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(
+            self,
+            status_code: int,
+            *,
+            retry_after: str | None = None,
+        ) -> None:
+            self.status_code = status_code
+            self.headers = {"Retry-After": retry_after} if retry_after else {}
+
+        def json(self) -> dict[str, object]:
+            return {"error": {"message": "temporary model failure"}}
+
+    class Client:
+        def request(self, _method: str, _url: str, **kwargs: object) -> Response:
+            payload = kwargs["json"]
+            assert isinstance(payload, dict)
+            if payload["model"] != "gemini-3.5-flash":
+                return Response(429, retry_after="3600")
+            return Response(503)
+
+    audio_path = tmp_path / "chunk.mp3"
+    audio_path.write_bytes(b"small audio fixture")
+    monkeypatch.setattr(gemini_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(GeminiTransientError) as raised:
+        gemini_module._generate_inline(
+            Client(),
+            make_test_settings(tmp_path),
+            audio_path,
+            "audio/mp3",
+            "Transcribe faithfully.",
+        )
+
+    assert raised.value.quota_limited is False
+    assert raised.value.retry_after_seconds is None
+
+
+def test_gemini_poll_quota_does_not_submit_a_fallback_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        headers = {"Retry-After": "120"}
+
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class Client:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        def request(self, method: str, _url: str, **kwargs: object) -> Response:
+            if method == "POST":
+                payload = kwargs["json"]
+                assert isinstance(payload, dict)
+                self.models.append(str(payload["model"]))
+                return Response(200, {"id": "interaction-1", "status": "queued"})
+            return Response(429, {"error": {"message": "quota exceeded"}})
+
+    audio_path = tmp_path / "chunk.mp3"
+    audio_path.write_bytes(b"small audio fixture")
+    pending_path = tmp_path / "gemini_interaction.pending.json"
+    monkeypatch.setattr(gemini_module.time, "sleep", lambda _seconds: None)
+    client = Client()
+
+    with pytest.raises(GeminiTransientError) as raised:
+        gemini_module._generate_inline(
+            client,
+            make_test_settings(tmp_path),
+            audio_path,
+            "audio/mp3",
+            "Transcribe faithfully.",
+            pending_path=pending_path,
+            pending_filename=audio_path.name,
+        )
+
+    assert raised.value.quota_limited is True
+    assert raised.value.retry_after_seconds == 120.0
+    assert client.models == ["gemini-3.8-flash"]
+    pending = gemini_module._load_pending_interaction(  # noqa: SLF001
+        pending_path,
+        audio_path.name,
+    )
+    assert pending is not None
+    assert pending.interaction_id == "interaction-1"
+
+    class ResumeClient:
+        def __init__(self) -> None:
+            self.methods: list[str] = []
+
+        def request(self, method: str, _url: str, **_kwargs: object) -> Response:
+            self.methods.append(method)
+            assert method == "GET"
+            return Response(
+                200,
+                {
+                    "id": "interaction-1",
+                    "status": "completed",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "[00:00] recovered"}],
+                        }
+                    ],
+                },
+            )
+
+    resume_client = ResumeClient()
+    resumed = gemini_module._resume_pending_interaction(  # noqa: SLF001
+        resume_client,
+        make_test_settings(tmp_path),
+        pending,
+    )
+
+    assert resumed.text == "[00:00] recovered"
+    assert resume_client.methods == ["GET"]
+
+
+def test_gemini_incomplete_interaction_never_persists_partial_output(tmp_path: Path) -> None:
+    with pytest.raises(GeminiPermanentError, match="status: incomplete"):
+        gemini_module._wait_for_interaction_completion(  # noqa: SLF001
+            object(),
+            make_test_settings(tmp_path),
+            {
+                "id": "partial-interaction",
+                "status": "incomplete",
+                "output_text": "partial transcript that must not be accepted",
+            },
+        )
+
+
+def test_terminal_pending_interaction_is_cleared_before_manual_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_dir = tmp_path / "optimized" / "pkg"
+    package_dir.mkdir(parents=True)
+    (package_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source": {"filename": "meeting.webm"},
+                "chunks": [
+                    {
+                        "filename": "chunk_001.mp3",
+                        "start_sec": 0,
+                        "end_sec": 10,
+                        "duration_sec": 10,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package_dir / "chunk_001.mp3").write_bytes(b"small audio fixture")
+    pending_path = package_dir / gemini_module.PENDING_INTERACTION_FILENAME
+    pending_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "filename": "chunk_001.mp3",
+                "interaction_id": "dead-interaction",
+                "model": "gemini-3.8-flash",
+                "delivery": "inline",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"id": "dead-interaction", "status": "failed"}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.methods: list[str] = []
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request(self, method: str, _url: str, **_kwargs: object) -> Response:
+            self.methods.append(method)
+            assert method == "GET"
+            return Response()
+
+    fake_client = FakeClient()
+
+    class FakeHttpx:
+        class Timeout:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        @staticmethod
+        def Client(**_kwargs: object) -> FakeClient:
+            return fake_client
+
+    monkeypatch.setattr(gemini_module, "_load_httpx", lambda: FakeHttpx)
+    monkeypatch.setattr(gemini_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(GeminiPermanentError, match="status: failed"):
+        transcribe_gemini_package(
+            package_dir,
+            make_test_settings(tmp_path),
+            api_key="request-only-key",
+        )
+
+    assert fake_client.methods == ["GET"]
+    assert not pending_path.exists()
 
 
 def test_failed_workflow_recovers_when_completed_artifacts_exist(tmp_path: Path) -> None:

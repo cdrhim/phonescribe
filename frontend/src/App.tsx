@@ -737,7 +737,14 @@ export function App() {
       );
     }
     if (workflow.transcription_progress) {
-      setTranscriptionProgress(workflow.transcription_progress);
+      setTranscriptionProgress({
+        ...workflow.transcription_progress,
+        error_code: workflow.error_code ?? workflow.transcription_progress.error_code,
+        transcription_retry_count:
+          workflow.transcription_retry_count ??
+          workflow.transcription_progress.transcription_retry_count,
+        next_retry_at: workflow.next_retry_at ?? workflow.transcription_progress.next_retry_at
+      });
     }
     if (workflow.status === "queued" || workflow.status === "optimizing") {
       setStage("optimizing");
@@ -2322,10 +2329,17 @@ export function App() {
                 onClick={() => void startTranscription()}
               >
                 {busy ? <Loader2 className="spin" size={20} /> : <Play size={20} />}
-                {primaryActionLabel(stage)}
+                {primaryActionLabel(stage, transcriptionProgress)}
               </button>
               <p className="action-note">
-                {actionStatus(stage, keyReady, hasSource, shareMode, uploadMode)}
+                {actionStatus(
+                  stage,
+                  keyReady,
+                  hasSource,
+                  shareMode,
+                  uploadMode,
+                  transcriptionProgress
+                )}
               </p>
             </>
           )}
@@ -2624,11 +2638,28 @@ function TranscriptionProgressView({
       : progress.eta_sec < 10
         ? "곧 완료"
         : `약 ${formatRemainingTime(progress.eta_sec)} 남음`;
+  const retryCount = progress.transcription_retry_count ?? 0;
+  const retryAt =
+    progress.next_retry_at && progress.next_retry_at * 1000 > Date.now()
+    ? new Date(progress.next_retry_at * 1000).toLocaleTimeString("ko-KR", {
+        hour: "numeric",
+        minute: "2-digit"
+      })
+    : null;
+  const retryStatus =
+    progress.error_code === "gemini_quota_wait"
+      ? `Gemini 무료 사용 한도 대기 중${retryAt ? ` · ${retryAt} 자동 재개` : ""}`
+      : progress.error_code === "gemini_transient_retry"
+        ? `Gemini 응답 재시도 대기 중${retryAt ? ` · ${retryAt} 자동 재개` : ""}${retryCount ? ` · ${retryCount}번째` : ""}`
+        : null;
+  const visibleChunkStatus = retryStatus
+    ? `${progress.completed_chunks}/${progress.total_chunks} 구간 완료`
+    : chunkStatus;
 
   return (
     <div className="transcription-progress" aria-live="polite">
       <div className="progress-heading">
-        <span>전사 진행</span>
+        <span>{retryStatus ? "전사 재시도 대기" : "전사 진행"}</span>
         <strong>{percent}%</strong>
       </div>
       <div
@@ -2642,8 +2673,8 @@ function TranscriptionProgressView({
         <span style={{ width: `${percent}%` }} />
       </div>
       <div className="progress-meta">
-        <span>{chunkStatus}</span>
-        <span>{etaStatus}</span>
+        <span>{visibleChunkStatus}</span>
+        <span>{retryStatus || etaStatus}</span>
       </div>
     </div>
   );
@@ -2715,9 +2746,18 @@ function previewTranscriptText(value: string, maxCharacters = 1600): {
   return { text: `${text.slice(0, boundary).trimEnd()}\n…`, truncated: true };
 }
 
-function primaryActionLabel(stage: WorkflowStage): string {
+function primaryActionLabel(
+  stage: WorkflowStage,
+  progress?: GeminiTranscriptionProgress | null
+): string {
   if (stage === "analyzing") return "파일 분석 중";
   if (stage === "optimizing") return "오디오 최적화 중";
+  if (stage === "transcribing" && progress?.error_code === "gemini_quota_wait") {
+    return "Gemini 사용량 회복 대기";
+  }
+  if (stage === "transcribing" && progress?.error_code === "gemini_transient_retry") {
+    return "Gemini 연결 재시도 중";
+  }
   if (stage === "transcribing") return "Gemini 전사 중";
   if (stage === "failed") return "다시 처리";
   return "전사 시작";
@@ -2736,6 +2776,12 @@ function workflowErrorMessage(error: string | null | undefined): string {
   if (/Internal error encountered|temporarily unavailable/i.test(detail)) {
     return "Gemini 서버가 일시적으로 응답하지 않았습니다. 저장된 음원으로 다시 처리할 수 있습니다.";
   }
+  if (/quota (?:is exhausted|.*unavailable)|quota.*reset time/i.test(detail)) {
+    return "Gemini 무료 사용 한도로 자동 처리를 중지했습니다. 저장된 음원은 그대로 있으며 사용량이 회복된 뒤 다시 처리할 수 있습니다.";
+  }
+  if (/remained unavailable after .*automatic attempts/i.test(detail)) {
+    return "Gemini가 여러 번 응답하지 않아 자동 재시도를 중지했습니다. 저장된 음원으로 나중에 다시 처리할 수 있습니다.";
+  }
   return detail;
 }
 
@@ -2744,10 +2790,17 @@ function actionStatus(
   keyReady: boolean,
   hasSource: boolean,
   shareMode: boolean,
-  uploadMode: boolean
+  uploadMode: boolean,
+  progress?: GeminiTranscriptionProgress | null
 ): string {
   if (stage === "analyzing") return "녹음 길이와 언어를 빠르게 확인하고 있습니다.";
   if (stage === "optimizing") return "음성을 선명하게 정리하고 안전한 크기로 나눕니다.";
+  if (stage === "transcribing" && progress?.error_code === "gemini_quota_wait") {
+    return "저장된 음원을 보관한 채 Gemini 사용량 회복을 기다립니다.";
+  }
+  if (stage === "transcribing" && progress?.error_code === "gemini_transient_retry") {
+    return "저장된 음원으로 예정된 시각에 자동 재시도합니다.";
+  }
   if (stage === "transcribing") return "완료된 구간을 안전하게 저장하며 계속 처리합니다.";
   if (stage === "complete") return "미팅록을 확인하거나 TXT로 내려받으세요.";
   if (!hasSource) {

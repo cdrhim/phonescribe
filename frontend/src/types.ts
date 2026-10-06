@@ -168,6 +168,9 @@ export interface GeminiTranscriptionProgress {
   progress: number;
   elapsed_sec: number;
   eta_sec: number | null;
+  error_code?: string | null;
+  transcription_retry_count?: number | null;
+  next_retry_at?: number | null;
 }
 
 export type TranscriptionWorkflowStage =
@@ -185,6 +188,9 @@ export interface TranscriptionWorkflowStart {
 
 export interface TranscriptionWorkflowStatus extends TranscriptionWorkflowStart {
   error: string | null;
+  error_code?: string | null;
+  transcription_retry_count?: number | null;
+  next_retry_at?: number | null;
   auto_exported?: boolean | null;
   auto_export_error?: string | null;
   package?: OptimizedPackageResult;

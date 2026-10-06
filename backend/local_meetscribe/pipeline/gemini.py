@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import time
 import uuid
@@ -22,10 +23,13 @@ INLINE_LIMIT_BYTES = 20 * 1024 * 1024
 MAX_REQUEST_ATTEMPTS = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MODEL_FALLBACK_STATUS_CODES = RETRYABLE_STATUS_CODES | {400, 404}
-GEMINI_FALLBACK_MODELS = ("gemini-3.6-flash",)
+GEMINI_FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash")
 INTERACTION_POLL_ATTEMPTS = 120
+INTERACTION_PENDING_STATUSES = frozenset({"queued", "in_progress"})
+INTERACTION_COMPLETED_STATUSES = frozenset({"complete", "completed"})
 PARTIAL_TRANSCRIPT_FILENAME = "gemini_transcript.partial.json"
 PROGRESS_FILENAME = "gemini_progress.json"
+PENDING_INTERACTION_FILENAME = "gemini_interaction.pending.json"
 DEFAULT_TRANSCRIPTION_PROMPT = (
     "Generate a faithful Korean/English meeting transcript from this audio. "
     "Keep spoken transcript text only. Use timestamps at segment starts. Use rough speaker "
@@ -37,6 +41,17 @@ DEFAULT_TRANSCRIPTION_PROMPT = (
 
 class GeminiTransientError(LocalMeetScribeError):
     """A Gemini failure that can be retried without changing the recording."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        quota_limited: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = _positive_finite_seconds(retry_after_seconds)
+        self.quota_limited = quota_limited
 
 
 class GeminiPermanentError(LocalMeetScribeError):
@@ -62,6 +77,15 @@ class GeminiChunkTranscript:
 class _GeminiGeneration:
     text: str
     model: str
+
+
+@dataclass(frozen=True)
+class _PendingInteraction:
+    filename: str
+    interaction_id: str
+    model: str
+    delivery: GeminiDelivery
+    file_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +171,7 @@ def transcribe_gemini_package(
     httpx = _load_httpx()
     partial_path = package_dir / PARTIAL_TRANSCRIPT_FILENAME
     progress_path = package_dir / PROGRESS_FILENAME
+    pending_path = package_dir / PENDING_INTERACTION_FILENAME
     completed = _load_partial_transcripts(partial_path, settings.gemini_model)
     transcripts: list[GeminiChunkTranscript] = []
     manifest_filenames = {
@@ -218,14 +243,40 @@ def transcribe_gemini_package(
                     float(chunk_meta.get("start_sec") or 0.0),
                     float(chunk_meta.get("end_sec") or 0.0),
                 )
-                if can_send_gemini_inline(chunk_path):
-                    delivery: GeminiDelivery = "inline"
+                delivery: GeminiDelivery
+                pending = _load_pending_interaction(pending_path, filename)
+                if pending is not None:
+                    delivery = pending.delivery
+                    try:
+                        generation = _resume_pending_interaction(client, settings, pending)
+                    except GeminiTransientError:
+                        raise
+                    except LocalMeetScribeError:
+                        if pending.file_name:
+                            _delete_uploaded_file(
+                                client,
+                                settings,
+                                {"file": {"name": pending.file_name}},
+                            )
+                        _best_effort_unlink(pending_path)
+                        raise
+                    if pending.file_name:
+                        _delete_uploaded_file(
+                            client,
+                            settings,
+                            {"file": {"name": pending.file_name}},
+                        )
+                    _best_effort_unlink(pending_path)
+                elif can_send_gemini_inline(chunk_path):
+                    delivery = "inline"
                     generation = _generate_inline(
                         client,
                         settings,
                         chunk_path,
                         mime_type,
                         prompt,
+                        pending_path=pending_path,
+                        pending_filename=filename,
                     )
                 else:
                     delivery = "files_api"
@@ -238,9 +289,12 @@ def transcribe_gemini_package(
                             file_info,
                             mime_type,
                             prompt,
+                            pending_path=pending_path,
+                            pending_filename=filename,
                         )
                     finally:
-                        _delete_uploaded_file(client, settings, file_info)
+                        if _load_pending_interaction(pending_path, filename) is None:
+                            _delete_uploaded_file(client, settings, file_info)
                 transcripts.append(
                     GeminiChunkTranscript(
                         filename=filename,
@@ -323,6 +377,7 @@ def transcribe_gemini_package(
     }
     _atomic_write_text(json_path, json.dumps(payload, ensure_ascii=False, indent=2))
     _best_effort_unlink(partial_path)
+    _best_effort_unlink(pending_path)
     _write_progress_safely(
         progress_path,
         status="complete",
@@ -562,6 +617,9 @@ def _generate_inline(
     audio_path: Path,
     mime_type: str,
     prompt: str,
+    *,
+    pending_path: Path | None = None,
+    pending_filename: str | None = None,
 ) -> _GeminiGeneration:
     return _generate_interaction(
         client,
@@ -572,6 +630,9 @@ def _generate_inline(
             "mime_type": mime_type,
             "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
         },
+        pending_path=pending_path,
+        pending_filename=pending_filename,
+        pending_delivery="inline",
     )
 
 
@@ -651,6 +712,9 @@ def _generate_from_file(
     file_info: dict[str, Any],
     fallback_mime_type: str,
     prompt: str,
+    *,
+    pending_path: Path | None = None,
+    pending_filename: str | None = None,
 ) -> _GeminiGeneration:
     file_obj = _file_obj(file_info)
     file_uri = file_obj.get("uri")
@@ -662,6 +726,10 @@ def _generate_from_file(
         settings,
         prompt,
         {"type": "audio", "mime_type": mime_type, "uri": file_uri},
+        pending_path=pending_path,
+        pending_filename=pending_filename,
+        pending_delivery="files_api",
+        pending_file_name=str(file_obj.get("name") or "") or None,
     )
 
 
@@ -670,6 +738,11 @@ def _generate_interaction(
     settings: Settings,
     prompt: str,
     audio_input: dict[str, str],
+    *,
+    pending_path: Path | None = None,
+    pending_filename: str | None = None,
+    pending_delivery: GeminiDelivery | None = None,
+    pending_file_name: str | None = None,
 ) -> _GeminiGeneration:
     last_response: Any | None = None
     last_exception: LocalMeetScribeError | None = None
@@ -694,26 +767,59 @@ def _generate_interaction(
             last_exception = exc
             continue
         if response.status_code < 400:
+            response_payload = response.json()
+            pending_saved = False
+            if (
+                str(response_payload.get("status") or "").casefold()
+                in INTERACTION_PENDING_STATUSES
+                and pending_path is not None
+                and pending_filename
+                and pending_delivery is not None
+            ):
+                interaction_id = str(response_payload.get("id") or "").strip()
+                if interaction_id:
+                    _write_pending_interaction(
+                        pending_path,
+                        _PendingInteraction(
+                            filename=pending_filename,
+                            interaction_id=interaction_id,
+                            model=model,
+                            delivery=pending_delivery,
+                            file_name=pending_file_name,
+                        ),
+                    )
+                    pending_saved = True
             try:
                 interaction = _wait_for_interaction_completion(
                     client,
                     settings,
-                    response.json(),
+                    response_payload,
                 )
-                return _GeminiGeneration(
+                generation = _GeminiGeneration(
                     text=_extract_interaction_text(interaction),
                     model=model,
                 )
+            except GeminiTransientError:
+                # The interaction was already accepted. Retrying with a fallback model
+                # here would create a second billable transcription for the same chunk.
+                raise
             except LocalMeetScribeError as exc:
+                if pending_saved and pending_path is not None:
+                    _best_effort_unlink(pending_path)
                 last_response = None
                 last_exception = exc
                 continue
+            if pending_saved and pending_path is not None:
+                _best_effort_unlink(pending_path)
+            return generation
         last_response = response
         last_exception = None
         if response.status_code not in MODEL_FALLBACK_STATUS_CODES:
             break
 
     if last_response is not None:
+        # Quotas and Retry-After values are model-specific. Do not carry a long
+        # quota delay from an earlier fallback into the final model's response.
         _raise_for_gemini_error(last_response)
     if last_exception is not None:
         raise last_exception
@@ -786,8 +892,8 @@ def _wait_for_interaction_completion(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     status = str(payload.get("status") or "").casefold()
-    if status != "in_progress":
-        return payload
+    if status not in INTERACTION_PENDING_STATUSES:
+        return _require_completed_interaction(payload)
     interaction_id = str(payload.get("id") or "").strip()
     if not interaction_id:
         raise LocalMeetScribeError("Gemini interaction is in progress without a recovery ID.")
@@ -803,10 +909,35 @@ def _wait_for_interaction_completion(
         _raise_for_gemini_error(response)
         payload = response.json()
         status = str(payload.get("status") or "").casefold()
-        if status != "in_progress":
-            return payload
+        if status not in INTERACTION_PENDING_STATUSES:
+            return _require_completed_interaction(payload)
     raise GeminiTransientError(
         "Gemini interaction is still processing. The server will continue automatically."
+    )
+
+
+def _require_completed_interaction(payload: dict[str, Any]) -> dict[str, Any]:
+    status = str(payload.get("status") or "").casefold()
+    if not status or status in INTERACTION_COMPLETED_STATUSES:
+        return payload
+    raise GeminiPermanentError(
+        f"Gemini interaction ended without a complete transcript (status: {status})."
+    )
+
+
+def _resume_pending_interaction(
+    client: Any,
+    settings: Settings,
+    pending: _PendingInteraction,
+) -> _GeminiGeneration:
+    interaction = _wait_for_interaction_completion(
+        client,
+        settings,
+        {"id": pending.interaction_id, "status": "in_progress"},
+    )
+    return _GeminiGeneration(
+        text=_extract_interaction_text(interaction),
+        model=pending.model,
     )
 
 
@@ -821,18 +952,26 @@ def _raise_for_gemini_error(response: Any) -> None:
             detail = f"Gemini API error: {message}"
     except Exception:
         pass
+    retry_after_seconds = _response_retry_after_seconds(response)
     if response.status_code == 429:
         detail += (
             " The Gemini free-tier quota may be exhausted. Wait for it to reset or check "
             "the active limits in Google AI Studio."
         )
-        raise GeminiTransientError(detail)
+        raise GeminiTransientError(
+            detail,
+            retry_after_seconds=retry_after_seconds,
+            quota_limited=True,
+        )
     elif response.status_code in {500, 502, 503, 504}:
         detail = (
             "Gemini is temporarily unavailable after automatic retries. "
             "The optimized audio is saved and the server will continue automatically."
         )
-        raise GeminiTransientError(detail)
+        raise GeminiTransientError(
+            detail,
+            retry_after_seconds=retry_after_seconds,
+        )
     raise GeminiPermanentError(detail)
 
 
@@ -847,6 +986,10 @@ def _request_with_retry(client: Any, method: str, url: str, **kwargs: Any) -> An
                 ) from exc
             time.sleep(2**attempt)
             continue
+        if response.status_code == 429:
+            # A quota response is model-specific. Let the caller advance to the next
+            # configured model instead of spending all attempts on the same model.
+            return response
         if (
             response.status_code not in RETRYABLE_STATUS_CODES
             or attempt + 1 >= MAX_REQUEST_ATTEMPTS
@@ -857,13 +1000,60 @@ def _request_with_retry(client: Any, method: str, url: str, **kwargs: Any) -> An
 
 
 def _retry_delay(response: Any, attempt: int) -> float:
-    retry_after = response.headers.get("retry-after")
-    if retry_after:
-        try:
-            return min(30.0, max(1.0, float(retry_after)))
-        except ValueError:
-            pass
+    retry_after = _response_retry_after_seconds(response)
+    if retry_after is not None:
+        return min(30.0, max(1.0, retry_after))
     return min(15.0, float(3 * (2**attempt)))
+
+
+def _response_retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {})
+    retry_after = None
+    if hasattr(headers, "get"):
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    parsed = _duration_seconds(retry_after)
+
+    try:
+        payload = response.json()
+    except Exception:
+        return parsed
+    error = payload.get("error") if isinstance(payload, dict) else None
+    details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, list):
+        return parsed
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        parsed = _maximum_seconds(
+            parsed,
+            _duration_seconds(detail.get("retryDelay") or detail.get("retry_delay")),
+        )
+    return parsed
+
+
+def _duration_seconds(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return _positive_finite_seconds(float(value))
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("s"):
+        text = text[:-1].strip()
+    try:
+        return _positive_finite_seconds(float(text))
+    except ValueError:
+        return None
+
+
+def _positive_finite_seconds(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _maximum_seconds(*values: float | None) -> float | None:
+    valid = [value for value in values if value is not None]
+    return max(valid) if valid else None
 
 
 def _api_headers(settings: Settings) -> dict[str, str]:
@@ -921,6 +1111,52 @@ def _combine_chunk_text(chunks: list[GeminiChunkTranscript]) -> str:
             f"{chunk.filename}]\n{chunk.text.strip()}"
         )
     return "\n\n".join(sections).strip()
+
+
+def _load_pending_interaction(
+    path: Path,
+    filename: str,
+) -> _PendingInteraction | None:
+    if not path.exists():
+        return None
+    payload = _read_json_object(path)
+    delivery = str(payload.get("delivery") or "")
+    stored_filename = str(payload.get("filename") or "")
+    interaction_id = str(payload.get("interaction_id") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if (
+        stored_filename != filename
+        or not interaction_id
+        or not model
+        or delivery not in {"inline", "files_api"}
+    ):
+        return None
+    return _PendingInteraction(
+        filename=stored_filename,
+        interaction_id=interaction_id,
+        model=model,
+        delivery=delivery,  # type: ignore[arg-type]
+        file_name=str(payload.get("file_name") or "").strip() or None,
+    )
+
+
+def _write_pending_interaction(path: Path, pending: _PendingInteraction) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "filename": pending.filename,
+                "interaction_id": pending.interaction_id,
+                "model": pending.model,
+                "delivery": pending.delivery,
+                "file_name": pending.file_name,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
 
 
 def _load_partial_transcripts(

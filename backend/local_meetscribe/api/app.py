@@ -91,6 +91,7 @@ RECOVERABLE_WORKFLOW_STATUSES = frozenset({"queued", "optimizing", "transcribing
 IDEMPOTENT_WORKFLOW_STATUSES = RECOVERABLE_WORKFLOW_STATUSES | {"complete"}
 GEMINI_WORKFLOW_RETRY_BASE_SEC = 30.0
 GEMINI_WORKFLOW_RETRY_MAX_SEC = 5 * 60.0
+GEMINI_WORKFLOW_MAX_TRANSIENT_ATTEMPTS = 4
 
 
 class CloudUploadDescriptorRequest(BaseModel):
@@ -146,7 +147,7 @@ def create_app(
     active_workflow_lock = threading.Lock()
     gemini_workflow_gate = threading.BoundedSemaphore(1)
     gemini_cooldown_lock = threading.Lock()
-    gemini_not_before = 0.0
+    gemini_cooldown_by_credential: dict[str, tuple[float, str]] = {}
     cloud_outbox_lock = threading.Lock()
     cloud_cleanup_lock = threading.Lock()
     cloud_outbox_run_gate = threading.BoundedSemaphore(1)
@@ -384,13 +385,17 @@ def create_app(
 
     def find_idempotent_workflow(
         workflow_input_key: str,
+        *,
+        package_id: str | None = None,
     ) -> dict[str, object] | None:
         workflow_dir = active_settings.tmp_dir / "workflows"
         newest: tuple[float, dict[str, object]] | None = None
         for state_path in workflow_dir.glob("*.json"):
             try:
                 state = _read_json_object(state_path)
-                if state.get("workflow_input_key") != workflow_input_key:
+                same_input = state.get("workflow_input_key") == workflow_input_key
+                same_package = bool(package_id) and state.get("package_id") == package_id
+                if not same_input and not same_package:
                     continue
                 if str(state.get("status") or "") not in IDEMPOTENT_WORKFLOW_STATUSES:
                     continue
@@ -417,8 +422,10 @@ def create_app(
 
     def idempotent_workflow_response(
         workflow_input_key: str,
+        *,
+        package_id: str | None = None,
     ) -> dict[str, object] | None:
-        state = find_idempotent_workflow(workflow_input_key)
+        state = find_idempotent_workflow(workflow_input_key, package_id=package_id)
         if state is None:
             return None
         return {
@@ -467,16 +474,39 @@ def create_app(
     def remote_session_is_valid(authorization: str | None) -> bool:
         return remote_session_access_mode(authorization) is not None
 
-    def extend_gemini_cooldown(delay_sec: float) -> None:
-        nonlocal gemini_not_before
+    def gemini_credential_scope(api_key: str) -> str:
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+    def extend_gemini_cooldown(
+        api_key: str,
+        delay_sec: float,
+        error_code: str,
+    ) -> None:
+        scope = gemini_credential_scope(api_key)
         deadline = time.monotonic() + max(0.0, delay_sec)
         with gemini_cooldown_lock:
-            gemini_not_before = max(gemini_not_before, deadline)
+            current_deadline, current_code = gemini_cooldown_by_credential.get(
+                scope,
+                (0.0, error_code),
+            )
+            if deadline >= current_deadline:
+                gemini_cooldown_by_credential[scope] = (deadline, error_code)
+            else:
+                gemini_cooldown_by_credential[scope] = (current_deadline, current_code)
 
-    def wait_for_gemini_cooldown() -> bool:
+    def gemini_cooldown_snapshot(api_key: str) -> tuple[float, str | None]:
+        scope = gemini_credential_scope(api_key)
+        with gemini_cooldown_lock:
+            deadline, error_code = gemini_cooldown_by_credential.get(scope, (0.0, ""))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                gemini_cooldown_by_credential.pop(scope, None)
+                return 0.0, None
+            return remaining, error_code or None
+
+    def wait_for_gemini_cooldown(api_key: str) -> bool:
         while not maintenance_stop.is_set():
-            with gemini_cooldown_lock:
-                remaining = gemini_not_before - time.monotonic()
+            remaining, _error_code = gemini_cooldown_snapshot(api_key)
             if remaining <= 0:
                 return True
             if maintenance_stop.wait(remaining):
@@ -522,6 +552,18 @@ def create_app(
                 durable_fields=durable_fields,
             )
 
+        def persist_scoped_cooldown_wait() -> None:
+            remaining, cooldown_error_code = gemini_cooldown_snapshot(api_key)
+            if remaining <= 0:
+                return
+            persist_state(
+                "transcribing",
+                durable_fields={
+                    "error_code": cooldown_error_code or "gemini_transient_retry",
+                    "next_retry_at": time.time() + remaining,
+                },
+            )
+
         release_system_awake = _request_system_awake()
         try:
             if maintenance_stop.is_set():
@@ -565,6 +607,11 @@ def create_app(
 
             phase = "transcribing"
             persist_state("transcribing")
+            persist_scoped_cooldown_wait()
+            if not gemini_slot_held and (
+                not wait_for_gemini_cooldown(api_key) or maintenance_stop.is_set()
+            ):
+                return
             if not gemini_slot_held and not gemini_workflow_gate.acquire(blocking=False):
 
                 def queued_gemini_worker() -> None:
@@ -572,7 +619,13 @@ def create_app(
                     slot_ready = False
                     try:
                         while not maintenance_stop.wait(0.25):
+                            persist_scoped_cooldown_wait()
+                            if not wait_for_gemini_cooldown(api_key):
+                                break
                             if gemini_workflow_gate.acquire(blocking=False):
+                                if gemini_cooldown_snapshot(api_key)[0] > 0:
+                                    gemini_workflow_gate.release()
+                                    continue
                                 slot_ready = True
                                 break
                     finally:
@@ -608,8 +661,14 @@ def create_app(
                 workflow_lease_transferred = True
                 return
             gemini_slot_held = True
-            if not wait_for_gemini_cooldown() or maintenance_stop.is_set():
-                return
+            persist_state(
+                "transcribing",
+                durable_fields={
+                    "error_code": None,
+                    "last_transient_error_at": None,
+                    "next_retry_at": None,
+                },
+            )
             transcription_retry_count: int | None = None
             retry_delay: float | None = None
             try:
@@ -619,7 +678,7 @@ def create_app(
                         active_settings,
                         api_key=api_key,
                     )
-                except GeminiTransientError:
+                except GeminiTransientError as exc:
                     if not _gemini_outputs_complete(output_dir):
                         transcription_retry_count = (
                             _workflow_transcription_retry_count(
@@ -627,10 +686,23 @@ def create_app(
                             )
                             + 1
                         )
-                        retry_delay = _gemini_workflow_retry_delay(
-                            transcription_retry_count
-                        )
-                        extend_gemini_cooldown(retry_delay)
+                        if _should_retry_gemini_transient(
+                            exc,
+                            transcription_retry_count,
+                        ):
+                            retry_delay = _gemini_workflow_retry_delay(
+                                transcription_retry_count,
+                                retry_after_seconds=exc.retry_after_seconds,
+                            )
+                            extend_gemini_cooldown(
+                                api_key,
+                                retry_delay,
+                                (
+                                    "gemini_quota_wait"
+                                    if exc.quota_limited
+                                    else "gemini_transient_retry"
+                                ),
+                            )
                     raise
                 finally:
                     gemini_workflow_gate.release()
@@ -647,18 +719,50 @@ def create_app(
                         auto_export_error=auto_export_error,
                     )
                     return
-                if transcription_retry_count is None or retry_delay is None:
+                if transcription_retry_count is None:
                     transcription_retry_count = (
                         _workflow_transcription_retry_count(
                             _workflow_state_path(active_settings, workflow_id)
                         )
                         + 1
                     )
-                    retry_delay = _gemini_workflow_retry_delay(transcription_retry_count)
+                if not _should_retry_gemini_transient(exc, transcription_retry_count):
+                    persist_state(
+                        "failed",
+                        error=_gemini_transient_terminal_message(
+                            exc,
+                            transcription_retry_count,
+                        ),
+                        durable_fields={
+                            "error_code": _gemini_transient_terminal_error_code(exc),
+                            "transcription_retry_count": transcription_retry_count,
+                            "last_transient_error_at": time.time(),
+                            "next_retry_at": None,
+                        },
+                    )
+                    return
+                if retry_delay is None:
+                    retry_delay = _gemini_workflow_retry_delay(
+                        transcription_retry_count,
+                        retry_after_seconds=exc.retry_after_seconds,
+                    )
+                    extend_gemini_cooldown(
+                        api_key,
+                        retry_delay,
+                        (
+                            "gemini_quota_wait"
+                            if exc.quota_limited
+                            else "gemini_transient_retry"
+                        ),
+                    )
                 persist_state(
                     "transcribing",
                     durable_fields={
-                        "error_code": "gemini_transient_retry",
+                        "error_code": (
+                            "gemini_quota_wait"
+                            if exc.quota_limited
+                            else "gemini_transient_retry"
+                        ),
                         "transcription_retry_count": transcription_retry_count,
                         "last_transient_error_at": time.time(),
                         "next_retry_at": time.time() + retry_delay,
@@ -850,7 +954,71 @@ def create_app(
     def recover_workflows() -> None:
         workflow_dir = active_settings.tmp_dir / "workflows"
         workflow_dir.mkdir(parents=True, exist_ok=True)
-        for state_path in sorted(workflow_dir.glob("*.json")):
+        state_paths = sorted(workflow_dir.glob("*.json"))
+        canonical_recovery_paths: dict[str, tuple[tuple[float, float, str], Path]] = {}
+        for candidate_path in state_paths:
+            try:
+                candidate = _read_json_object(candidate_path)
+                candidate_workflow_id = str(candidate.get("workflow_id") or "")
+                candidate_package_id = str(candidate.get("package_id") or "")
+                candidate_status = str(candidate.get("status") or "")
+                if (
+                    candidate_path.stem != candidate_workflow_id
+                    or not re.fullmatch(r"[a-f0-9]{32}", candidate_workflow_id)
+                    or not re.fullmatch(r"[a-f0-9]{32}", candidate_package_id)
+                ):
+                    continue
+                candidate_is_transient = candidate_status == "failed" and (
+                    _is_transient_gemini_workflow_failure(candidate)
+                )
+                if (
+                    candidate_status not in RECOVERABLE_WORKFLOW_STATUSES
+                    and not candidate_is_transient
+                ):
+                    continue
+                if _workflow_retry_limit_exhausted(candidate):
+                    continue
+                created_at = _positive_timestamp(candidate.get("created_at"))
+                updated_at = _positive_timestamp(candidate.get("updated_at"))
+                fallback_time = candidate_path.stat().st_mtime
+                rank = (
+                    created_at or updated_at or fallback_time,
+                    updated_at or created_at or fallback_time,
+                    candidate_path.name,
+                )
+            except (LocalMeetScribeError, OSError, TypeError, ValueError):
+                continue
+            current = canonical_recovery_paths.get(candidate_package_id)
+            if current is None or rank > current[0]:
+                canonical_recovery_paths[candidate_package_id] = (rank, candidate_path)
+
+        # Register every persisted cooldown before starting any recovery worker. Without
+        # this pre-pass, an earlier state file can reach Gemini before a later state file
+        # contributes the shared wait that applies to the same server credential.
+        startup_recovery_api_key = recovery_api_key()
+        if startup_recovery_api_key:
+            for _rank, cooldown_state_path in canonical_recovery_paths.values():
+                try:
+                    cooldown_state = _read_json_object(cooldown_state_path)
+                    cooldown_package_id = str(cooldown_state.get("package_id") or "")
+                    cooldown_output_dir = (
+                        active_settings.data_dir / "optimized" / cooldown_package_id
+                    )
+                    if _gemini_outputs_complete(cooldown_output_dir):
+                        continue
+                    recovery_retry_delay = _workflow_retry_delay_remaining(cooldown_state)
+                    if recovery_retry_delay <= 0:
+                        continue
+                    extend_gemini_cooldown(
+                        startup_recovery_api_key,
+                        recovery_retry_delay,
+                        _workflow_error_code(cooldown_state)
+                        or "gemini_transient_retry",
+                    )
+                except (LocalMeetScribeError, OSError, TypeError, ValueError):
+                    continue
+
+        for state_path in state_paths:
             lease: _WorkflowInputLease | None = None
             workflow_input_key = ""
             try:
@@ -882,7 +1050,61 @@ def create_app(
                 ):
                     continue
 
-                input_kind, input_id, workflow_input_key = _recovery_input(state, package_id)
+                output_dir = active_settings.data_dir / "optimized" / package_id
+                if _workflow_retry_limit_exhausted(state) and not _gemini_outputs_complete(
+                    output_dir
+                ):
+                    retry_count = _nonnegative_int(state.get("transcription_retry_count"))
+                    quota_limited = state.get("error_code") == "gemini_quota_wait"
+                    persist_workflow_state(
+                        workflow_id=workflow_id,
+                        package_id=package_id,
+                        status="failed",
+                        error=(
+                            f"Gemini quota remained unavailable after {retry_count} scheduled "
+                            "attempts. The optimized audio is saved. Retry transcription later; "
+                            "no new recording is needed."
+                            if quota_limited
+                            else f"Gemini remained unavailable after {retry_count} automatic "
+                            "attempts. The optimized audio is saved. Retry transcription later; "
+                            "no new recording is needed."
+                        ),
+                        cloud_recording_id=cloud_recording_id,
+                        cloud_client=current_supabase_client(),
+                        durable_fields={
+                            "error_code": (
+                                "gemini_quota_retry_exhausted"
+                                if quota_limited
+                                else "gemini_retry_exhausted"
+                            ),
+                            "next_retry_at": None,
+                        },
+                        attempt_cloud_delivery=False,
+                    )
+                    continue
+
+                canonical_entry = canonical_recovery_paths.get(package_id)
+                if canonical_entry is not None and canonical_entry[1] != state_path:
+                    persist_workflow_state(
+                        workflow_id=workflow_id,
+                        package_id=package_id,
+                        status="failed",
+                        error=(
+                            "A newer workflow owns recovery for this recording. "
+                            "Use that workflow's result instead."
+                        ),
+                        cloud_recording_id=cloud_recording_id,
+                        cloud_client=current_supabase_client(),
+                        durable_fields={"error_code": "duplicate_recovery_worker"},
+                        attempt_cloud_delivery=False,
+                    )
+                    continue
+
+                input_kind, input_id, _persisted_input_key = _recovery_input(state, package_id)
+                # Different entry paths can point at the same optimized package. Recovery
+                # must use one canonical lease so a restart never relaunches duplicate
+                # Gemini workers for that package.
+                workflow_input_key = f"package:{package_id}"
                 lease, reservation_error = try_reserve_workflow_input(workflow_input_key)
                 if lease is None:
                     if reservation_error == "active":
@@ -891,7 +1113,7 @@ def create_app(
                             package_id=package_id,
                             status="failed",
                             error=(
-                                "A newer recovery worker already owns this recording. "
+                                "Another recovery worker already owns this recording. "
                                 "Retry the recording only if that workflow fails."
                             ),
                             cloud_recording_id=cloud_recording_id,
@@ -929,7 +1151,7 @@ def create_app(
                             active_workflow_inputs.discard(workflow_input_key)
                     continue
 
-                api_key = recovery_api_key()
+                api_key = startup_recovery_api_key
                 cloud_client = current_supabase_client() if cloud_recording_id else None
                 recovery_error: str | None = None
                 error_code: str | None = None
@@ -1604,7 +1826,10 @@ def create_app(
         input_kind = "upload" if upload_id else ("cloud" if cloud_recording_id else "package")
         supplied_input_id = upload_id or cloud_recording_id or package_id or ""
         workflow_input_key = f"{input_kind}:{supplied_input_id}"
-        existing_workflow = idempotent_workflow_response(workflow_input_key)
+        existing_workflow = idempotent_workflow_response(
+            workflow_input_key,
+            package_id=package_id,
+        )
         if existing_workflow is not None:
             return existing_workflow
 
@@ -1648,7 +1873,10 @@ def create_app(
         workflow_id = uuid.uuid4().hex
         workflow_lease, _reservation_error = try_reserve_workflow_input(workflow_input_key)
         if workflow_lease is None:
-            existing_workflow = idempotent_workflow_response(workflow_input_key)
+            existing_workflow = idempotent_workflow_response(
+                workflow_input_key,
+                package_id=package_id,
+            )
             if existing_workflow is not None:
                 return existing_workflow
             raise HTTPException(
@@ -1743,6 +1971,13 @@ def create_app(
             "package_id": package_id,
             "status": status,
             "error": None if status == "complete" else state.get("error"),
+            "error_code": None if status == "complete" else _workflow_error_code(state),
+            "transcription_retry_count": _nonnegative_int(
+                state.get("transcription_retry_count")
+            ),
+            "next_retry_at": (
+                None if status == "complete" else _positive_timestamp(state.get("next_retry_at"))
+            ),
             "auto_exported": state.get("auto_exported"),
             "auto_export_error": state.get("auto_export_error"),
         }
@@ -2395,9 +2630,60 @@ def _try_acquire_workflow_input_lease(
         return None
 
 
-def _gemini_workflow_retry_delay(retry_count: int) -> float:
+def _gemini_workflow_retry_delay(
+    retry_count: int,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float:
     exponent = max(0, min(retry_count - 1, 8))
-    return min(GEMINI_WORKFLOW_RETRY_MAX_SEC, GEMINI_WORKFLOW_RETRY_BASE_SEC * (2**exponent))
+    backoff = min(
+        GEMINI_WORKFLOW_RETRY_MAX_SEC,
+        GEMINI_WORKFLOW_RETRY_BASE_SEC * (2**exponent),
+    )
+    if retry_after_seconds is None:
+        return backoff
+    return max(backoff, retry_after_seconds)
+
+
+def _should_retry_gemini_transient(
+    exc: GeminiTransientError,
+    transcription_attempt_count: int,
+) -> bool:
+    if transcription_attempt_count >= GEMINI_WORKFLOW_MAX_TRANSIENT_ATTEMPTS:
+        return False
+    if exc.quota_limited:
+        return exc.retry_after_seconds is not None
+    return True
+
+
+def _gemini_transient_terminal_error_code(exc: GeminiTransientError) -> str:
+    if not exc.quota_limited:
+        return "gemini_retry_exhausted"
+    if exc.retry_after_seconds is None:
+        return "gemini_quota_wait_unavailable"
+    return "gemini_quota_retry_exhausted"
+
+
+def _gemini_transient_terminal_message(
+    exc: GeminiTransientError,
+    transcription_attempt_count: int,
+) -> str:
+    if exc.quota_limited:
+        if exc.retry_after_seconds is not None:
+            return (
+                f"Gemini quota remained unavailable after {transcription_attempt_count} "
+                "scheduled attempts. The optimized audio is saved. Retry transcription later; "
+                "no new recording is needed."
+            )
+        return (
+            "Gemini quota is exhausted and no reset time was provided. The optimized audio "
+            "is saved. Check the quota in Google AI Studio, then retry transcription; no new "
+            "recording is needed."
+        )
+    return (
+        f"Gemini remained unavailable after {transcription_attempt_count} automatic attempts. "
+        "The optimized audio is saved. Retry transcription later; no new recording is needed."
+    )
 
 
 def _workflow_transcription_retry_count(state_path: Path) -> int:
@@ -2408,8 +2694,60 @@ def _workflow_transcription_retry_count(state_path: Path) -> int:
         return 0
 
 
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(str(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _positive_timestamp(value: object) -> float | None:
+    try:
+        timestamp = float(str(value or 0))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        return None
+    return timestamp
+
+
+def _workflow_error_code(state: Mapping[str, object]) -> str | None:
+    value = str(state.get("error_code") or "").strip()
+    return value[:80] or None
+
+
+def _workflow_retry_delay_remaining(
+    state: Mapping[str, object],
+    *,
+    now: float | None = None,
+) -> float:
+    if state.get("error_code") not in {"gemini_transient_retry", "gemini_quota_wait"}:
+        return 0.0
+    next_retry_at = _positive_timestamp(state.get("next_retry_at"))
+    if next_retry_at is None:
+        return 0.0
+    return max(0.0, next_retry_at - (time.time() if now is None else now))
+
+
+def _workflow_retry_limit_exhausted(state: Mapping[str, object]) -> bool:
+    if state.get("error_code") not in {
+        "gemini_transient",
+        "gemini_transient_retry",
+        "gemini_quota_wait",
+    }:
+        return False
+    return (
+        _nonnegative_int(state.get("transcription_retry_count"))
+        >= GEMINI_WORKFLOW_MAX_TRANSIENT_ATTEMPTS
+    )
+
+
 def _is_transient_gemini_workflow_failure(state: Mapping[str, object]) -> bool:
-    if state.get("error_code") in {"gemini_transient", "gemini_transient_retry"}:
+    if state.get("error_code") in {
+        "gemini_transient",
+        "gemini_transient_retry",
+        "gemini_quota_wait",
+    }:
         return True
     error = str(state.get("error") or "")
     return error.startswith(

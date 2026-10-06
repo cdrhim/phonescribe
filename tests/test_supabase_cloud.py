@@ -520,9 +520,13 @@ def wait_for_workflow_status(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("status") == expected:
-                return payload
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                if payload.get("status") == expected:
+                    return payload
         time.sleep(0.01)
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -793,6 +797,43 @@ def test_completed_upload_workflow_post_is_idempotent_after_staged_source_delete
     assert transcribe_calls == 1
 
 
+def test_package_workflow_reuses_existing_workflow_from_other_input_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "5" * 32
+    workflow_id = "6" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id, transcript=True)
+    state_path = write_recoverable_state(
+        settings,
+        workflow_id=workflow_id,
+        package_id=package_id,
+        status="complete",
+        input_kind="cloud",
+        input_id="7" * 32,
+        cloud_recording_id="7" * 32,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["auto_exported"] = True
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def unexpected_transcribe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("an existing package workflow must be reused")
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", unexpected_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        response = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == workflow_id
+    assert response.json()["package_id"] == package_id
+    assert response.json()["status"] == "complete"
+
+
 def test_transient_gemini_failure_stays_transcribing_and_retries_to_completion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -838,13 +879,481 @@ def test_transient_gemini_failure_stays_transcribing_and_retries_to_completion(
         assert [value["transcription_retry_count"] for value in retry_states] == [1, 2]
         assert all(value["status"] == "transcribing" for value in retry_states)
         assert all(value["error"] is None for value in retry_states)
-        assert all(value["error_code"] == "gemini_transient_retry" for value in retry_states)
+        assert all(value["error_code"] is None for value in retry_states)
+        assert all(value["next_retry_at"] is None for value in retry_states)
         allow_success.set()
         state = wait_for_workflow_status(state_path, "complete")
 
     assert calls == 3
     assert state["status"] == "complete"
     assert state["transcription_retry_count"] == 2
+
+
+def test_quota_retry_after_controls_workflow_retry_delay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "d" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    call_times: list[float] = []
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        call_times.append(time.monotonic())
+        if len(call_times) == 1:
+            raise GeminiTransientError(
+                "quota reset pending",
+                retry_after_seconds=0.15,
+                quota_limited=True,
+            )
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 0.01)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = wait_for_workflow_status(state_path, "complete")
+
+    assert state["status"] == "complete"
+    assert len(call_times) == 2
+    assert call_times[1] - call_times[0] >= 0.12
+
+
+def test_non_quota_transient_failure_stops_after_finite_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "e" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiTransientError("temporary Gemini outage")
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_MAX_TRANSIENT_ATTEMPTS", 3)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = wait_for_workflow_status(state_path, "failed")
+        status_response = client.get(f"/api/workflows/{started.json()['workflow_id']}")
+
+    assert calls == 3
+    assert state["error_code"] == "gemini_retry_exhausted"
+    assert state["transcription_retry_count"] == 3
+    assert state["next_retry_at"] is None
+    assert "optimized audio is saved" in str(state["error"])
+    assert "no new recording is needed" in str(state["error"])
+    assert status_response.status_code == 200
+    assert status_response.json()["error_code"] == "gemini_retry_exhausted"
+    assert status_response.json()["transcription_retry_count"] == 3
+    assert status_response.json()["next_retry_at"] is None
+
+
+def test_quota_without_reset_time_fails_once_with_saved_audio_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "f" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiTransientError("quota exhausted", quota_limited=True)
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = wait_for_workflow_status(state_path, "failed")
+
+    assert calls == 1
+    assert state["error_code"] == "gemini_quota_wait_unavailable"
+    assert state["next_retry_at"] is None
+    assert "Check the quota in Google AI Studio" in str(state["error"])
+
+
+def test_quota_retries_stop_after_finite_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "0" * 32
+    package_dir = settings.data_dir / "optimized" / package_id
+    write_optimized_fixture(package_dir)
+    calls = 0
+
+    def fake_transcribe(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise GeminiTransientError(
+            "quota reset pending",
+            retry_after_seconds=0.01,
+            quota_limited=True,
+        )
+
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_BASE_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_RETRY_MAX_SEC", 0.01)
+    monkeypatch.setattr(app_module, "GEMINI_WORKFLOW_MAX_TRANSIENT_ATTEMPTS", 3)
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        started = client.post(
+            "/api/workflows",
+            data={"destination": "gemini", "package_id": package_id},
+        )
+        assert started.status_code == 202
+        state_path = settings.tmp_dir / "workflows" / f"{started.json()['workflow_id']}.json"
+        state = wait_for_workflow_status(state_path, "failed")
+
+    assert calls == 3
+    assert state["error_code"] == "gemini_quota_retry_exhausted"
+    assert state["transcription_retry_count"] == 3
+    assert state["next_retry_at"] is None
+    assert "scheduled attempts" in str(state["error"])
+
+
+def test_quota_cooldown_is_scoped_to_the_request_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key=None)
+    first_package_id = "a" * 32
+    queued_same_key_package_id = "c" * 32
+    second_package_id = "b" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / first_package_id)
+    write_optimized_fixture(settings.data_dir / "optimized" / queued_same_key_package_id)
+    write_optimized_fixture(settings.data_dir / "optimized" / second_package_id)
+    second_started = threading.Event()
+    first_key_calls = 0
+
+    def fake_transcribe(
+        value: Path,
+        *_args: object,
+        api_key: str | None = None,
+        **_kwargs: object,
+    ) -> object:
+        nonlocal first_key_calls
+        if api_key == "request-key-a":
+            first_key_calls += 1
+            raise GeminiTransientError(
+                "quota reset pending",
+                retry_after_seconds=60.0,
+                quota_limited=True,
+            )
+        assert api_key == "request-key-b"
+        second_started.set()
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)) as client:
+        first = client.post(
+            "/api/workflows",
+            data={
+                "destination": "gemini",
+                "package_id": first_package_id,
+            },
+            headers={"X-Gemini-API-Key": "request-key-a"},
+        )
+        assert first.status_code == 202
+        first_state_path = (
+            settings.tmp_dir / "workflows" / f"{first.json()['workflow_id']}.json"
+        )
+        deadline = time.monotonic() + 1
+        first_state: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            try:
+                first_state = json.loads(first_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.01)
+                continue
+            if first_state.get("error_code") == "gemini_quota_wait":
+                break
+            time.sleep(0.01)
+        assert first_state["error_code"] == "gemini_quota_wait"
+
+        queued_same_key = client.post(
+            "/api/workflows",
+            data={
+                "destination": "gemini",
+                "package_id": queued_same_key_package_id,
+            },
+            headers={"X-Gemini-API-Key": "request-key-a"},
+        )
+        assert queued_same_key.status_code == 202
+        queued_state_path = (
+            settings.tmp_dir
+            / "workflows"
+            / f"{queued_same_key.json()['workflow_id']}.json"
+        )
+        deadline = time.monotonic() + 1
+        queued_state: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            try:
+                queued_state = json.loads(queued_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.01)
+                continue
+            if queued_state.get("error_code") == "gemini_quota_wait":
+                break
+            time.sleep(0.01)
+        assert queued_state["error_code"] == "gemini_quota_wait"
+        assert float(str(queued_state["next_retry_at"])) > time.time()
+
+        second = client.post(
+            "/api/workflows",
+            data={
+                "destination": "gemini",
+                "package_id": second_package_id,
+            },
+            headers={"X-Gemini-API-Key": "request-key-b"},
+        )
+        assert second.status_code == 202
+        second_state_path = (
+            settings.tmp_dir / "workflows" / f"{second.json()['workflow_id']}.json"
+        )
+        assert second_started.wait(timeout=1)
+        second_state = wait_for_workflow_status(second_state_path, "complete")
+
+    assert second_state["status"] == "complete"
+    assert first_key_calls == 1
+
+
+def test_workflow_retry_delay_remaining_honors_persisted_quota_reset() -> None:
+    assert app_module._workflow_retry_delay_remaining(  # noqa: SLF001
+        {
+            "error_code": "gemini_quota_wait",
+            "next_retry_at": 4600.0,
+        },
+        now=1000.0,
+    ) == 3600.0
+    assert app_module._workflow_retry_delay_remaining(  # noqa: SLF001
+        {
+            "error_code": "gemini_retry_exhausted",
+            "next_retry_at": 4600.0,
+        },
+        now=1000.0,
+    ) == 0.0
+
+
+def test_restart_recovers_only_one_worker_for_the_same_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "b" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+    stale_workflow_id = "1" * 32
+    newest_workflow_id = "f" * 32
+    stale_state_path = write_recoverable_state(
+        settings,
+        workflow_id=stale_workflow_id,
+        package_id=package_id,
+        status="transcribing",
+        input_kind="cloud",
+        input_id="3" * 32,
+        cloud_recording_id="3" * 32,
+    )
+    newest_state_path = write_recoverable_state(
+        settings,
+        workflow_id=newest_workflow_id,
+        package_id=package_id,
+        status="transcribing",
+        input_kind="package",
+        input_id=package_id,
+    )
+    stale_state = json.loads(stale_state_path.read_text(encoding="utf-8"))
+    stale_state.update({"created_at": 100.0, "updated_at": 100.0})
+    stale_state_path.write_text(json.dumps(stale_state), encoding="utf-8")
+    newest_state = json.loads(newest_state_path.read_text(encoding="utf-8"))
+    newest_state.update({"created_at": 200.0, "updated_at": 200.0})
+    newest_state_path.write_text(json.dumps(newest_state), encoding="utf-8")
+    transcribe_started = threading.Event()
+    allow_transcribe = threading.Event()
+    calls = 0
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        transcribe_started.set()
+        allow_transcribe.wait(timeout=2)
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)):
+        assert transcribe_started.wait(timeout=1)
+        stale_state = wait_for_workflow_status(stale_state_path, "failed")
+        assert stale_state["error_code"] == "duplicate_recovery_worker"
+        allow_transcribe.set()
+        newest_state = wait_for_workflow_status(newest_state_path, "complete")
+
+    assert newest_state["status"] == "complete"
+    assert calls == 1
+
+
+def test_restart_registers_all_shared_cooldowns_before_starting_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_ids = ("1" * 32, "2" * 32)
+    workflow_ids = ("3" * 32, "4" * 32)
+    state_paths: list[Path] = []
+    for workflow_id, package_id in zip(workflow_ids, package_ids, strict=True):
+        write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+        state_paths.append(
+            write_recoverable_state(
+                settings,
+                workflow_id=workflow_id,
+                package_id=package_id,
+                status="transcribing",
+                input_kind="package",
+                input_id=package_id,
+            )
+        )
+
+    quota_state = json.loads(state_paths[1].read_text(encoding="utf-8"))
+    quota_state.update(
+        {
+            "error_code": "gemini_quota_wait",
+            "transcription_retry_count": 1,
+            "next_retry_at": time.time() + 0.25,
+        }
+    )
+    state_paths[1].write_text(json.dumps(quota_state), encoding="utf-8")
+
+    started_at = time.monotonic()
+    call_times: list[float] = []
+    call_lock = threading.Lock()
+
+    def fake_transcribe(value: Path, *_args: object, **_kwargs: object) -> object:
+        with call_lock:
+            call_times.append(time.monotonic())
+        write_optimized_fixture(value, transcript=True)
+        return SimpleNamespace(
+            suggested_filename="meeting",
+            txt_path=value / "gemini_transcript.txt",
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_gemini_package", fake_transcribe)
+    with TestClient(app_module.create_app(settings)):
+        states = [wait_for_workflow_status(path, "complete") for path in state_paths]
+
+    assert all(state["status"] == "complete" for state in states)
+    assert len(call_times) == 2
+    assert min(call_times) - started_at >= 0.15
+
+
+def test_restart_terminalizes_workflow_already_over_retry_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "c" * 32
+    workflow_id = "d" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id)
+    state_path = write_recoverable_state(
+        settings,
+        workflow_id=workflow_id,
+        package_id=package_id,
+        status="transcribing",
+        input_kind="package",
+        input_id=package_id,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "error_code": "gemini_transient_retry",
+            "transcription_retry_count": 31,
+            "next_retry_at": time.time() + 3600,
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    monkeypatch.setattr(
+        app_module,
+        "transcribe_gemini_package",
+        lambda *_args, **_kwargs: pytest.fail("over-limit workflow must not call Gemini"),
+    )
+    with TestClient(app_module.create_app(settings)):
+        terminal = wait_for_workflow_status(state_path, "failed")
+
+    assert terminal["error_code"] == "gemini_retry_exhausted"
+    assert terminal["transcription_retry_count"] == 31
+    assert terminal["next_retry_at"] is None
+
+
+def test_restart_prefers_completed_artifacts_over_retry_limit_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(make_test_settings(tmp_path), gemini_api_key="server-gemini-key")
+    package_id = "e" * 32
+    workflow_id = "f" * 32
+    write_optimized_fixture(settings.data_dir / "optimized" / package_id, transcript=True)
+    state_path = write_recoverable_state(
+        settings,
+        workflow_id=workflow_id,
+        package_id=package_id,
+        status="transcribing",
+        input_kind="package",
+        input_id=package_id,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "error_code": "gemini_transient_retry",
+            "transcription_retry_count": 31,
+            "next_retry_at": time.time() + 3600,
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    monkeypatch.setattr(
+        app_module,
+        "transcribe_gemini_package",
+        lambda *_args, **_kwargs: pytest.fail("completed artifacts must not call Gemini"),
+    )
+    with TestClient(app_module.create_app(settings)):
+        completed = wait_for_workflow_status(state_path, "complete")
+
+    assert completed["status"] == "complete"
 
 
 def test_transient_retry_background_task_does_not_block_graceful_shutdown(
