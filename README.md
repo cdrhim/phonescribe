@@ -230,6 +230,10 @@ sign-in. The phone and PC displays may turn off after the initial upload, but th
 powered on and connected to the internet. Windows prevents system sleep only while a workflow is
 actively optimizing or transcribing.
 
+For a periodic Windows health-check task, run `scripts/start-network-hidden.vbs` with
+`wscript.exe //B //NoLogo`. This wrapper keeps the existing startup/recovery behavior without
+briefly flashing a PowerShell console on the desktop.
+
 ## Supabase Recording Storage
 
 PhoneScribe can hand a completed phone recording to Supabase before the local PC starts the
