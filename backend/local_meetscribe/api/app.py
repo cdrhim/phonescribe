@@ -1141,6 +1141,9 @@ def create_app(
                             durable_fields={
                                 "attempt_count": int(str(state.get("attempt_count") or 0)) + 1,
                                 "recovered_after_restart": True,
+                                "error_code": None,
+                                "last_transient_error_at": None,
+                                "next_retry_at": None,
                             },
                             attempt_cloud_delivery=False,
                         )

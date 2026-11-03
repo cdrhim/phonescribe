@@ -16,7 +16,7 @@ from typing import Any, Literal
 from local_meetscribe.config import Settings
 from local_meetscribe.utils.errors import LocalMeetScribeError
 
-GeminiDelivery = Literal["inline", "files_api"]
+GeminiDelivery = Literal["inline", "files_api", "local_cpu"]
 GeminiProgressStatus = Literal["idle", "transcribing", "complete", "failed"]
 
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
@@ -1179,7 +1179,7 @@ def _load_partial_transcripts(
         filename = str(item.get("filename") or "")
         delivery = str(item.get("delivery") or "")
         text = str(item.get("text") or "").strip()
-        if not filename or not text or delivery not in {"inline", "files_api"}:
+        if not filename or not text or delivery not in {"inline", "files_api", "local_cpu"}:
             continue
         completed[filename] = GeminiChunkTranscript(
             filename=filename,
@@ -1218,7 +1218,11 @@ def _load_completed_transcript_result(
         filename = str(item.get("filename") or "")
         delivery = str(item.get("delivery") or "")
         chunk_text = str(item.get("text") or "").strip()
-        if not filename or not chunk_text or delivery not in {"inline", "files_api"}:
+        if (
+            not filename
+            or not chunk_text
+            or delivery not in {"inline", "files_api", "local_cpu"}
+        ):
             continue
         chunks.append(
             GeminiChunkTranscript(

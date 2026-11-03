@@ -1354,6 +1354,8 @@ def test_restart_prefers_completed_artifacts_over_retry_limit_state(
         completed = wait_for_workflow_status(state_path, "complete")
 
     assert completed["status"] == "complete"
+    assert completed["error_code"] is None
+    assert completed["next_retry_at"] is None
 
 
 def test_transient_retry_background_task_does_not_block_graceful_shutdown(

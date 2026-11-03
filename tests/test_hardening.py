@@ -1140,6 +1140,81 @@ def test_failed_workflow_recovers_when_completed_artifacts_exist(tmp_path: Path)
     assert recovered_state["error"] is None
 
 
+def test_completed_hybrid_artifacts_are_loaded_without_calling_gemini(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_dir = tmp_path / "optimized" / "pkg"
+    package_dir.mkdir(parents=True)
+    chunks = [
+        {
+            "filename": "chunk_001.mp3",
+            "start_sec": 0,
+            "end_sec": 10,
+            "delivery": "inline",
+            "mime_type": "audio/mp3",
+            "text": "first chunk",
+            "model": "gemini-3.6-flash",
+        },
+        {
+            "filename": "chunk_002.mp3",
+            "start_sec": 10,
+            "end_sec": 20,
+            "delivery": "local_cpu",
+            "mime_type": "audio/mp3",
+            "text": "second chunk",
+            "model": "faster-whisper-small",
+        },
+    ]
+    (package_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source": {"filename": "meeting.m4a"},
+                "recommendation": {},
+                "chunks": [
+                    {
+                        "filename": item["filename"],
+                        "start_sec": item["start_sec"],
+                        "end_sec": item["end_sec"],
+                    }
+                    for item in chunks
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    text = "first chunk\n\nsecond chunk"
+    (package_dir / "gemini_transcript.txt").write_text(text, encoding="utf-8")
+    (package_dir / "gemini_transcript.json").write_text(
+        json.dumps(
+            {
+                "provider": "hybrid",
+                "model": "gemini-3.6-flash + faster-whisper-small",
+                "suggested_filename": "meeting",
+                "chunks": chunks,
+                "text": text,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gemini_module,
+        "_load_httpx",
+        lambda: pytest.fail("completed hybrid artifacts must not call Gemini"),
+    )
+
+    result = transcribe_gemini_package(
+        package_dir,
+        make_test_settings(tmp_path),
+        api_key="request-only-test-key",
+    )
+
+    assert result.provider == "gemini"
+    assert result.model == "gemini-3.6-flash + faster-whisper-small"
+    assert [chunk.delivery for chunk in result.chunks] == ["inline", "local_cpu"]
+    assert result.text == text
+
+
 def test_gemini_retryable_error_keeps_optimized_audio_message() -> None:
     class Response:
         status_code = 500

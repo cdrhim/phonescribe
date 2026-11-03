@@ -135,7 +135,7 @@ export interface GeminiTranscriptChunk {
   filename: string;
   start_sec: number;
   end_sec: number;
-  delivery: "inline" | "files_api";
+  delivery: "inline" | "files_api" | "local_cpu";
   mime_type: string;
 }
 
