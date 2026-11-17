@@ -303,6 +303,21 @@ def test_remote_cors_allows_only_configured_frontend(tmp_path: Path) -> None:
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == "https://phonescribe.vercel.app"
 
+    private_network = client.options(
+        "/api/runtime?client=share-v1",
+        headers={
+            "Origin": "https://phonescribe.vercel.app",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+    assert private_network.status_code == 200
+    assert (
+        private_network.headers["access-control-allow-origin"]
+        == "https://phonescribe.vercel.app"
+    )
+    assert private_network.headers["access-control-allow-private-network"] == "true"
+
     unauthorized = client.post(
         "/api/cloud-recordings/upload-descriptor",
         headers={

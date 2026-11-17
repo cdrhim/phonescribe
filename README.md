@@ -208,9 +208,11 @@ through a stable HTTPS Funnel:
 tailscale funnel --bg http://127.0.0.1:8766
 ```
 
-Set `VITE_API_BASE_URL` in the Vercel project to the Funnel `https://...ts.net` origin. Start the
-server with `scripts/start-network.ps1`; it enables remote session protection and allows only the
-`https://phonescribe.vercel.app` browser origin. Health, runtime discovery, and passcode verification
+`frontend/vercel.json` proxies `/api/*` through Vercel to the Funnel, and the production frontend
+uses that same-origin path even if the older `VITE_API_BASE_URL` setting is still present. This avoids
+browser local-network restrictions when Tailscale resolves the Funnel hostname to a `100.x` address.
+Start the server with `scripts/start-network.ps1`; it enables remote session protection and allows only
+the `https://phonescribe.vercel.app` browser origin. Health, runtime discovery, and passcode verification
 remain public. Every upload, workflow-status request, and download requires the expiring bearer
 session returned after a correct passcode. The raw token is stored only in the current tab's
 `sessionStorage`; the server persists only its one-way hash and expiry. Sessions therefore survive
@@ -221,6 +223,11 @@ automatically continues the same work without another recording. Runtime discove
 an existing tab token before enabling the record button, so a stale session is repaired before a
 new recording starts. Genuine temporary network failures stay in the transcription-preparation
 state and retry automatically with a capped delay instead of ending after a fixed retry count.
+
+The same-origin proxy carries API metadata, the expiring session token, workflow responses, and TXT
+downloads through Vercel. Recording parts normally travel directly from the browser to Supabase using
+short-lived signed URLs; the PC-upload fallback can pass a recording through the proxy when Supabase is
+unavailable.
 
 After a completed or failed workflow, `새 녹음 시작` clears only the current browser view and starts
 the microphone again. Already accepted server jobs and transcript files remain untouched.
@@ -275,8 +282,8 @@ local-meetscribe supabase status
 
 The first command prompts for the key without echoing it and stores it with Windows user-scoped
 DPAPI encryption under the runtime data directory. Do not put this key in Vercel, frontend
-environment variables, source control, screenshots, or chat. The Vercel site needs only its existing
-`VITE_API_BASE_URL` pointing to the PC's HTTPS Funnel.
+environment variables, source control, screenshots, or chat. The Vercel site reaches the PC through
+the `/api/*` external rewrite in `frontend/vercel.json`; no Supabase secret is stored in Vercel.
 
 The exact screen-off boundary is the returned `workflow_id`: keep the phone page visible while it is
 recording and uploading, and until the page says the server accepted the job. From that point,

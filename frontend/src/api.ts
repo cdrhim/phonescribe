@@ -58,7 +58,22 @@ export interface OptimizerOptions {
   denoise: boolean;
 }
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+export function resolveApiBaseUrl(configuredBaseUrl: string, hostname: string): string {
+  const normalized = configuredBaseUrl.replace(/\/$/, "");
+  const normalizedHostname = hostname.toLowerCase();
+  if (
+    normalizedHostname === "phonescribe.vercel.app" ||
+    normalizedHostname.endsWith(".vercel.app")
+  ) {
+    return "";
+  }
+  return normalized;
+}
+
+const API_BASE_URL = resolveApiBaseUrl(
+  import.meta.env.VITE_API_BASE_URL || "",
+  typeof window === "undefined" ? "" : window.location.hostname
+);
 const API_ACCESS_TOKEN_STORAGE_KEY = "local-meetscribe.remote-session.v1";
 const MAX_CLOUD_PART_SIZE_BYTES = 6 * 1024 * 1024;
 const CLOUD_UPLOAD_RETRY_DELAYS_MS = [0, 1000, 3000, 5000, 10000, 20000];
