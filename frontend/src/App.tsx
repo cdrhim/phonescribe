@@ -85,6 +85,7 @@ const LAST_AUTO_DOWNLOAD_REQUESTED_WORKFLOW_KEY =
   "local-meetscribe.last-auto-download-requested-workflow.v1";
 const AUTO_DOWNLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
 const RECORDING_UPLOAD_RETRY_DELAYS_MS = [1000, 3000, 10000, 30000];
+const RUNTIME_RETRY_DELAYS_MS = [1000, 3000, 5000];
 const PENDING_RECORDING_STORAGE_WAIT_MS = 2000;
 const RECORDER_ERROR_FINALIZE_DELAY_MS = 1000;
 
@@ -117,6 +118,8 @@ export function App() {
   const [sourceBytes, setSourceBytes] = useState(0);
   const [runtime, setRuntime] = useState<RuntimeProfile | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
+  const [runtimeRequestId, setRuntimeRequestId] = useState(0);
+  const [runtimeRetryScheduled, setRuntimeRetryScheduled] = useState(false);
   const [scan, setScan] = useState<QuickScanResult | null>(null);
   const [recommendation, setRecommendation] =
     useState<OptimizerRecommendationResponse | null>(null);
@@ -169,6 +172,8 @@ export function App() {
   const darkRecordingMode =
     recordingState === "starting" || recordingState === "recording";
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const runtimeRetryTimerRef = useRef<number | null>(null);
+  const runtimeRetryAttemptRef = useRef(0);
   const workflowTimerRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -203,8 +208,13 @@ export function App() {
   analyzeSelectedFileRef.current = analyzeSelectedFile;
 
   useEffect(() => {
+    let active = true;
+    setRuntimeChecked(false);
+    setRuntimeRetryScheduled(false);
     void getRuntime()
       .then((profile) => {
+        if (!active) return;
+        runtimeRetryAttemptRef.current = 0;
         setRuntime(profile);
         if (profile.remote_session_valid === false) {
           clearApiAccessToken();
@@ -221,11 +231,46 @@ export function App() {
         }
       })
       .catch(() => {
+        if (!active) return;
         setRuntime(null);
         setAccessMode(null);
+        const delayMs = RUNTIME_RETRY_DELAYS_MS[runtimeRetryAttemptRef.current];
+        if (delayMs !== undefined) {
+          runtimeRetryAttemptRef.current += 1;
+          setRuntimeRetryScheduled(true);
+          runtimeRetryTimerRef.current = window.setTimeout(() => {
+            runtimeRetryTimerRef.current = null;
+            setRuntimeRequestId((current) => current + 1);
+          }, delayMs);
+        }
       })
-      .finally(() => setRuntimeChecked(true));
-  }, []);
+      .finally(() => {
+        if (active) setRuntimeChecked(true);
+      });
+    return () => {
+      active = false;
+      if (runtimeRetryTimerRef.current !== null) {
+        window.clearTimeout(runtimeRetryTimerRef.current);
+        runtimeRetryTimerRef.current = null;
+      }
+    };
+  }, [runtimeRequestId]);
+
+  useEffect(() => {
+    if (runtime || !runtimeChecked) return;
+    const retryWhenAvailable = () => {
+      if (navigator.onLine === false || document.visibilityState !== "visible") return;
+      retryRuntimeConnection();
+    };
+    window.addEventListener("online", retryWhenAvailable);
+    window.addEventListener("pageshow", retryWhenAvailable);
+    document.addEventListener("visibilitychange", retryWhenAvailable);
+    return () => {
+      window.removeEventListener("online", retryWhenAvailable);
+      window.removeEventListener("pageshow", retryWhenAvailable);
+      document.removeEventListener("visibilitychange", retryWhenAvailable);
+    };
+  }, [runtime, runtimeChecked]);
 
   useEffect(() => {
     if (!file) {
@@ -415,6 +460,7 @@ export function App() {
   useEffect(() => {
     if (
       !runtimeChecked ||
+      !runtime ||
       !file ||
       recommendation ||
       stage !== "idle" ||
@@ -431,6 +477,7 @@ export function App() {
     file,
     keyReady,
     recommendation,
+    runtime,
     runtime?.cloud_upload_enabled,
     runtimeChecked,
     shareAccessReady,
@@ -798,6 +845,17 @@ export function App() {
     } finally {
       setSavingShareKey(false);
     }
+  }
+
+  function retryRuntimeConnection() {
+    if (runtimeRetryTimerRef.current !== null) {
+      window.clearTimeout(runtimeRetryTimerRef.current);
+      runtimeRetryTimerRef.current = null;
+    }
+    runtimeRetryAttemptRef.current = 0;
+    setRuntimeRetryScheduled(false);
+    setRuntimeChecked(false);
+    setRuntimeRequestId((current) => current + 1);
   }
 
   async function confirmShareAccess() {
@@ -1967,11 +2025,15 @@ export function App() {
                 onClick={() => void startDirectRecording(Boolean(activeWorkflowId))}
               >
                 <Mic size={18} />
-                {!recordingSupported
-                  ? "이 브라우저는 직접 녹음 미지원"
-                  : recordingAccessReady
-                    ? "바로 녹음 시작"
-                    : "비밀번호 확인 후 녹음 시작"}
+                {!runtimeChecked
+                  ? "서버 연결 확인 중"
+                  : !runtime
+                    ? "서버 연결 후 녹음 시작"
+                    : !recordingSupported
+                      ? "이 브라우저는 직접 녹음 미지원"
+                      : recordingAccessReady
+                        ? "바로 녹음 시작"
+                        : "비밀번호 확인 후 녹음 시작"}
               </button>
             </div>
           ) : (
@@ -2091,15 +2153,41 @@ export function App() {
               index="02"
               title="Gemini 연결"
               note={
-                shareMode
-                  ? "공유 비밀번호로 연결"
-                  : serverKeyReady
-                    ? "서버 키 연결됨"
-                    : "무료 AI Studio 키"
+                !runtimeChecked
+                  ? "서버 연결 확인 중"
+                  : !runtime
+                    ? "서버 연결 필요"
+                    : shareMode
+                      ? "공유 비밀번호로 연결"
+                      : serverKeyReady
+                        ? "서버 키 연결됨"
+                        : "무료 AI Studio 키"
               }
             />
 
-          {shareMode ? (
+          {!runtimeChecked ? (
+            <div className="connected-line" role="status" aria-live="polite">
+              <Loader2 className="spin" size={18} />
+              <span>서버 연결을 확인하고 있습니다.</span>
+            </div>
+          ) : !runtime ? (
+            <div className="share-access">
+              <p className="share-status" role="alert">
+                서버 연결을 확인하지 못했습니다. 녹음은 시작되지 않았습니다.
+              </p>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={retryRuntimeConnection}
+              >
+                <RefreshCw size={17} />
+                서버 연결 다시 시도
+              </button>
+              {runtimeRetryScheduled && (
+                <p className="share-status">잠시 후 서버 연결을 다시 확인합니다.</p>
+              )}
+            </div>
+          ) : shareMode ? (
             <div className="share-access">
               <form
                 className="passcode-confirm-form"

@@ -384,7 +384,24 @@ afterEach(() => {
 });
 
 describe("direct phone recording", () => {
-  it("keeps recording disabled when the server runtime cannot be loaded", async () => {
+  it("shows only a connection check while the server runtime is loading", async () => {
+    const pendingRuntime = deferred<RuntimeProfile>();
+    vi.mocked(api.getRuntime).mockReturnValue(pendingRuntime.promise);
+
+    render(<App />);
+
+    expect(screen.getByText("서버 연결을 확인하고 있습니다.")).toBeTruthy();
+    expect(screen.queryByText("API key")).toBeNull();
+    expect(screen.getByRole("button", { name: "서버 연결 확인 중" })).toHaveProperty(
+      "disabled",
+      true
+    );
+
+    pendingRuntime.resolve({ ...runtime, remote_session_valid: false });
+    expect(await screen.findByText("공유 비밀번호")).toBeTruthy();
+  });
+
+  it("keeps recording disabled and offers recovery when runtime loading fails", async () => {
     installRecordingBrowser(async () => ({
       getTracks: () => [{ stop: vi.fn() }]
     } as unknown as MediaStream));
@@ -393,10 +410,69 @@ describe("direct phone recording", () => {
     render(<App />);
 
     const blockedRecording = await screen.findByRole("button", {
-      name: "비밀번호 확인 후 녹음 시작"
+      name: "서버 연결 후 녹음 시작"
     });
     expect(blockedRecording).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "서버 연결 다시 시도" })).toBeTruthy();
+    expect(screen.queryByText("API key")).toBeNull();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
+  });
+
+  it("automatically recovers when the first runtime request fails", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.getRuntime)
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({ ...runtime, remote_session_valid: false });
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "서버 연결 다시 시도" })).toBeTruthy();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(api.getRuntime).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("공유 비밀번호")).toBeTruthy();
+    expect(screen.queryByText("API key")).toBeNull();
+  });
+
+  it("rechecks the runtime when a mobile browser restores the page", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.getRuntime)
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({ ...runtime, remote_session_valid: false });
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    for (const delayMs of [1000, 3000, 5000]) {
+      await act(async () => {
+        vi.advanceTimersByTime(delayMs);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+    expect(api.getRuntime).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      window.dispatchEvent(new Event("pageshow"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(api.getRuntime).toHaveBeenCalledTimes(5);
+    expect(screen.getByText("공유 비밀번호")).toBeTruthy();
   });
 
   it("requires a fresh remote session before allowing a new recording", async () => {
@@ -902,6 +978,38 @@ describe("pending recording persistence", () => {
         3
       )
     );
+  });
+
+  it("does not resume a restored recording while runtime checks keep failing", async () => {
+    vi.useFakeTimers();
+    const restoredFile = new File(["restored audio"], "PhoneScribe_restored.webm", {
+      type: "audio/webm"
+    });
+    vi.mocked(api.getRuntime).mockRejectedValue(new Error("offline"));
+    vi.mocked(pendingRecording.loadPendingRecording).mockResolvedValue({
+      id: "restored-recording-id",
+      file: restoredFile,
+      savedAt: 456,
+      retryAttempts: 0
+    });
+
+    render(<App />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("PhoneScribe_restored.webm")).toBeTruthy();
+
+    for (const delayMs of [1000, 3000, 5000]) {
+      await act(async () => {
+        vi.advanceTimersByTime(delayMs);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    expect(api.getRuntime).toHaveBeenCalledTimes(4);
+    expect(api.analyzeOptimizer).not.toHaveBeenCalled();
   });
 
   it("keeps an exhausted retry budget bounded across reloads", async () => {
