@@ -2670,9 +2670,13 @@ export function App() {
         <footer className="privacy-footer">
           <ShieldCheck size={16} />
           <span>
-            {shareMode
-              ? "기본 API key는 이 PC에 암호화해 저장하며 공유 브라우저에는 전달하지 않습니다."
-              : "API key는 저장하지 않습니다."}
+            {!runtimeChecked
+              ? "서버 연결을 확인하고 있습니다."
+              : !runtime
+                ? "서버 연결 후 녹음을 시작할 수 있습니다."
+                : shareMode
+                  ? "기본 API key는 이 PC에 암호화해 저장하며 공유 브라우저에는 전달하지 않습니다."
+                  : "API key는 저장하지 않습니다."}
           </span>
         </footer>
       </div>

@@ -390,8 +390,8 @@ describe("direct phone recording", () => {
 
     render(<App />);
 
-    expect(screen.getByText("서버 연결을 확인하고 있습니다.")).toBeTruthy();
-    expect(screen.queryByText("API key")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("서버 연결을 확인하고 있습니다.");
+    expect(screen.queryByText(/API key/)).toBeNull();
     expect(screen.getByRole("button", { name: "서버 연결 확인 중" })).toHaveProperty(
       "disabled",
       true
@@ -414,7 +414,7 @@ describe("direct phone recording", () => {
     });
     expect(blockedRecording).toHaveProperty("disabled", true);
     expect(screen.getByRole("button", { name: "서버 연결 다시 시도" })).toBeTruthy();
-    expect(screen.queryByText("API key")).toBeNull();
+    expect(screen.queryByText(/API key/)).toBeNull();
     expect(api.analyzeOptimizer).not.toHaveBeenCalled();
   });
 
